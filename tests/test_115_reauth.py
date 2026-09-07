@@ -1347,7 +1347,8 @@ def test_reauth_status_poll_worst_case_stays_under_26s_of_simulated_time(client,
     elapsed = clock() - start
 
     assert response.get_json()["state"] == "pending"
-    assert elapsed == hidrive._115_UPSTREAM_CONNECT_TIMEOUT + hidrive.REAUTH_STATUS_POLL_READ_SECONDS
+    expected = hidrive._115_UPSTREAM_CONNECT_TIMEOUT + hidrive.REAUTH_STATUS_POLL_READ_SECONDS
+    assert elapsed == pytest.approx(expected)
     assert elapsed < 26
 
 

@@ -41,6 +41,8 @@ share codes; it never calls an external provider.
 For a container:
 
 ```bash
+export HIDRIVE_UID="$(id -u)"
+export HIDRIVE_GID="$(id -g)"
 docker compose up --build -d
 ```
 

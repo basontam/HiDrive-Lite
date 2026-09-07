@@ -11,8 +11,10 @@ proxy for anonymous or third-party accounts.
   performed through the Open Platform;
 * an allowed target root (normally the configured OpenList 115 mount).
 
-All three are encrypted with the Fernet master key. They are never returned by
-status APIs or written to logs.
+The Cookie and Open Platform access/refresh credentials are encrypted with the
+Fernet master key. The target PID/CID are non-secret internal settings in the
+SQLite `settings` table; they are omitted from status APIs and logs. None of
+these values are returned to the browser.
 
 The status endpoint only exposes whether the target PID/Open Platform pair is
 configured; it intentionally does not return the numeric PID/CID or any

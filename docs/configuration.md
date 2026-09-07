@@ -38,4 +38,5 @@ The public `/api/status` response is deliberately redacted: it reports
 configured/healthy booleans and the logical OpenList mount labels, but does not
 echo provider URLs, absolute filesystem paths, target PIDs/CIDs, Cookies, or
 tokens. The browser always submits a logical target path; the server resolves
-the real 115 CID during transfer.
+the real 115 CID during transfer. The HDHive compatibility endpoints also
+sanitize free-text fields and OAuth errors before returning them.

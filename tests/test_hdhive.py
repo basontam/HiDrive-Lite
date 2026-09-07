@@ -130,16 +130,30 @@ def test_resources_filters_share_urls_and_access_codes_from_browser(client, hidr
     http.route(
         "GET",
         RESOURCES_URL,
-        {"success": True, "data": [{"slug": "matrix-1999", "title": "The Matrix", "share_url": "https://115.com/s/secret", "access_code": "abcd", "download_token": "token"}]},
+        {
+            "success": True,
+            "data": [
+                {
+                    "slug": "matrix-1999",
+                    "title": "The Matrix",
+                    "description": "下载 https://115.com/s/secret?password=xyz，访问码：abcd",
+                    "share_url": "https://115.com/s/secret",
+                    "access_code": "abcd",
+                    "download_token": "token",
+                }
+            ],
+        },
     )
 
     response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["data"] == [{"slug": "matrix-1999", "title": "The Matrix"}]
+    assert body["data"] == [{"slug": "matrix-1999", "title": "The Matrix", "description": "下载 [redacted-url]"}]
     assert "115.com" not in response.get_data(as_text=True)
     assert "access_code" not in response.get_data(as_text=True)
+    assert "secret" not in response.get_data(as_text=True)
+    assert "abcd" not in response.get_data(as_text=True)
 
 
 def test_upstream_refresh_demand_retries_once_with_locally_valid_token(client, hidrive, http):

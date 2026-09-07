@@ -37,10 +37,10 @@ import requests
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request
 
-# Load a repository-local .env for clone-and-run installations. Explicit
-# process environment variables still win (python-dotenv never overwrites
-# them), while access mode continues to require encrypted provider secrets.
-load_dotenv()
+# Load only the repository-local .env for clone-and-run installations. An
+# explicit path prevents a parent workspace's credentials or paths from being
+# inherited accidentally. Explicit process environment variables still win.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import library_normalize
 import library_search
@@ -1572,6 +1572,16 @@ def list_openlist(path: str, page: int = 1) -> tuple[dict, int]:
         return {"success": False, "code": "OPENLIST_UNAVAILABLE", "message": type(exc).__name__}, 502
 
 
+def _redact_hdhive_text(value: object) -> str:
+    """Remove URLs and common access-code forms from provider text fields."""
+    text = str(value)
+    text = re.sub(r"https?://[^\s<>\"']+", "[redacted-url]", text, flags=re.I)
+    text = re.sub(r"(?i)(?:www\.)?115\.com/[^\s<>\"']+", "[redacted-url]", text)
+    text = re.sub(r"(?i)(password|access[_-]?code|cookie|token|secret)\s*[:=]\s*[^\s,;，；。]+", r"\1=[redacted]", text)
+    text = re.sub(r"(访问码|提取码|密码|口令|密钥)\s*[:：=]\s*[^\s,;，；。]+", r"\1：[redacted]", text)
+    return text[:500]
+
+
 def _safe_hdhive_envelope(data: object) -> dict:
     """Keep only the non-secret part of an HDHive response envelope.
 
@@ -1591,11 +1601,7 @@ def _safe_hdhive_envelope(data: object) -> dict:
             if re.fullmatch(r"[A-Z0-9_.-]{1,80}", code):
                 result[key] = code
         elif key == "message" and isinstance(value, (str, int, float)) and value != "":
-            # Keep diagnostics useful while stripping accidental provider
-            # URLs and key/value secrets from an upstream error message.
-            message = re.sub(r"https?://[^\s<>\"']+", "[redacted-url]", str(value), flags=re.I)
-            message = re.sub(r"(?i)(password|access[_-]?code|cookie|token|secret)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", message)
-            result[key] = message[:500]
+            result[key] = _redact_hdhive_text(value)
     return result
 
 
@@ -1612,7 +1618,7 @@ def _safe_hdhive_resource_item(item: object) -> dict:
     if not isinstance(item, dict):
         return {}
     return {
-        key: item[key]
+        key: _redact_hdhive_text(item[key]) if isinstance(item[key], str) else item[key]
         for key in _SAFE_HDHIVE_RESOURCE_FIELDS
         if key in item and isinstance(item[key], (str, int, float, bool))
     }
@@ -3104,7 +3110,8 @@ def oauth_callback():
         code = "HDHIVE_INVALID_JSON" if isinstance(exc, (ValueError, TypeError)) else "HDHIVE_UNAVAILABLE"
         return json_error("HDHive OAuth 返回格式异常" if code == "HDHIVE_INVALID_JSON" else f"HDHive OAuth 换 token 失败：{type(exc).__name__}", 502, code)
     if response.status_code >= 400 or not data.get("success", False):
-        return json_error(str(data.get("message") or "HDHive OAuth 授权失败"), response.status_code if response.status_code >= 400 else 400, str(data.get("code") or "OAUTH_EXCHANGE_FAILED"))
+        safe_error = _safe_hdhive_envelope(data)
+        return json_error(str(safe_error.get("message") or "HDHive OAuth 授权失败"), response.status_code if response.status_code >= 400 else 400, str(safe_error.get("code") or "OAUTH_EXCHANGE_FAILED"))
     try:
         save_tokens(data.get("data") or {})
     except RuntimeError as exc:

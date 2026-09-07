@@ -110,12 +110,25 @@ def test_oauth_state_cannot_be_replayed(client, hidrive, http):
 def test_oauth_callback_surfaces_upstream_rejection(client, hidrive, http):
     hidrive.secret_set("hdhive_app_secret", "app-secret-for-tests")
     state = _start(client, hidrive)
-    http.route("POST", TOKEN_URL, {"success": False, "code": "INVALID_GRANT", "message": "code expired"}, status=400)
+    http.route(
+        "POST",
+        TOKEN_URL,
+        {
+            "success": False,
+            "code": "INVALID_GRANT",
+            "message": "code expired; contact https://hdhive.com/reset with password=secret",
+        },
+        status=400,
+    )
 
     response = client.get(f"/api/oauth/hdhive/callback?code=stale&state={state}")
 
     assert response.status_code == 400
-    assert response.get_json() == {"success": False, "code": "INVALID_GRANT", "message": "code expired"}
+    body = response.get_json()
+    assert body["success"] is False
+    assert body["code"] == "INVALID_GRANT"
+    assert "hdhive.com" not in body["message"]
+    assert "password=secret" not in body["message"]
     assert hidrive.get_tokens() is None
 
 

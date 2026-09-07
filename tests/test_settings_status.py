@@ -18,14 +18,18 @@ def test_status_on_fresh_install(client, hidrive):
     body = response.get_json()
     assert body["success"] is True
     assert body["auth_mode"] == "local"
-    assert body["public_origin"] == "https://hidrive.test"
+    assert body["public_origin_configured"] is True
     assert body["hdhive"]["authorized"] is False
     assert body["hdhive"]["app_secret_configured"] is False
     assert body["hdhive"]["checkin"] == {"last_success": None, "last_at": None}
     assert body["115"]["cookie_configured"] is False
     assert body["115"]["open_platform_configured"] is False
-    assert body["openlist"] == {"url": "http://openlist.test", "token_configured": False, "paths": {"115pan": "/115pan", "115strm": "/115strm"}}
-    assert body["strm"] == {"root": str(hidrive.STRM_ROOT), "exists": True}
+    assert body["openlist"] == {"configured": True, "token_configured": False, "paths": {"115pan": "/115pan", "115strm": "/115strm"}}
+    assert body["strm"] == {"exists": True}
+    assert "url" not in body["openlist"]
+    assert "root" not in body["strm"]
+    assert "target_pid" not in body["115"]
+    assert "open_root_cid" not in body["115"]
 
 
 def test_status_115_block_reports_reauth_available_and_retry_after_on_fresh_install(client, hidrive):

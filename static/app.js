@@ -405,11 +405,9 @@
     currentOpenPreset: "115pan",
     transferRoot: "/115pan",
     // T18 §12.5: the currently browsed OpenList path IS the transfer
-    // target now (no separate "选择此目录" step) -- transferRootPid/
-    // currentTransferPid are the 115 pid this client can actually PROVE
-    // corresponds to a path (init() below seeds transferRootPid from
-    // /api/status's 115.open_root_cid, the only path<->pid mapping ever
-    // exposed to the browser); currentTransferPid is kept in lockstep
+    // target now (no separate "选择此目录" step). The backend resolves
+    // the displayed path server-side; no 115 PID/CID is exposed through
+    // the diagnostics payload. currentTransferPid is kept in lockstep
     // with currentTransferPath by loadFolders() and is never invented for
     // an arbitrary subfolder -- see loadFolders' own comment.
     transferRootPid: "",
@@ -419,7 +417,8 @@
     // Lazy-tab latches (T4): OpenList/STRM only ever fetch once, on the
     // first time their tab is actually activated -- never at page load.
     openlistLoaded: false,
-    strmLoaded: false
+    strmLoaded: false,
+    targetPidDirty: false
   };
 
   // ------------------------------------------------------------------
@@ -659,16 +658,10 @@
     },
     // T18 §12.5: the browsed path is always the transfer target --
     // folderCurrent and targetPath show the identical path, and
-    // currentTransferPid is updated in the same breath: it is only ever
-    // set to a pid this client can actually prove (the OpenList "115pan"
-    // mount root's own 115_open_root_cid, the one path<->pid mapping
-    // /api/status ever exposes -- see init()) when `path` is exactly that
-    // mount root, and cleared for any subfolder -- there is no client-
-    // visible way to resolve an arbitrary subfolder's real 115 pid (that
-    // walk only ever happens server-side, in resolve_115_target_path). A
-    // cleared pid is never invented: the submit handler below just sends
-    // target_path alone in that case, exactly like the pre-existing
-    // manual-link flow, and the server resolves it itself.
+    // currentTransferPid remains empty: there is no client-visible way to
+    // resolve an arbitrary subfolder's real 115 pid (that walk happens
+    // server-side in resolve_115_target_path). The submit handler sends the
+    // target path alone and the server resolves it itself.
     loadFolders: function (path) {
       path = path === undefined ? state.currentTransferPath : path;
       state.currentTransferPath = path;
@@ -2323,6 +2316,10 @@
 
   views.settings = {
     init: function () {
+      // The diagnostics endpoint intentionally does not echo the legacy
+      // default PID/CID. Only send this setting when the operator actually
+      // edits the field, so saving a TMDB key or Cookie cannot erase it.
+      $("settingPid").addEventListener("input", function () { state.targetPidDirty = true; });
       // T10: only send tmdb_enrich_enabled once the user has actually
       // touched the switch in this page session -- otherwise a save fired
       // before refreshLibraryStatus seeds the checkbox from server state
@@ -2355,7 +2352,8 @@
         }).then(function () { $("linkcheckSave").disabled = false; });
       };
       $("settingsSave").onclick = function () {
-        var payload = { "115_target_pid": $("settingPid").value.trim() };
+        var payload = {};
+        if (state.targetPidDirty) payload["115_target_pid"] = $("settingPid").value.trim();
         var cookie = $("cookie115").value.trim();
         if (cookie) payload["115_cookie"] = cookie;
         var tmdbKey = $("tmdbKey").value.trim();
@@ -2373,6 +2371,7 @@
           if (d.tmdb && d.tmdb.configured_budget != null) $("tmdbBudget").value = d.tmdb.configured_budget;
           state.tmdbEnrichDirty = false;
           state.linkcheckDirty = false;
+          state.targetPidDirty = false;
           if (d.cookie_check) {
             feedback("settingsResult", d.cookie_check.valid ? "设置已保存，115 Cookie 可用。" : "设置已保存，但 115 Cookie 不可用。", d.cookie_check.valid ? "success" : "error");
           } else {
@@ -2632,17 +2631,17 @@
       renderStatus(s);
       state.openPaths = Object.assign(state.openPaths, s.openlist.paths || {});
       state.transferRoot = state.openPaths["115pan"] || "/115pan";
-      // T18 §12.5: the only path<->pid mapping ever exposed to the browser
-      // -- the OpenList "115pan" mount root's own 115 cid (see the
-      // transfer dialog's own folder-loading logic for how this is used).
-      state.transferRootPid = (s["115"] && s["115"].open_root_cid) || "";
+      // 115 target PIDs/CIDs are server-side values and are intentionally
+      // omitted from /api/status. Path resolution is performed on submit.
+      state.transferRootPid = "";
       state.currentTransferPath = state.transferRoot;
       state.currentTransferPid = state.transferRootPid;
       state.currentOpenPath = state.openPaths[state.currentOpenPreset] || "/";
       $("openCurrent").textContent = state.currentOpenPath;
       $("folderCurrent").textContent = state.transferRoot;
       $("targetPath").textContent = state.transferRoot;
-      $("settingPid").value = s["115"].target_pid || "";
+      // The legacy PID field is write-only from the browser's perspective;
+      // status never echoes it. Leave any operator-entered value untouched.
       $("actor").textContent = s.auth_mode === "access" ? "Cloudflare Access" : "本地测试模式";
       refreshLibraryStatus();
       refreshLinkcheckStatus();

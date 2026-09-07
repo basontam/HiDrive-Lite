@@ -448,7 +448,7 @@ def test_settings_save_writes_configured_budget_back_into_input(js):
     # fails if the writeback inside $("settingsSave").onclick is removed --
     # an unscoped search of the whole file would still pass on
     # refreshLibraryStatus's unrelated seed of the same input.
-    match = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,1600}?\n      \};', js)
+    match = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,2000}?\n      \};', js)
     assert match, "expected settingsSave onclick handler"
     body = match.group(0)
     assert re.search(r'\$\("tmdbBudget"\)\.value = .*configured_budget', body)
@@ -561,7 +561,7 @@ def test_enrich_switch_change_sets_a_dirty_flag(js):
     # the request body when that same flag is set -- an unconditional send
     # would silently disable enrichment on a save fired before
     # refreshLibraryStatus has ever seeded the checkbox from server state.
-    region = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,1600}?\n      \};', js)
+    region = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,2000}?\n      \};', js)
     assert region, "expected settingsSave onclick handler"
     assert re.search(r'if \(state\.' + flag_name + r'\) payload\["tmdb_enrich_enabled"\] = ', region.group(0))
 
@@ -574,7 +574,7 @@ def test_settings_save_resets_the_dirty_flag_on_success(js):
     assert match, "expected a change listener on #tmdbEnrichEnabled setting a state flag"
     flag_name = match.group(1)
 
-    region = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,1600}?\n      \};', js)
+    region = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,2000}?\n      \};', js)
     assert region, "expected settingsSave onclick handler"
     assert re.search(r"state\." + flag_name + r"\s*=\s*false;", region.group(0))
 

@@ -57,6 +57,20 @@ def test_oauth_callback_requires_app_secret(client, hidrive):
     assert response.get_json()["code"] == "HDHIVE_CREDENTIALS_MISSING"
 
 
+def test_oauth_callback_rejects_state_from_another_actor(client, hidrive, monkeypatch, audit_rows):
+    hidrive.secret_set("hdhive_client_id", "client-id-for-tests")
+    actors = iter(("owner", "attacker"))
+    monkeypatch.setattr(hidrive, "actor_id", lambda: next(actors))
+    state = _start(client, hidrive)
+
+    response = client.get(f"/api/oauth/hdhive/callback?code=auth-code&state={state}")
+
+    assert response.status_code == 403
+    assert response.get_json()["code"] == "OAUTH_STATE_ACTOR_MISMATCH"
+    assert hidrive.get_tokens() is None
+    assert audit_rows("hdhive.oauth.callback")[0]["detail"] == "state actor mismatch"
+
+
 def test_oauth_callback_exchanges_code_and_stores_encrypted_tokens(client, hidrive, http, audit_rows):
     hidrive.secret_set("hdhive_app_secret", "app-secret-for-tests")
     state = _start(client, hidrive)

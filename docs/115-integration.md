@@ -14,6 +14,11 @@ proxy for anonymous or third-party accounts.
 All three are encrypted with the Fernet master key. They are never returned by
 status APIs or written to logs.
 
+The status endpoint only exposes whether the target PID/Open Platform pair is
+configured; it intentionally does not return the numeric PID/CID or any
+filesystem path. The browser sends the displayed logical path and the server
+performs the path-to-CID walk immediately before the receive request.
+
 ## Transfer sequence
 
 1. The detail page sends `resource_link_id` and the displayed target path.

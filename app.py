@@ -31,10 +31,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
+from dotenv import load_dotenv
 import jwt
 import requests
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request
+
+# Load a repository-local .env for clone-and-run installations. Explicit
+# process environment variables still win (python-dotenv never overwrites
+# them), while access mode continues to require encrypted provider secrets.
+load_dotenv()
 
 import library_normalize
 import library_search
@@ -1566,6 +1572,103 @@ def list_openlist(path: str, page: int = 1) -> tuple[dict, int]:
         return {"success": False, "code": "OPENLIST_UNAVAILABLE", "message": type(exc).__name__}, 502
 
 
+def _safe_hdhive_envelope(data: object) -> dict:
+    """Keep only the non-secret part of an HDHive response envelope.
+
+    HDHive resource and unlock responses may contain provider share URLs,
+    access codes, or opaque download tokens. Those values are useful to the
+    server-side adapter but must not be reflected into a browser response.
+    Error codes/messages remain available for diagnosis, while successful
+    payloads are normalized by the endpoint-specific helpers below.
+    """
+    if not isinstance(data, dict):
+        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "HDHive 返回格式异常"}
+    result: dict[str, object] = {"success": bool(data.get("success", False))}
+    for key in ("code", "message"):
+        value = data.get(key)
+        if key == "code" and isinstance(value, (str, int, float)):
+            code = str(value)
+            if re.fullmatch(r"[A-Z0-9_.-]{1,80}", code):
+                result[key] = code
+        elif key == "message" and isinstance(value, (str, int, float)) and value != "":
+            # Keep diagnostics useful while stripping accidental provider
+            # URLs and key/value secrets from an upstream error message.
+            message = re.sub(r"https?://[^\s<>\"']+", "[redacted-url]", str(value), flags=re.I)
+            message = re.sub(r"(?i)(password|access[_-]?code|cookie|token|secret)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", message)
+            result[key] = message[:500]
+    return result
+
+
+_SAFE_HDHIVE_RESOURCE_FIELDS = {
+    "id", "resource_id", "slug", "title", "name", "description", "overview",
+    "media_type", "tmdb_id", "imdb_id", "tvmaze_id", "year", "release_date",
+    "quality", "resolution", "dynamic_range", "source_type", "language",
+    "audio", "subtitle", "size", "status", "points", "requires_points",
+    "owned", "unlocked", "created_at", "updated_at",
+}
+
+
+def _safe_hdhive_resource_item(item: object) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    return {
+        key: item[key]
+        for key in _SAFE_HDHIVE_RESOURCE_FIELDS
+        if key in item and isinstance(item[key], (str, int, float, bool))
+    }
+
+
+def _safe_hdhive_resources_response(data: object) -> dict:
+    result = _safe_hdhive_envelope(data)
+    if not isinstance(data, dict) or not data.get("success", False):
+        return result
+    raw = data.get("data")
+    if isinstance(raw, list):
+        result["data"] = [_safe_hdhive_resource_item(item) for item in raw]
+        result["resource_count"] = len(raw)
+    elif isinstance(raw, dict):
+        # Some deployments wrap resources in ``items``/``resources`` and add
+        # pagination metadata. Preserve only counters and normalized items.
+        items = raw.get("items") if isinstance(raw.get("items"), list) else raw.get("resources")
+        if isinstance(items, list):
+            result["data"] = [_safe_hdhive_resource_item(item) for item in items]
+            result["resource_count"] = len(items)
+        else:
+            result["data"] = _safe_hdhive_resource_item(raw)
+        for key in ("total", "page", "pages", "per_page"):
+            value = raw.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                result[key] = value
+    else:
+        result["data"] = []
+        result["resource_count"] = 0
+    return result
+
+
+def _safe_hdhive_unlock_response(data: object) -> dict:
+    """Return unlock state without returning a share URL or access code."""
+    result = _safe_hdhive_envelope(data)
+    if not isinstance(data, dict) or not data.get("success", False):
+        return result
+    raw = data.get("data")
+    link_count = 0
+    if isinstance(raw, dict):
+        for key in ("links", "resources", "items"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                link_count = max(link_count, len(value))
+        summary = _safe_hdhive_resource_item(raw)
+    elif isinstance(raw, list):
+        link_count = len(raw)
+        summary = {}
+    else:
+        summary = {}
+    summary["links_available"] = link_count > 0
+    summary["link_count"] = link_count
+    result["data"] = summary
+    return result
+
+
 def status_payload(verify_115: bool = False) -> dict:
     row = get_tokens()
     n115 = cookie_status(verify=verify_115)
@@ -1574,7 +1677,9 @@ def status_payload(verify_115: bool = False) -> dict:
     return {
         "app": APP_NAME,
         "auth_mode": AUTH_MODE,
-        "public_origin": PUBLIC_ORIGIN,
+        # The browser already knows its origin from the current URL. Do not
+        # echo deployment URLs or filesystem paths through a diagnostics API.
+        "public_origin_configured": bool(PUBLIC_ORIGIN),
         "hdhive": {
             "app_secret_configured": bool(config_value("hdhive_app_secret", "HDHIVE_APP_SECRET")),
             "client_id_configured": bool(config_value("hdhive_client_id", "HDHIVE_CLIENT_ID")),
@@ -1596,12 +1701,12 @@ def status_payload(verify_115: bool = False) -> dict:
             "cookie_error_code": n115["error_code"],
             "retry_after": n115["retry_after"],
             "reauth_available": _115_reauth_available(actor_id()),
-            "target_pid": setting_get("115_target_pid", ""),
+            "target_pid_configured": bool(setting_get("115_target_pid", "")),
             "open_platform_configured": bool(config_value("115_open_access_token", "115_open_access_token") and config_value("115_open_refresh_token", "115_open_refresh_token")),
-            "open_root_cid": setting_get("115_open_root_cid", "0"),
+            "open_root_cid_configured": bool(setting_get("115_open_root_cid", "")),
         },
-        "openlist": {"url": OPENLIST_URL, "token_configured": bool(config_value("openlist_token", "OPENLIST_TOKEN")), "paths": {"115pan": OPENLIST_115PAN_PATH, "115strm": OPENLIST_115STRM_PATH}},
-        "strm": {"root": str(STRM_ROOT), "exists": STRM_ROOT.exists()},
+        "openlist": {"configured": bool(OPENLIST_URL), "token_configured": bool(config_value("openlist_token", "OPENLIST_TOKEN")), "paths": {"115pan": OPENLIST_115PAN_PATH, "115strm": OPENLIST_115STRM_PATH}},
+        "strm": {"exists": STRM_ROOT.exists()},
         "library": _library_status_summary(),
     }
 
@@ -2978,10 +3083,14 @@ def oauth_callback():
     state = request.args.get("state", "").strip()
     if not code or not state:
         return json_error("HDHive OAuth 回调缺少 code/state", 400, "OAUTH_CALLBACK_INVALID")
+    current_actor = actor_id()
     with connect_db() as db:
         row = db.execute("SELECT * FROM oauth_states WHERE state=? AND used_at IS NULL AND expires_at>=?", (state, utc_now())).fetchone()
         if not row:
             return json_error("OAuth state 无效或已过期", 400, "OAUTH_STATE_INVALID")
+        if str(row["created_by"] or "") != current_actor:
+            audit("hdhive.oauth.callback", "failed", "state actor mismatch", current_actor)
+            return json_error("OAuth state 不属于当前用户", 403, "OAUTH_STATE_ACTOR_MISMATCH")
         db.execute("UPDATE oauth_states SET used_at=? WHERE state=?", (utc_now(), state))
     secret = config_value("hdhive_app_secret", "HDHIVE_APP_SECRET")
     client_id = config_value("hdhive_client_id", "HDHIVE_CLIENT_ID")
@@ -3000,7 +3109,7 @@ def oauth_callback():
         save_tokens(data.get("data") or {})
     except RuntimeError as exc:
         return json_error(str(exc), 502, "OAUTH_TOKEN_INVALID")
-    audit("hdhive.oauth.callback", "success", "encrypted access/refresh tokens stored", actor_id())
+    audit("hdhive.oauth.callback", "success", "encrypted access/refresh tokens stored", current_actor)
     return redirect("/?oauth=success")
 
 
@@ -3011,17 +3120,18 @@ def api_hdhive_resources():
     if media_type not in {"movie", "tv"} or not tmdb_id.isdigit():
         return json_error("media_type 必须为 movie/tv，tmdb_id 必须为数字")
     data, status = hdhive_request("GET", f"/api/open/resources/{media_type}/{tmdb_id}")
-    return jsonify(data), status
+    return jsonify(_safe_hdhive_resources_response(data)), status
 
 
 @app.post("/api/hdhive/checkin")
 def api_hdhive_checkin():
     data, status = hdhive_request("POST", HDHIVE_CHECKIN_PATH, payload={})
-    success = bool(data.get("success")) and status < 400
+    safe = _safe_hdhive_envelope(data)
+    success = bool(safe.get("success")) and status < 400
     with connect_db() as db:
-        db.execute("INSERT INTO checkins(success,code,message,created_at) VALUES(?,?,?,?)", (int(success), str(data.get("code") or status), str(data.get("message") or "")[:500], utc_now()))
-    audit("hdhive.checkin", "success" if success else "failed", str(data.get("code") or status), actor_id())
-    return jsonify(data), status
+        db.execute("INSERT INTO checkins(success,code,message,created_at) VALUES(?,?,?,?)", (int(success), str(safe.get("code") or status), str(safe.get("message") or "")[:500], utc_now()))
+    audit("hdhive.checkin", "success" if success else "failed", str(safe.get("code") or status), actor_id())
+    return jsonify(safe), status
 
 
 @app.post("/api/hdhive/unlock")
@@ -3037,7 +3147,7 @@ def api_hdhive_unlock():
     data, status = hdhive_request("POST", "/api/open/resources/unlock", payload=payload)
     if status < 400 and data.get("success"):
         audit("hdhive.unlock", "success", "points unlock requested" if allow_points else "free or already-owned resource; link omitted from audit", actor_id())
-    return jsonify(data), status
+    return jsonify(_safe_hdhive_unlock_response(data)), status
 
 
 @app.get("/api/hdhive/search")

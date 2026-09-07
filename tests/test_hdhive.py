@@ -9,6 +9,7 @@ from conftest import FakeResponse
 TMDB_MULTI = "https://api.themoviedb.org/3/search/multi"
 RESOURCES_URL = "https://hdhive.com/api/open/resources/movie/603"
 UNLOCK_URL = "https://hdhive.com/api/open/resources/unlock"
+CHECKIN_URL = "https://hdhive.com/api/open/checkin"
 REFRESH_URL = "https://hdhive.com/api/public/openapi/oauth/refresh"
 
 
@@ -118,10 +119,27 @@ def test_resources_proxies_upstream_with_bearer_and_api_key(client, hidrive, htt
     response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
 
     assert response.status_code == 200
-    assert response.get_json() == upstream
+    assert response.get_json() == {"success": True, "data": [{"slug": "matrix-1999", "title": "The Matrix", "points": 0}], "resource_count": 1}
     (call,) = http.calls_to(RESOURCES_URL)
     assert call["headers"]["Authorization"] == "Bearer access-1"
     assert call["headers"]["X-API-Key"] == "app-secret-for-tests"
+
+
+def test_resources_filters_share_urls_and_access_codes_from_browser(client, hidrive, http):
+    _authorize(hidrive)
+    http.route(
+        "GET",
+        RESOURCES_URL,
+        {"success": True, "data": [{"slug": "matrix-1999", "title": "The Matrix", "share_url": "https://115.com/s/secret", "access_code": "abcd", "download_token": "token"}]},
+    )
+
+    response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["data"] == [{"slug": "matrix-1999", "title": "The Matrix"}]
+    assert "115.com" not in response.get_data(as_text=True)
+    assert "access_code" not in response.get_data(as_text=True)
 
 
 def test_upstream_refresh_demand_retries_once_with_locally_valid_token(client, hidrive, http):
@@ -171,6 +189,18 @@ def test_resources_reports_upstream_outage(client, hidrive, http):
     assert response.get_json()["code"] == "UPSTREAM_UNAVAILABLE"
 
 
+def test_checkin_response_is_anonymized(client, hidrive, http):
+    _authorize(hidrive)
+    http.route("POST", CHECKIN_URL, {"success": True, "message": "ok", "share_url": "https://115.com/s/private", "token": "secret"})
+
+    response = client.post("/api/hdhive/checkin")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"success": True, "message": "ok"}
+    assert "115.com" not in response.get_data(as_text=True)
+    assert "secret" not in response.get_data(as_text=True)
+
+
 # --- unlock -----------------------------------------------------------------
 
 
@@ -187,6 +217,9 @@ def test_unlock_posts_slug_without_points_by_default(client, hidrive, http, audi
     response = client.post("/api/hdhive/unlock", json={"slug": "matrix-1999", "allow_points": "yes"})
 
     assert response.status_code == 200
+    assert response.get_json() == {"success": True, "data": {"links_available": True, "link_count": 1}}
+    assert "115.com" not in response.get_data(as_text=True)
+    assert "password" not in response.get_data(as_text=True)
     (call,) = http.calls_to(UNLOCK_URL)
     assert call["json"] == {"slug": "matrix-1999"}
     (entry,) = audit_rows("hdhive.unlock")

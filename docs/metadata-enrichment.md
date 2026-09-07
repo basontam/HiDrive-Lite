@@ -21,3 +21,9 @@ Recommended policy:
 
 Set `TMDB_DAILY_BUDGET` only as a safety cap. The actual configured budget is
 stored in encrypted application settings and can be lower.
+
+The optional HDHive compatibility endpoints normalize successful resource and
+unlock responses before returning them to a browser. Share URLs, access codes,
+cookies, bearer tokens and download URLs are never reflected in JSON; callers
+receive metadata plus link counts and must use the library's server-side
+transfer flow for a 115 receive operation.

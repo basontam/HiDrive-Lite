@@ -15,6 +15,9 @@ import time
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 OPENLIST_DB = Path(os.getenv("OPENLIST_DB", "./data/openlist.db"))

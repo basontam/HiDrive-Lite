@@ -1,6 +1,9 @@
 services:
   hidrive-lite:
     build: .
+    # Match the bind-mounted data/key ownership on the host. Set these to the
+    # UID/GID that owns ./data and ./secrets before starting the stack.
+    user: "${HIDRIVE_UID:-1000}:${HIDRIVE_GID:-1000}"
     restart: unless-stopped
     init: true
     ports:

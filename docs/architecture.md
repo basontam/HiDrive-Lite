@@ -37,3 +37,9 @@ opaque `resource_link_id`; the server decrypts and parses the link just in time,
 validates the target directory, and records a redacted audit result. Non-115
 providers use the existing open/copy path and are not sent to the 115 receive
 endpoint.
+
+The optional HDHive resource/unlock routes follow the same browser boundary:
+they return a small metadata envelope and link counts, never upstream share
+URLs, access codes, cookies, or bearer tokens. OAuth state is bound to the
+actor that initiated it; a callback from another actor is rejected before the
+state is consumed.

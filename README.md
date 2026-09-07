@@ -63,6 +63,10 @@ The Fernet master key is outside Git at `HIDRIVE_MASTER_KEY_FILE`. Keep the key
 and encrypted databases in separate protected backups. Never commit `data/`,
 `secrets/`, databases, workbooks, provider Cookies, access codes or logs.
 
+The public status API is redacted and the optional HDHive compatibility routes
+do not reflect upstream share URLs or access codes. See
+`docs/configuration.md` for Docker UID/GID and OpenList connectivity details.
+
 ## Importing your library
 
 The importer is dry-run by default and accepts source files outside the

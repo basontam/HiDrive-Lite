@@ -17,10 +17,12 @@ import time
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+load_dotenv(ROOT / ".env")
 
 
 def _write_key(path: Path) -> None:
@@ -130,13 +132,13 @@ def _build_demo_bundle(bundle: Path) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, default=Path("data"))
-    parser.add_argument("--key-file", type=Path, default=Path("secrets/master.key"))
+    parser.add_argument("--data-dir", type=Path, default=None)
+    parser.add_argument("--key-file", type=Path, default=None)
     parser.add_argument("--demo", action="store_true", help="install the fictional demo media library")
     args = parser.parse_args()
 
-    data_dir = args.data_dir.expanduser().resolve()
-    key_file = args.key_file.expanduser().resolve()
+    data_dir = (args.data_dir or Path(os.getenv("HIDRIVE_DATA_DIR", "data"))).expanduser().resolve()
+    key_file = (args.key_file or Path(os.getenv("HIDRIVE_MASTER_KEY_FILE", "secrets/master.key"))).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "strm").mkdir(parents=True, exist_ok=True)
     _write_key(key_file)

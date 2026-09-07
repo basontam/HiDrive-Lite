@@ -1385,5 +1385,5 @@ def test_reauth_status_complete_worst_case_stays_under_26s_of_simulated_time(cli
 
     assert response.get_json()["state"] == "authenticated"
     expected = 2 * (hidrive._115_UPSTREAM_CONNECT_TIMEOUT + hidrive._115_UPSTREAM_TIMEOUT)
-    assert elapsed == expected
+    assert elapsed == pytest.approx(expected)
     assert elapsed < 26

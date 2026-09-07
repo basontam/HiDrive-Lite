@@ -1,0 +1,520 @@
+/* HiDrive-Lite shell styles.
+ * Tokens follow docs/architecture.md §2
+ * (neutral colours, radius scale, motion) with the accent kept at the
+ * existing HiDrive-Lite blue and the dark palette kept as-is (per the
+ * construction plan §8.7). Breakpoints follow spec §18.
+ */
+
+:root {
+  color-scheme: light;
+  --bg: #f5f6f9;
+  --surface: #ffffff;
+  --surface-solid: #fff;
+  --surface-hover: #eff0f5;
+  --line: #dcdeea;
+  --text: #181822;
+  --muted: #626276;
+  --placeholder: #89899c;
+  --accent: #007aff;
+  --accent-strong: #0066d6;
+  --success: #34c759;
+  --warning: #ff9f0a;
+  --danger: #ff3b30;
+  /* T18 §14.4: rating-source brand colours (Simple Icons canonical hex),
+     used only to tint the small decorative source icon -- readable text
+     (score/votes) stays --text/--muted in both colour schemes. */
+  --brand-tmdb: #01b4e4;
+  --brand-imdb: #f5c518;
+  --shadow: 0 18px 48px rgba(0, 0, 0, .08);
+  --shadow-hover: 0 22px 56px rgba(0, 0, 0, .14);
+  --shadow-dialog: 0 28px 90px rgba(0, 0, 0, .24);
+  --radius-sm: 7px;
+  --radius-md: 11px;
+  --radius-lg: 16px;
+  --radius-dialog: 21px;
+  --radius-pill: 999px;
+  --duration: 280ms;
+  --ease: cubic-bezier(.22, 1, .36, 1);
+  --content-width: 1440px;
+  /* y1-cards §2.1: the one poster-box contract shared by the grid and the
+     rails -- image, fallback and skeleton all fill this same box. */
+  --poster-ratio: 2 / 3;
+  --poster-rail-width: 150px;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #1c1c1e;
+    --surface: rgba(44, 44, 46, .86);
+    --surface-solid: #2c2c2e;
+    --line: rgba(235, 235, 245, .18);
+    --text: #f5f5f7;
+    --muted: #98989d;
+    --accent: #0a84ff;
+    --accent-strong: #0066d6;
+    --success: #30d158;
+    --warning: #ffd60a;
+    --danger: #ff453a;
+    --shadow: 0 18px 48px rgba(0, 0, 0, .24);
+    --shadow-hover: 0 22px 60px rgba(0, 0, 0, .32);
+    --shadow-dialog: 0 28px 96px rgba(0, 0, 0, .42);
+  }
+}
+
+*{box-sizing:border-box}
+body{min-height:100vh;margin:0;background:radial-gradient(circle at 85% -15%,rgba(0,122,255,.12),transparent 36%),var(--bg)}
+body.modal-open{overflow:hidden}
+
+/* Shell layout ----------------------------------------------------- */
+.app-shell{max-width:var(--content-width);margin:0 auto;padding:28px 32px 52px}
+.site-sticky{position:sticky;top:0;z-index:8;margin:0 -32px 24px;padding:12px 32px 0;background:color-mix(in srgb,var(--bg) 78%,transparent);backdrop-filter:blur(18px)}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:16px}
+.brand h1{margin:0;font-size:27px;letter-spacing:-.025em}
+.brand p{margin:3px 0 0;color:var(--muted);font-size:13px}
+.access-badge{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border:1px solid var(--line);border-radius:var(--radius-pill);color:var(--muted);font-size:12px;background:var(--surface)}
+.access-badge:before{content:"";width:7px;height:7px;border-radius:50%;background:var(--success)}
+
+.workspace-nav{display:flex;align-items:center;gap:5px;overflow-x:auto;margin-bottom:24px;padding:6px;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface);box-shadow:var(--shadow);backdrop-filter:blur(22px)}
+.nav-item{display:inline-flex;align-items:center;justify-content:center;gap:9px;min-height:38px;margin:0;padding:8px 16px;border:0;border-radius:var(--radius-md);background:transparent;color:var(--muted);font-size:14px;text-align:center;white-space:nowrap;transition:background var(--duration) var(--ease),color var(--duration) var(--ease)}
+.nav-item:hover{background:rgba(120,120,128,.12);color:var(--text)}
+.nav-item[aria-selected="true"]{background:var(--text);color:var(--bg)}
+.nav-icon{display:inline-grid;place-items:center;width:18px;height:18px}
+.nav-icon svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.icon{width:24px;height:24px;display:inline-block;flex:0 0 auto;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+#libraryFiltersToggle{display:inline-flex;align-items:center;gap:6px}
+#libraryFiltersToggle .icon{width:18px;height:18px}
+.workspace-status{display:inline-flex;align-items:center;gap:7px;margin-left:auto;padding:0 12px;color:var(--muted);font-size:11px;white-space:nowrap}
+
+.content{min-width:0}
+.page-intro{margin:4px 0 20px}
+.eyebrow{color:var(--accent);font-size:12px;font-weight:600;letter-spacing:.05em}
+.page-intro h2{margin:5px 0 7px;font-size:clamp(40px,3vw + 24px,48px);font-weight:700;letter-spacing:-.03em}
+.page-intro p{max-width:700px;margin:0;color:var(--muted);font-size:14px;line-height:1.6}
+
+.app-footer{margin-top:48px;padding-top:20px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.6}
+
+/* Cards and forms ---------------------------------------------------- */
+.card{padding:22px;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface);box-shadow:var(--shadow);backdrop-filter:blur(22px)}
+.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;margin-bottom:16px}
+.section-head h3{margin:0;font-size:18px;letter-spacing:-.02em}
+.section-head p{margin:5px 0 0;color:var(--muted);font-size:13px;line-height:1.5}
+.settings-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px;align-items:stretch}
+.settings-grid>.card{height:100%;min-width:0}
+.field{display:grid;gap:7px;margin:13px 0}
+.field label,.field-label-static{font-size:12px;color:var(--muted)}
+.field-label-static{display:block;margin-bottom:7px}
+input,select,button{font:inherit}
+input,select{width:100%;min-height:38px;padding:8px 11px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--surface-solid);color:var(--text);outline:none;transition:border-color var(--duration) var(--ease),box-shadow var(--duration) var(--ease)}
+input::placeholder{color:var(--muted)}
+input:focus,select:focus{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 20%,transparent)}
+button{min-height:38px;padding:8px 14px;border:1px solid var(--accent);border-radius:var(--radius-md);background:var(--accent-strong);color:#fff;cursor:pointer;font-weight:600;transition:background var(--duration) var(--ease),transform var(--duration) var(--ease)}
+button:hover{background:var(--accent-strong)}
+button:active{transform:scale(.98)}
+button:disabled{opacity:.48;cursor:not-allowed;transform:none}
+button.loading{cursor:progress}
+button:disabled:hover{background:var(--accent-strong)}
+button.secondary{border-color:var(--line);background:transparent;color:var(--text)}
+button.secondary:hover{background:rgba(120,120,128,.12)}
+button.tertiary{min-height:32px;padding:5px 10px;border-color:var(--line);background:transparent;color:var(--accent);font-size:12px}
+
+/* Focus-visible ring (RE0 §17: >=2-3px, not colour-only) ------------- */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 40%,transparent);outline-offset:2px}
+
+.feedback{margin-top:13px;padding:10px 12px;border-radius:var(--radius-md);background:rgba(120,120,128,.1);color:var(--muted);font-size:13px;line-height:1.5}
+.feedback.success{background:color-mix(in srgb,var(--success) 13%,transparent);color:color-mix(in srgb,var(--success) 75%,var(--text))}
+.feedback.error{background:color-mix(in srgb,var(--danger) 12%,transparent);color:color-mix(in srgb,var(--danger) 78%,var(--text))}
+.feedback.warn{background:color-mix(in srgb,var(--warning) 13%,transparent);color:color-mix(in srgb,var(--warning) 70%,var(--text))}
+.feedback[hidden]{display:none}
+.empty{padding:16px;border-radius:var(--radius-md);background:rgba(120,120,128,.08);color:var(--muted);font-size:13px}
+
+.status-list{display:grid;gap:0}
+.status-row{display:grid;grid-template-columns:16px minmax(155px,1fr) minmax(130px,1.5fr);gap:8px;align-items:center;padding:11px 0;border-bottom:1px solid var(--line)}
+.status-row:last-child{border-bottom:0}
+.status-label{font-size:13px}
+.status-value{color:var(--muted);font-size:12px;text-align:right}
+.status-value code,code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;overflow-wrap:anywhere}
+.status-mark{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.status-mark.ok{background:var(--success)}
+.status-mark.off{background:var(--line)}
+.status-mark.warn{background:var(--warning)}
+.status-mark.bad{background:var(--danger)}
+
+.scrape-status{display:grid;gap:6px;margin:14px 0;font-size:13px;color:var(--muted)}
+.scrape-status p{margin:0}
+.scrape-actions{display:flex;gap:10px;flex-wrap:wrap}
+/* w6-contract §5/§UI item 4: one row per phase-1 provider in the "资源有效
+   性检测" settings card -- a thin top rule separates rows (first row has
+   none), the switch sits flush right of the label via margin-left:auto. */
+.linkcheck-provider{border-top:1px solid var(--line);padding-top:12px;margin-top:12px}
+.linkcheck-provider:first-child{border-top:0;padding-top:0;margin-top:0}
+.linkcheck-provider-head{display:flex;align-items:center;gap:8px}
+.linkcheck-provider-head .switch-field{margin-left:auto}
+.linkcheck-provider-label{font-weight:600;font-size:13px}
+
+/* Library hero (T4): cinematic focus block, shown only for a real backdrop */
+.library-hero{position:relative;height:340px;margin-bottom:20px;border-radius:var(--radius-lg);overflow:hidden;background:#0c0d12;box-shadow:var(--shadow)}
+.library-hero-media{position:absolute;inset:0}
+.library-hero-backdrop{width:100%;height:100%;object-fit:cover;display:block;opacity:.9}
+.library-hero-overlay{position:absolute;inset:0;background:linear-gradient(90deg,rgba(6,7,12,.92),rgba(6,7,12,.35) 60%),linear-gradient(0deg,rgba(6,7,12,.85),transparent 55%)}
+.library-hero-content{position:relative;display:flex;flex-direction:column;align-items:flex-start;gap:10px;max-width:560px;height:100%;padding:32px 40px;color:#fff;justify-content:flex-end}
+.library-hero-type{background:rgba(255,255,255,.16);color:#fff}
+.library-hero-title{margin:0;font-size:clamp(28px,2.4vw + 18px,40px);font-weight:800;letter-spacing:-.02em}
+.library-hero-overview{margin:0;max-width:520px;color:rgba(255,255,255,.82);font-size:14px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.library-hero-cta{margin-top:4px}
+@media (max-width:760px){
+  .library-hero{height:280px}
+  .library-hero-content{padding:22px 20px}
+  .library-hero-overview{-webkit-line-clamp:2}
+}
+
+/* Content rails (T4): horizontally scrolling poster tracks on the home view */
+.content-rails{display:flex;flex-direction:column;gap:26px;margin:22px 0}
+.rail-head{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:12px}
+.rail-head h3{margin:0;font-size:24px;font-weight:680;letter-spacing:-.01em}
+.rail-track{display:flex;gap:16px;overflow-x:auto;padding-bottom:6px;scroll-snap-type:x proximity}
+.rail-track .media-card{flex:0 0 var(--poster-rail-width);width:var(--poster-rail-width);scroll-snap-align:start}
+.rail[hidden]{display:none}
+
+/* Library home (T5.3): search, chips, filters, results grid, pagination -- */
+.library-search-card{position:relative}
+.library-search-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.search-field{position:relative;flex:1;min-width:220px;display:flex;align-items:center}
+.search-field input{width:100%;padding-left:36px}
+.search-field-icon{position:absolute;left:11px;display:grid;place-items:center;width:18px;height:18px;color:var(--muted);pointer-events:none}
+.search-field-icon .icon{width:16px;height:16px}
+.suggest-list{position:absolute;z-index:5;left:0;right:0;top:calc(100% + 6px);margin:0;padding:6px;list-style:none;max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--surface-solid);box-shadow:var(--shadow)}
+.suggest-list[hidden]{display:none}
+.suggest-list li{display:flex;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:var(--radius-sm);font-size:13px;cursor:pointer}
+.suggest-list li:hover,.suggest-list li[aria-selected="true"]{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.suggest-year{color:var(--muted);font-size:12px}
+.segmented{display:inline-flex;padding:3px;gap:2px;border-radius:var(--radius-pill);background:var(--surface-hover)}
+.segmented button{min-height:32px;padding:5px 13px;border:0;border-radius:var(--radius-pill);background:transparent;color:var(--muted);font-size:13px;font-weight:600}
+.segmented button[aria-pressed="true"]{background:var(--surface-solid);color:var(--text);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+.chip-row{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px}
+.chip-row[hidden]{display:none}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 6px 5px 11px;border-radius:var(--radius-pill);background:color-mix(in srgb,var(--accent) 12%,transparent);color:var(--accent-strong);font-size:12px}
+.chip-remove{min-height:20px;min-width:20px;padding:0;border:0;border-radius:50%;background:transparent;color:inherit;font-size:14px;line-height:1}
+.chip-remove:hover{background:color-mix(in srgb,var(--accent) 20%,transparent)}
+.filter-anchor{position:relative}
+.filter-badge{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;border-radius:var(--radius-pill);background:var(--accent);color:#fff;font-size:10px;font-weight:700;line-height:16px}
+.filter-badge[hidden]{display:none}
+/* T16 §6: the filter panel is a body-level popover (portal-to-body via
+   static placement in the template, not a descendant of the scrollable/
+   stacking-context-heavy poster wall) positioned with `position:fixed`
+   from the toggle button's own getBoundingClientRect() -- see
+   views.library.positionFilters() in app.js. z-index sits well above any
+   card/rail stacking context; the scrim is a full-viewport click target
+   for "click outside closes" plus a light dimming layer so the poster
+   wall reads as inert while the panel is open. */
+.popover-scrim{position:fixed;inset:0;z-index:999;border:0;margin:0;padding:0;background:rgba(15,15,20,.12);cursor:default}
+.popover-scrim[hidden]{display:none}
+.library-filters-popover{position:fixed;z-index:1000;display:flex;flex-direction:column;gap:16px;width:min(360px,calc(100vw - 32px));max-height:min(72vh,720px);overflow:auto;padding:18px;border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface-solid);box-shadow:var(--shadow-hover)}
+.library-filters-popover[hidden]{display:none}
+.popover-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.popover-head h3{margin:0;font-size:15px}
+.filter-field{min-width:150px;margin:0}
+fieldset.filter-group{display:grid;gap:7px;min-width:0;margin:0;padding:0;border:0}
+.filter-label{font-size:12px;color:var(--muted);padding:0}
+.chip-toggle-row{display:flex;flex-wrap:wrap;gap:7px}
+.chip-toggle{min-height:30px;padding:5px 12px;border:1px solid var(--line);border-radius:var(--radius-pill);background:var(--surface-solid);color:var(--text);font-size:12px;font-weight:500}
+.chip-toggle:hover{background:var(--surface-hover)}
+.chip-toggle[aria-pressed="true"]{border-color:var(--accent);background:color-mix(in srgb,var(--accent-strong) 14%,transparent);color:var(--accent-strong)}
+.chip-toggle:disabled{opacity:.4;cursor:not-allowed}
+.switch-field{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text)}
+.switch-field input{width:auto;min-height:0}
+.results-status{margin:18px 2px 12px;color:var(--muted);font-size:13px}
+.results-status[hidden]{display:none}
+.media-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+.media-grid[hidden]{display:none}
+@media (min-width:768px){.media-grid{grid-template-columns:repeat(3,1fr)}}
+@media (min-width:1024px){.media-grid{grid-template-columns:repeat(5,1fr)}}
+.media-card{display:flex;flex-direction:column;gap:6px;padding:0;border:0;background:transparent;color:var(--text);text-align:left;border-radius:var(--radius-md);cursor:pointer}
+.media-card:hover{background:var(--surface-hover)}
+/* y1-cards §2.1: one poster box per card, shared by the grid and the
+   rails -- explicit width/ratio, never sized by the image's natural
+   dimensions. img/fallback/skeleton all fill it via position:absolute. */
+.media-card .poster{position:relative;display:block;width:100%;aspect-ratio:var(--poster-ratio);height:auto;min-height:0;overflow:hidden;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--surface-hover)}
+.media-card .poster img{position:absolute;inset:0;width:100%;height:100%;min-width:0;min-height:0;object-fit:cover;display:block}
+.media-card .poster img.poster-broken{display:none}
+.poster-fallback{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:10px;background:linear-gradient(155deg,var(--surface-hover),var(--surface-solid) 75%);color:var(--muted);font-size:12px;text-align:center;line-height:1.4}
+.poster-fallback .icon{width:28px;height:28px;opacity:.55}
+/* T18 §14.4: the card's one "unhurried" primary rating badge, tucked into
+   the poster box's own top-left corner -- absolutely positioned inside
+   the already position:relative .poster box, so it never changes that
+   box's own width/height (y1-cards §2.1/§2.3 geometry contract). */
+.card-rating-badge{position:absolute;left:6px;top:6px;z-index:1;display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:var(--radius-pill);background:rgba(12,13,18,.72);color:#fff;font-size:11px;font-weight:700}
+.card-rating-badge .rating-badge-icon{width:11px;height:11px;color:#fff;flex:0 0 auto}
+/* w6-contract §UI item 3: opposite corner from .card-rating-badge above,
+   so a title with both a primary rating and every link invalid never
+   overlaps the two -- same translucent-dark treatment, muted red text. */
+.card-invalid-badge{position:absolute;right:6px;top:6px;z-index:1;padding:2px 6px;border-radius:var(--radius-pill);background:rgba(12,13,18,.72);color:color-mix(in srgb,var(--danger) 70%,var(--text));font-size:11px;font-weight:700}
+/* y1-cards §1.1: the footer below the poster is only ever a title + one
+   meta line now -- still a fixed-height block (min-height==height plus
+   overflow:hidden) so a card's total height never depends on content.
+   Row heights: 32(title)+14(meta) + 1*4px gap = 50px, matching
+   .card-footer below (verified in scripts/ui_screenshots.py). */
+.media-card .card-footer{display:flex;flex-direction:column;gap:4px;height:50px;min-height:50px;overflow:hidden}
+.media-card .card-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;height:32px;line-height:16px;font-size:13px;font-weight:700}
+.media-card .card-meta{height:14px;line-height:14px;color:var(--muted);font-size:11px}
+.badge-match{align-self:flex-start;padding:2px 8px;border-radius:var(--radius-pill);background:color-mix(in srgb,var(--warning) 20%,transparent);color:color-mix(in srgb,var(--warning) 70%,var(--text));font-size:10px}
+.match-note{color:var(--muted);font-size:11px}
+.media-card:hover .poster,.media-card:focus-visible .poster{transform:translateY(-2px);box-shadow:var(--shadow-hover)}
+.media-card .poster{transition:transform var(--duration) var(--ease),box-shadow var(--duration) var(--ease)}
+/* y1-cards §2.1/§2.2: the loading skeleton reuses the same nested .poster
+   box (position/ratio/size come from ".media-card .poster" above) --
+   only the shimmer fill is skeleton-specific. */
+.skeleton-card .poster{background:linear-gradient(100deg,rgba(120,120,128,.08) 30%,rgba(120,120,128,.16) 50%,rgba(120,120,128,.08) 70%);background-size:200% 100%;animation:skeleton-shimmer 1.4s ease-in-out infinite}
+@keyframes skeleton-shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+.pagination{display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px;margin-top:20px}
+.pagination[hidden]{display:none}
+.page-btn{min-height:34px;padding:6px 12px;font-size:12px}
+.page-btn:disabled{opacity:.4;cursor:not-allowed}
+.page-current{padding:0 6px;color:var(--muted);font-size:12px}
+
+/* Media detail (T4/T5.4) ------------------------------------------------ */
+.library-detail[hidden]{display:none}
+.library-detail #detailBack{margin-bottom:16px;display:inline-flex;align-items:center;gap:6px}
+.library-detail #detailBack .icon{width:18px;height:18px}
+.detail-hero{position:relative}
+/* T21 §8.2/§8.3: layered hero -- .detail-backdrop reserves its own box via
+   aspect-ratio/min-height before any image loads (no CLS regardless of
+   backdrop/poster-fallback/no-image state below), the foreground image is
+   always object-fit:contain (never object-fit:cover -- a subject must
+   never be cropped) and the blur copy + gradient only fill the letterboxed
+   edges for legibility; they can never be the sole information carrier. */
+.detail-backdrop{position:relative;width:100%;max-width:100%;aspect-ratio:16/9;min-height:clamp(240px,38vw,520px);max-height:520px;overflow:hidden;border-radius:var(--radius-lg);background:#0c0d12}
+/* T21 §8.2 follow-up: no backdrop AND no poster -- a subtle dark
+   gradient instead of the flat fill, same reserved box either way. */
+.detail-backdrop--empty{background:linear-gradient(135deg,#1b1d27,#0c0d12)}
+.detail-backdrop__blur,.detail-backdrop__image{position:absolute;inset:0;width:100%;height:100%;display:block}
+.detail-backdrop__blur{object-fit:cover;filter:blur(22px);transform:scale(1.06);opacity:.42}
+.detail-backdrop__image{object-fit:contain;object-position:center;z-index:1}
+.detail-backdrop__gradient{position:absolute;inset:0;z-index:2;pointer-events:none;background:linear-gradient(180deg,rgba(0,0,0,.05) 0%,rgba(0,0,0,.18) 100%)}
+.detail-main{position:relative;display:flex;gap:22px;align-items:flex-start;padding:0 6px}
+/* Only the poster overlaps up into the backdrop's dark bottom edge -- the
+   title/meta/overview/CTA block (.detail-info) always stays in normal flow
+   below the hero, on the plain page background, so its text is readable in
+   both colour schemes regardless of the backdrop underneath (T7 §2). */
+.detail-poster{flex:0 0 150px;width:150px;aspect-ratio:2/3;margin-top:-70px;border-radius:var(--radius-md);overflow:hidden;border:1px solid var(--line);background:var(--surface-hover);box-shadow:0 12px 34px rgba(0,0,0,.2)}
+.detail-poster-img{width:100%;height:100%;object-fit:cover;display:block}
+.detail-poster .poster-fallback{position:static;height:100%}
+.detail-info{flex:1;min-width:0;padding-bottom:6px}
+.detail-title{margin:0 0 4px;font-size:32px;font-weight:800;letter-spacing:-.02em}
+.detail-year{color:var(--muted);font-weight:500}
+.detail-original{margin:0 0 10px;color:var(--muted);font-size:13px}
+.detail-meta-row{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:10px}
+.pill{padding:3px 10px;border-radius:var(--radius-pill);background:rgba(120,120,128,.12);color:var(--text);font-size:11px}
+.detail-overview{max-width:760px;margin:0 0 6px;color:var(--muted);font-size:13px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
+.detail-overview.expanded{-webkit-line-clamp:unset}
+.detail-cta{margin-top:10px}
+.detail-summary-row{display:flex;flex-wrap:wrap;gap:14px;margin:14px 0 0;color:var(--muted);font-size:13px}
+
+/* T18 §14.4: RE0-style ratings row -- one compact unit per available
+   source, brand-tinted vendored icon + score + votes; a plain text badge
+   (no icon) is used for a source with no vendored mark (TVmaze). */
+.detail-ratings{display:flex;flex-wrap:wrap;align-items:center;gap:16px;margin:10px 0 4px}
+.detail-ratings-empty{color:var(--muted);font-size:13px;margin:10px 0 4px}
+.rating-unit{display:inline-flex;align-items:center;gap:6px;padding:0;border:0;background:transparent;color:var(--text);font-size:13px;cursor:default}
+button.rating-unit{cursor:pointer}
+button.rating-unit:hover{background:transparent;opacity:.78}
+.rating-icon{width:16px;height:16px;flex:0 0 auto;color:var(--muted)}
+.rating-unit[data-source="tmdb"] .rating-icon{color:var(--brand-tmdb)}
+.rating-unit[data-source="imdb"] .rating-icon{color:var(--brand-imdb)}
+.rating-badge-text{padding:1px 5px;border:1px solid var(--line);border-radius:4px;color:var(--muted);font-size:10px;font-weight:700;letter-spacing:.02em}
+.rating-score{font-weight:700}
+.rating-votes{color:var(--muted);font-size:12px}
+
+/* Provider-logo switcher (x1-provider-ui §2.2/§3.3/§5.1): a standalone
+   "网盘" block above the resource list -- a horizontally-scrolling,
+   roving-tabindex ARIA tablist of only the providers this title actually
+   has, RE0-style (logo + Chinese name + link count per tab). */
+.provider-switcher{margin-top:28px}
+.provider-switcher h3{margin:0 0 12px;font-size:24px;font-weight:680}
+.provider-tablist{display:flex;gap:8px;overflow-x:auto;padding-bottom:4px;scrollbar-width:none}
+.provider-tablist::-webkit-scrollbar{display:none}
+.provider-tab{flex:0 0 auto;display:inline-flex;align-items:center;gap:7px;min-height:44px;padding:7px 14px;border:1px solid var(--line);border-radius:var(--radius-pill);background:var(--surface-hover);color:var(--text);font-size:13px;font-weight:600;white-space:nowrap}
+.provider-tab:hover{background:color-mix(in srgb,var(--surface-hover) 60%,var(--surface))}
+.provider-tab[aria-selected="true"]{border-color:var(--accent);background:color-mix(in srgb,var(--accent-strong) 12%,transparent);color:var(--accent-strong)}
+.provider-logo{width:18px;height:18px;flex:0 0 auto}
+.provider-tab-count{color:var(--muted);font-size:11px}
+.provider-tab[aria-selected="true"] .provider-tab-count{color:inherit}
+.provider-panel{margin-top:4px}
+.detail-groups{margin-top:28px;scroll-margin-top:80px}
+.detail-groups h3{margin:0 0 12px;font-size:24px;font-weight:680}
+/* T18 §12.4/§13.3: a resource group renders its title + link count on one
+   line, a light season line, up to three spec-icon items, and every link
+   row immediately below -- no expand/collapse control, no hidden panel. */
+.detail-group{border:1px solid var(--line);border-radius:var(--radius-md);margin-bottom:10px;overflow:hidden}
+.group-summary{display:flex;flex-direction:column;gap:6px;width:100%;padding:13px 15px;background:var(--surface)}
+.group-title-row{display:flex;align-items:baseline;gap:8px;min-width:0}
+.group-title{flex:1;min-width:0;font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.group-count{flex:0 0 auto;color:var(--muted);font-size:12px}
+.group-recheck-btn{flex:0 0 auto;white-space:nowrap}
+.group-season{color:var(--muted);font-size:12px}
+.group-specs{display:flex;flex-wrap:wrap;gap:12px}
+.spec-item{display:inline-flex;align-items:center;gap:5px;color:var(--muted);font-size:12px}
+.spec-icon{width:14px;height:14px;flex:0 0 auto}
+.spec-value{color:var(--text);font-weight:600}
+.badge-review{padding:2px 8px;border-radius:var(--radius-pill);background:color-mix(in srgb,var(--warning) 20%,transparent);color:color-mix(in srgb,var(--warning) 70%,var(--text));font-size:10px;align-self:flex-start}
+.group-links{display:grid;grid-template-columns:minmax(0,1fr);gap:0;border-top:1px solid var(--line)}
+.group-links-empty{padding:13px 15px;color:var(--muted);font-size:12px}
+.link-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:11px 15px;border-bottom:1px solid var(--line);font-size:12px}
+.link-row:last-child{border-bottom:0}
+.link-row-deleted{opacity:.6}
+.link-provider{display:inline-flex;align-items:center;gap:6px;min-width:0;max-width:220px;flex:0 1 auto;color:var(--text);font-weight:600}
+.link-provider-icon{width:18px;height:18px;flex:0 0 auto}
+.link-provider-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-remark{flex:1;min-width:80px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.link-date{flex:0 0 auto;color:var(--muted)}
+/* w6-contract §UI item 1: red TEXT badge, not a pill -- deliberately no
+   background/padding/radius, unlike every other .badge-* in this file. */
+.link-invalid-text{color:var(--danger);font-weight:600}
+.link-status-text{font-weight:600;flex:0 0 auto}
+.link-status-valid{color:var(--success)}
+.link-status-unknown{color:var(--warning)}
+.link-status-unchecked{color:var(--muted);font-weight:500}
+.link-actions{display:flex;gap:7px;margin-left:auto;flex:0 0 auto}
+.link-action{min-height:30px;padding:5px 12px;font-size:12px;border-color:var(--line);background:transparent;color:var(--text)}
+.link-action:hover{background:var(--surface-hover)}
+.link-action.primary{border-color:var(--accent);background:var(--accent-strong);color:#fff}
+.link-action.primary:hover{background:var(--accent-strong)}
+.link-action:disabled{opacity:.5;cursor:not-allowed}
+.link-action:disabled:hover{background:transparent}
+.link-action.primary:disabled:hover{background:var(--accent-strong)}
+.link-unavailable{color:var(--muted);font-size:12px}
+.reveal-panel{margin-top:16px}
+.reveal-row{display:flex;align-items:center;gap:10px;font-size:13px}
+.reveal-row code{padding:4px 9px;border-radius:var(--radius-sm);background:rgba(120,120,128,.12);letter-spacing:.08em}
+.reveal-fallback-row{margin-top:11px}
+.reveal-fallback-row label{display:block;margin-bottom:6px;color:var(--muted);font-size:12px}
+.reveal-fallback{width:100%;min-height:52px;padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius-md);background:var(--surface-solid);color:var(--text);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;resize:vertical}
+
+/* Toast (reveal/copy feedback) ---------------------------------------- */
+.toast{position:fixed;left:50%;bottom:26px;z-index:20;transform:translateX(-50%);padding:11px 18px;border-radius:var(--radius-md);background:var(--text);color:var(--bg);font-size:13px;box-shadow:var(--shadow)}
+.toast[hidden]{display:none}
+.toast.error{background:var(--danger);color:#fff}
+.toast.success{background:var(--success);color:#06280f}
+
+/* Browsers (OpenList / STRM / folder picker) ------------------------- */
+.toolbar{display:flex;flex-wrap:wrap;align-items:center;gap:9px;margin-bottom:15px}
+.toolbar>*:first-child{flex:1}
+.toolbar select{width:auto;min-width:145px}
+.file-list,.folder-list{display:grid;gap:7px;margin-top:15px}
+.file-row,.folder{display:flex;align-items:center;justify-content:space-between;gap:13px;width:100%;min-height:48px;padding:10px 12px;border:1px solid transparent;border-radius:var(--radius-md);background:rgba(120,120,128,.08);color:var(--text);text-align:left}
+.file-row:hover,.folder:hover{border-color:color-mix(in srgb,var(--accent) 45%,var(--line));background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.file-row{min-height:42px;background:transparent;border-bottom:1px solid var(--line);border-radius:0}
+.file-row-name{display:inline-flex;align-items:center;gap:9px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-icon{width:16px;height:16px;flex:0 0 auto;color:var(--accent)}
+.badge-strm{flex:0 0 auto;padding:2px 7px;border-radius:var(--radius-sm);background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent-strong);font-size:10px;font-weight:700;letter-spacing:.04em}
+.file-meta{display:block;margin-top:3px;color:var(--muted);font-size:12px;line-height:1.45}
+.empty.error{display:flex;align-items:center;justify-content:space-between;gap:12px;color:color-mix(in srgb,var(--danger) 78%,var(--text));background:color-mix(in srgb,var(--danger) 10%,transparent)}
+.retry-btn{flex:0 0 auto}
+.browser-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:16px}
+.browser-head code{flex:1;min-width:140px;padding:9px 11px;border-radius:var(--radius-md);background:rgba(120,120,128,.1);color:var(--muted);overflow-x:auto;white-space:nowrap}
+.browser-head button{min-height:34px;padding:6px 10px;font-size:12px}
+.folder:before{content:"";width:9px;height:9px;border:1px solid var(--accent);border-radius:3px}
+.folder-name{flex:1}
+.folder-action{color:var(--muted);font-size:12px}
+
+/* Transfer dialog ------------------------------------------------------ */
+.modal{position:fixed;inset:0;z-index:10;display:grid;place-items:center;padding:18px}
+.modal[hidden]{display:none}
+.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.38);backdrop-filter:blur(8px)}
+.modal-card{position:relative;width:min(660px,100%);max-height:min(760px,calc(100vh - 36px));overflow:auto;padding:23px;border:1px solid var(--line);border-radius:var(--radius-dialog);background:var(--surface-solid);box-shadow:var(--shadow-dialog)}
+.modal-head{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;margin-bottom:17px}
+.modal-head h3{margin:0;font-size:20px}
+.modal-head p{margin:5px 0 0;color:var(--muted);font-size:12px}
+.modal-close{display:grid;place-items:center;min-width:32px;min-height:32px;padding:3px;border:0;border-radius:50%;background:rgba(120,120,128,.12);color:var(--muted)}
+.modal-close:hover{background:var(--surface-hover)}
+.modal-close svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.transfer-row{display:flex;gap:8px;align-items:center}
+.transfer-row input{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px}
+.selected-path{display:flex;align-items:center;gap:8px;margin-top:13px;padding:10px 12px;border-radius:var(--radius-md);background:rgba(120,120,128,.1);color:var(--muted);font-size:12px}
+.selected-path code{color:var(--text)}
+.modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:17px}
+.modal-actions button{min-height:36px}
+.modal .folder-list{max-height:260px;overflow:auto}
+.reauth-qr-wrap{display:grid;place-items:center;padding:16px;border-radius:var(--radius-md);background:rgba(120,120,128,.06)}
+.reauth-qr-wrap img{width:220px;height:220px;border-radius:var(--radius-sm);background:var(--surface-solid)}
+.reauth-countdown{margin-top:11px;color:var(--muted);font-size:12px;text-align:center}
+
+/* prefers-reduced-motion / prefers-reduced-transparency (RE0 §2.3/§17) */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: .001ms !important;
+    animation-duration: .001ms !important;
+    scroll-behavior: auto !important;
+  }
+  button:active{transform:none}
+}
+@media (prefers-reduced-transparency: reduce) {
+  .card,.workspace-nav,.access-badge,.site-sticky,.library-filters-popover{backdrop-filter:none;background:var(--surface-solid)}
+}
+
+/* Breakpoints (RE0 §18) ------------------------------------------------ */
+@media (min-width:1200px){
+  .app-shell{padding-left:32px;padding-right:32px}
+}
+@media (max-width:1199px){
+  .app-shell{padding-left:24px;padding-right:24px}
+  .site-sticky{margin-left:-24px;margin-right:-24px;padding-left:24px;padding-right:24px}
+  .settings-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:650px){
+  .settings-grid{grid-template-columns:1fr}
+  /* T16 §6.2: below the popover breakpoint, the filter panel becomes a
+     full-width bottom sheet with its own scrim/scroll-lock (app.js adds
+     body.modal-open) instead of a floating, JS-positioned popover. */
+  .popover-scrim{background:rgba(15,15,20,.45)}
+  .library-filters-popover{left:0;right:0;bottom:0;top:auto;width:100%;max-height:82vh;border-radius:20px 20px 0 0;box-shadow:0 -12px 34px rgba(0,0,0,.24)}
+}
+@media (max-width:760px){
+  .app-shell{padding:20px 16px 40px}
+  .site-sticky{margin-left:-16px;margin-right:-16px;padding:8px 16px 0}
+  .topbar{align-items:flex-start;min-height:56px}
+  .workspace-nav{padding:5px}
+  .detail-backdrop{min-height:210px;border-radius:14px}
+  .detail-main{flex-direction:column;padding-top:16px}
+  /* T21 §8.2: "poster stays an independent 2:3 box; desktop may overlap
+     the two layers slightly, mobile becomes normal flow" -- drop the
+     poster's negative margin-top overlap once .detail-main stacks. */
+  .detail-poster{width:120px;margin-top:0}
+  .detail-overview{-webkit-line-clamp:2}
+  .link-actions{margin-left:0;width:100%}
+}
+@media (max-width:640px){
+  .modal-card{padding:18px}
+  .modal-actions{flex-direction:column-reverse;align-items:stretch}
+  .modal-actions button{width:100%}
+  .status-row{grid-template-columns:16px minmax(110px,1fr) minmax(80px,1fr)}
+}
+@media (max-width:480px){
+  .brand h1{font-size:21px}
+  .card{padding:16px}
+  /* x1-provider-ui fix wave 1, item 2 (work order §3.4): every resource
+     action button gets a real touch target on narrow screens, and the 115
+     "转存到 115" button (the only action a 115 link row ever renders --
+     library_store._LINK_ACTIONS) spans the row's full width at its
+     bottom, via the existing .link-actions{width:100%} + .link-row's
+     flex-wrap (see the max-width:760px block above). */
+  .link-action{min-height:44px}
+  .link-transfer{width:100%}
+}
+@media (max-width:460px){
+  .brand p{display:none}
+  .brand h1{font-size:17px}
+}
+
+/* Global [hidden] safety net (T7 §1): several containers declare their own
+   `display` (e.g. .content-rails{display:flex}, .field{display:grid} used
+   by #transferShareField) -- an author-stylesheet `display` declaration
+   always wins over the browser's default `[hidden]{display:none}` UA rule
+   regardless of selector specificity, so setting the `hidden` attribute on
+   those elements had no visual effect. This global, `!important` rule
+   guarantees `hidden` always actually hides, everywhere. */
+[hidden]{display:none !important}

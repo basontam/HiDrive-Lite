@@ -1,0 +1,18 @@
+HiDrive-Lite includes a narrow 115 share-receive adapter derived from the
+request shape in walkingddd/TgtoDrive (MIT License):
+https://github.com/walkingddd/TgtoDrive
+
+The project also includes locally vendored icon path data:
+
+* Font Awesome Free icons, CC BY 4.0:
+  https://fontawesome.com/license/free
+* Simple Icons pictograms, CC0 1.0:
+  https://github.com/simple-icons/simple-icons/blob/develop/LICENSE.md
+
+The icon and brand names identify the corresponding services only. HiDrive-Lite
+is not affiliated with, sponsored by, or endorsed by 115, HDHive, TMDB, IMDb,
+TVmaze, Dolby, Font Awesome, or Simple Icons.
+
+HDHive, TMDB, IMDb, TVmaze, and 115 documentation and services remain subject
+to their own terms. This repository contains no user credentials, private
+resource lists, access codes, or copyrighted source datasets.

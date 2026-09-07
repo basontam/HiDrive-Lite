@@ -1,0 +1,25 @@
+services:
+  hidrive-lite:
+    build: .
+    restart: unless-stopped
+    init: true
+    ports:
+      - "127.0.0.1:12367:12367"
+    environment:
+      HIDRIVE_AUTH_MODE: ${HIDRIVE_AUTH_MODE:-local}
+      HIDRIVE_PUBLIC_ORIGIN: ${HIDRIVE_PUBLIC_ORIGIN:-http://127.0.0.1:12367}
+      HIDRIVE_DATA_DIR: /app/data
+      HIDRIVE_MASTER_KEY_FILE: /app/secrets/master.key
+      HIDRIVE_BIND: 0.0.0.0
+      HIDRIVE_PORT: 12367
+      OPENLIST_URL: ${OPENLIST_URL:-http://127.0.0.1:5244}
+      OPENLIST_DB: /app/data/openlist.db
+      OPENLIST_115PAN_PATH: ${OPENLIST_115PAN_PATH:-/115pan}
+      OPENLIST_115STRM_PATH: ${OPENLIST_115STRM_PATH:-/115strm}
+      STRM_ROOT: /app/data/strm
+      HDHIVE_CHECKIN_PATH: ${HDHIVE_CHECKIN_PATH:-/api/open/checkin}
+      LIBRARY_ENRICH_AUTOSTART: ${LIBRARY_ENRICH_AUTOSTART:-1}
+      TMDB_DAILY_BUDGET: ${TMDB_DAILY_BUDGET:-300}
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro

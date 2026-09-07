@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HiDrive-Lite</title>
+<link rel="stylesheet" href="/static/app.css?v={{ asset_version }}">
+</head>
+<body data-public-origin="{{ public_origin }}" data-asset-version="{{ asset_version }}">
+<div class="app-shell">
+  <div class="site-sticky">
+  <header class="topbar">
+    <div class="brand">
+      <h1>HiDrive-Lite</h1>
+      <p>资源库 · 115 转存 · OpenList / STRM 查看</p>
+    </div>
+    <div id="actor" class="access-badge">检查访问状态</div>
+  </header>
+  <nav class="workspace-nav" role="tablist" aria-label="工作区">
+    <button type="button" class="nav-item" data-tab="library" id="tab-library" role="tab" aria-selected="true" aria-controls="library">
+      <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-library"></use></svg></span>
+      <span>资源库</span>
+    </button>
+    <button type="button" class="nav-item" data-tab="openlist" id="tab-openlist" role="tab" aria-selected="false" aria-controls="openlist">
+      <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-openlist"></use></svg></span>
+      <span>OpenList</span>
+    </button>
+    <button type="button" class="nav-item" data-tab="strm" id="tab-strm" role="tab" aria-selected="false" aria-controls="strm">
+      <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-strm"></use></svg></span>
+      <span>STRM</span>
+    </button>
+    <button type="button" class="nav-item" data-tab="settings" id="tab-settings" role="tab" aria-selected="false" aria-controls="settings">
+      <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-settings"></use></svg></span>
+      <span>设置</span>
+    </button>
+    <span class="workspace-status">
+      <span id="globalDot" class="status-mark"></span>
+      <span id="globalStatusText">检查服务状态</span>
+    </span>
+  </nav>
+  </div>
+  <main class="content">
+    <div id="globalError" class="feedback error" hidden></div>
+    <section id="library" role="tabpanel" aria-labelledby="tab-library">
+      <div class="page-intro">
+        <span class="eyebrow">资源库</span>
+        <h2>个人影视资源库</h2>
+        <p id="libraryStats">搜索片名、英文名、原名或拼音，浏览资源库并转存到 115。</p>
+      </div>
+      <div id="libraryHome">
+        <section id="libraryHero" class="library-hero" hidden>
+          <div class="library-hero-media" aria-hidden="true">
+            <img class="library-hero-backdrop" alt="">
+            <div class="library-hero-overlay"></div>
+          </div>
+          <div class="library-hero-content">
+            <span class="pill library-hero-type"></span>
+            <h2 class="library-hero-title"></h2>
+            <p class="library-hero-overview"></p>
+            <button type="button" class="library-hero-cta">查看详情</button>
+          </div>
+        </section>
+        <article class="card library-search-card">
+          <div class="library-search-row">
+            <div class="search-field">
+              <span class="search-field-icon" aria-hidden="true"><svg class="icon"><use href="/static/icons.svg?v={{ asset_version }}#icon-search"></use></svg></span>
+              <input id="libraryQuery" type="search" placeholder="搜索片名、英文名、原名或拼音…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="librarySuggest" aria-autocomplete="list">
+              <ul id="librarySuggest" class="suggest-list" role="listbox" aria-label="搜索建议" hidden></ul>
+            </div>
+            <div id="libraryType" class="segmented" role="group" aria-label="媒体类型">
+              <button type="button" data-value="all" aria-pressed="true">全部</button>
+              <button type="button" data-value="movie" aria-pressed="false">电影</button>
+              <button type="button" data-value="tv" aria-pressed="false">剧集</button>
+              <button type="button" data-value="unknown" aria-pressed="false">未分类</button>
+            </div>
+            <button type="button" id="librarySearch">搜索</button>
+            <div class="filter-anchor">
+              <button type="button" id="libraryFiltersToggle" class="secondary" aria-haspopup="dialog" aria-expanded="false" aria-controls="libraryFilters">
+                <svg class="icon" aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-filter"></use></svg>
+                <span>筛选</span>
+                <span id="libraryFiltersBadge" class="filter-badge" aria-hidden="true" hidden></span>
+              </button>
+            </div>
+          </div>
+          <div id="libraryChips" class="chip-row" hidden></div>
+        </article>
+        <div id="libraryRails" class="content-rails"></div>
+        <div id="libraryStatus" class="results-status" hidden></div>
+        <div id="libraryResults" class="media-grid" hidden></div>
+        <div id="libraryEmpty" class="card" hidden>
+          <div class="empty">未找到匹配的标题。 <button type="button" id="libraryClearSearch" class="tertiary">清除搜索词</button></div>
+        </div>
+        <div id="libraryError" class="card" hidden>
+          <div class="empty error"><span id="libraryErrorText"></span> <button type="button" id="libraryRetry" class="tertiary">重试</button></div>
+        </div>
+        <div id="libraryNotInstalled" class="card" hidden>
+          <div class="empty">索引未安装，见设置页说明。</div>
+        </div>
+        <nav id="libraryPagination" class="pagination" hidden aria-label="结果分页"></nav>
+      </div>
+      <div id="libraryDetail" class="library-detail" hidden>
+        <button type="button" id="detailBack" class="secondary"><svg class="icon" aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-back"></use></svg><span>返回结果</span></button>
+        <div id="detailContent"></div>
+        <div id="revealPanel" class="reveal-panel card" hidden>
+          <div class="reveal-row">
+            <span>访问码</span>
+            <code id="revealCode">••••</code>
+            <button type="button" id="revealCodeToggle" class="tertiary">显示访问码</button>
+          </div>
+          <div id="revealFallbackRow" class="reveal-fallback-row" hidden>
+            <label for="revealFallback">浏览器未允许自动复制，请手动复制以下内容</label>
+            <textarea id="revealFallback" class="reveal-fallback" readonly rows="2"></textarea>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section id="openlist" hidden role="tabpanel" aria-labelledby="tab-openlist">
+      <div class="page-intro">
+        <span class="eyebrow">只读浏览</span>
+        <h2>OpenList 资源</h2>
+        <p>选择存储后，点击目录逐级进入；文件会显示在最底层，不修改 OpenList 配置或数据。</p>
+      </div>
+      <article class="card">
+        <div class="toolbar">
+          <select id="openPreset" aria-label="OpenList 存储">
+            <option value="115pan">115pan（115 网盘）</option>
+            <option value="115strm">115strm</option>
+          </select>
+        </div>
+        <div class="browser-head">
+          <code id="openCurrent">/115pan</code>
+          <button type="button" id="openUp" class="secondary">上级</button>
+          <button type="button" id="openRefresh" class="secondary">刷新</button>
+        </div>
+        <div id="openResult" class="file-list">
+          <div class="empty">选择存储后查看。</div>
+        </div>
+      </article>
+    </section>
+    <section id="strm" hidden role="tabpanel" aria-labelledby="tab-strm">
+      <div class="page-intro">
+        <span class="eyebrow">只读浏览</span>
+        <h2>Infuse STRM 资源</h2>
+        <p>点击目录逐级进入，直到看到最底层的 STRM 文件；不写入、不重建现有 WebDAV 服务。</p>
+      </div>
+      <article class="card">
+        <div class="browser-head">
+          <code id="strmCurrent">/</code>
+          <button type="button" id="strmUp" class="secondary">上级</button>
+          <button type="button" id="strmRefresh" class="secondary">刷新</button>
+        </div>
+        <div id="strmResult" class="file-list">
+          <div class="empty">读取中…</div>
+        </div>
+      </article>
+    </section>
+    <section id="settings" hidden role="tabpanel" aria-labelledby="tab-settings">
+      <div class="page-intro">
+        <span class="eyebrow">本地加密</span>
+        <h2>设置</h2>
+        <p>凭据只保存在服务器端加密数据库。OpenList Token 与 115 开放平台令牌由现有 OpenList 配置自动同步。</p>
+      </div>
+      <div class="settings-grid">
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <h3>私有凭据</h3>
+              <p>保存后输入框会清空；115 Cookie 只在后台验证可用性。</p>
+            </div>
+          </div>
+          <div class="field">
+            <label for="cookie115">115 Cookie</label>
+            <input id="cookie115" type="password" autocomplete="off" placeholder="输入后由服务器验证，不显示返回内容">
+          </div>
+          <div id="cookie115Status" class="feedback" hidden></div>
+          <button type="button" id="reauth115Btn" class="secondary" hidden>重新授权 115</button>
+          <div class="field">
+            <label for="settingPid">兼容旧配置的默认 115 目录 PID</label>
+            <input id="settingPid" placeholder="可留空">
+          </div>
+          <button type="button" id="settingsSave">保存设置</button>
+          <div id="settingsResult" class="feedback" hidden></div>
+        </article>
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <h3>TMDB 刮削</h3>
+              <p>为资源库补全海报、简介与类型；下方状态与操作直接读取后台线程，无需登录服务器排查。</p>
+            </div>
+          </div>
+          <label class="switch-field">
+            <input id="tmdbEnrichEnabled" type="checkbox">
+            <span>启用 TMDB 后台刮削（海报/简介/类型）</span>
+          </label>
+          <div class="field">
+            <label for="tmdbKey">TMDB API Key</label>
+            <input id="tmdbKey" type="password" autocomplete="off" placeholder="TMDB API Key，用于资源库海报与匹配">
+          </div>
+          <div class="field">
+            <label for="tmdbBudget">TMDB 每日预算</label>
+            <input id="tmdbBudget" type="number" min="1" max="5000" placeholder="默认 3000，上限 5000">
+          </div>
+          <div id="tmdbScrapeStatus" class="scrape-status"></div>
+          <div class="scrape-actions">
+            <button type="button" id="tmdbCheck" class="secondary">测试 TMDB 连接</button>
+            <button type="button" id="tmdbEnrichNow" class="secondary">立即补全一轮</button>
+          </div>
+          <div id="tmdbScrapeResult" class="feedback" hidden></div>
+        </article>
+        <article class="card" id="linkcheckCard">
+          <div class="section-head">
+            <div>
+              <h3>资源有效性检测</h3>
+              <p>勾选后请点击下方「保存检测设置」才会生效，刷新页面后勾选状态即为服务器已保存的状态。115 为匿名探测，不使用你的登录会话；失效判定只依据网盘的明确提示，无法确认的不标记。</p>
+            </div>
+          </div>
+          <label class="switch-field">
+            <input id="linkcheckEnabled" type="checkbox">
+            <span>启用资源有效性检测</span>
+          </label>
+          <div id="linkcheckProviders" class="linkcheck-providers"></div>
+          <div class="scrape-actions">
+            <button type="button" id="linkcheckSave">保存检测设置</button>
+          </div>
+          <div id="linkcheckResult" class="feedback" hidden></div>
+          <div id="linkcheckHeartbeat" class="feedback" hidden></div>
+        </article>
+        <article class="card">
+          <div class="section-head">
+            <div>
+              <h3>服务状态</h3>
+              <p>状态只显示可读标签和路径，不显示令牌、Cookie 或原始 JSON。</p>
+            </div>
+          </div>
+          <div id="statusList" class="status-list"></div>
+        </article>
+        <article class="card" id="settingsHelp">
+          <div class="section-head">
+            <div>
+              <h3>说明</h3>
+              <p>资源库与只读浏览的更新方式。</p>
+            </div>
+          </div>
+          <p>资源库索引通过离线导入更新：在有网环境构建索引后，运维通过 <code>--library-install</code> 原子替换到本机，页面本身不会发起任何联网抓取。</p>
+          <p>OpenList 与 Infuse STRM 页面只读浏览已有目录与文件，不修改现有配置或媒体文件。</p>
+          <p>Cloudflare Access 负责登录与身份校验；本页的凭据保存与状态刷新均在 Access 会话内进行。</p>
+        </article>
+      </div>
+    </section>
+  </main>
+  <footer class="app-footer">
+    <p>只读浏览 OpenList 与 Infuse STRM 目录，不修改现有配置或媒体文件。资源库索引通过离线导入更新，详见设置页说明。</p>
+  </footer>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</div>
+<div id="libraryFiltersScrim" class="popover-scrim" hidden></div>
+<div id="libraryFilters" class="library-filters-popover" hidden role="dialog" aria-modal="true" aria-labelledby="libraryFiltersTitle">
+  <div class="popover-head">
+    <h3 id="libraryFiltersTitle">筛选</h3>
+    <button type="button" class="modal-close" id="libraryFiltersClose" aria-label="关闭">
+      <svg aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-close"></use></svg>
+    </button>
+  </div>
+  <div class="field filter-field">
+    <label for="filterYear">年份</label>
+    <select id="filterYear"><option value="">全部年份</option></select>
+  </div>
+  <fieldset class="filter-group">
+    <legend class="filter-label" id="filterProvidersLabel">网盘</legend>
+    <div id="filterProviders" class="chip-toggle-row" role="group" aria-labelledby="filterProvidersLabel"></div>
+  </fieldset>
+  <fieldset class="filter-group">
+    <legend class="filter-label" id="filterQualityLabel">画质</legend>
+    <div id="filterQuality" class="chip-toggle-row" role="group" aria-labelledby="filterQualityLabel"></div>
+  </fieldset>
+  <fieldset class="filter-group">
+    <legend class="filter-label" id="filterHdrLabel">HDR</legend>
+    <div id="filterHdr" class="chip-toggle-row" role="group" aria-labelledby="filterHdrLabel"></div>
+  </fieldset>
+  <fieldset class="filter-group">
+    <legend class="filter-label" id="filterGenreLabel">类型</legend>
+    <div id="filterGenre" class="chip-toggle-row" role="group" aria-labelledby="filterGenreLabel"></div>
+  </fieldset>
+  <fieldset class="filter-group">
+    <legend class="filter-label" id="filterSourceLabel">来源</legend>
+    <div id="filterSource" class="chip-toggle-row" role="group" aria-labelledby="filterSourceLabel"></div>
+  </fieldset>
+  <label class="switch-field">
+    <input id="filterDeleted" type="checkbox">
+    <span>含已失效</span>
+  </label>
+  <div class="field filter-field">
+    <label for="filterSort">排序</label>
+    <select id="filterSort">
+      <option value="relevance">相关度</option>
+      <option value="year_desc">年份从新到旧</option>
+      <option value="year_asc">年份从旧到新</option>
+      <option value="links_desc">链接数量</option>
+    </select>
+  </div>
+</div>
+<div id="transferDialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="transferTitle">
+  <div class="modal-backdrop" data-close-transfer></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <div>
+        <h3 id="transferTitle">115 转存</h3>
+        <p id="transferSubtitle">当前目录为转存目标，确认无误后转存。</p>
+      </div>
+      <button type="button" class="modal-close" id="transferClose" aria-label="关闭">
+        <svg aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-close"></use></svg>
+      </button>
+    </div>
+    <input type="hidden" id="transferLinkId">
+    <div class="field" id="transferShareField">
+      <label for="transferShareUrl">分享链接</label>
+      <div class="transfer-row">
+        <input id="transferShareUrl" readonly>
+        <button type="button" id="copyTransferLink" class="tertiary">复制</button>
+      </div>
+    </div>
+    <div class="field" id="transferServerHeldField" hidden>
+      <span class="field-label-static">分享来源</span>
+      <div id="transferServerHeld" class="feedback">115 分享 · 访问码由服务端保管</div>
+    </div>
+    <div class="browser-head">
+      <code id="folderCurrent">/115pan</code>
+      <button type="button" id="folderUp" class="secondary">上级</button>
+      <button type="button" id="folderRefresh" class="secondary">刷新</button>
+    </div>
+    <div id="folderResult" class="folder-list">
+      <div class="empty">读取目录中…</div>
+    </div>
+    <div class="selected-path">
+      <span>保存到</span>
+      <code id="targetPath">/115pan</code>
+    </div>
+    <div id="transferResult" class="feedback" hidden></div>
+    <div class="modal-actions">
+      <button type="button" id="transferCancel" class="secondary">取消</button>
+      <button type="button" id="saveBtn">转存到 115</button>
+    </div>
+  </div>
+</div>
+<div id="reauthDialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="reauthTitle">
+  <div class="modal-backdrop" data-close-reauth></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <div>
+        <h3 id="reauthTitle">重新授权 115</h3>
+        <p id="reauthSubtitle">请使用 115 手机 App 扫描二维码完成登录。</p>
+      </div>
+      <button type="button" class="modal-close" id="reauthClose" aria-label="关闭">
+        <svg aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-close"></use></svg>
+      </button>
+    </div>
+    <div class="reauth-qr-wrap">
+      <img id="reauthQrImage" alt="115 登录二维码" width="220" height="220">
+    </div>
+    <p id="reauthCountdown" class="reauth-countdown"></p>
+    <div id="reauthResult" class="feedback" hidden></div>
+    <div class="modal-actions">
+      <button type="button" id="reauthCancel" class="secondary">取消</button>
+      <button type="button" id="reauthRefresh" class="secondary">刷新二维码</button>
+    </div>
+  </div>
+</div>
+<script src="/static/app.js?v={{ asset_version }}"></script>
+</body>
+</html>

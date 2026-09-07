@@ -1,0 +1,302 @@
+[
+  {
+    "query": "深渊行者",
+    "expected": "深渊行者",
+    "note": "中文全称: 完整中文标题精确匹配"
+  },
+  {
+    "query": "边界之外",
+    "expected": "边界之外",
+    "note": "中文全称: 完整中文标题精确匹配"
+  },
+  {
+    "query": "潮汐回声",
+    "expected": "潮汐回声",
+    "note": "中文全称: 完整中文标题精确匹配"
+  },
+  {
+    "query": "夜航船",
+    "expected": "夜航船",
+    "note": "中文全称: 完整中文标题精确匹配"
+  },
+  {
+    "query": "无名岁月",
+    "expected": "无名岁月",
+    "note": "中文全称: 完整中文标题精确匹配"
+  },
+  {
+    "query": "深藏之影",
+    "expected": "深藏之影",
+    "note": "中文全称: 完整中文标题精确匹配"
+  },
+  {
+    "query": "边界",
+    "expected": "边界之外",
+    "note": "中文部分: 标题前缀子串"
+  },
+  {
+    "query": "潮汐",
+    "expected": "潮汐回声",
+    "note": "中文部分: 标题前缀子串"
+  },
+  {
+    "query": "灯塔",
+    "expected": "灯塔守夜人",
+    "note": "中文部分: 标题前缀子串"
+  },
+  {
+    "query": "旧梦",
+    "expected": "旧梦重圆",
+    "note": "中文部分: 标题前缀子串"
+  },
+  {
+    "query": "孤帆",
+    "expected": "孤帆远影",
+    "note": "中文部分: 标题前缀子串"
+  },
+  {
+    "query": "夜色",
+    "expected": "夜色未眠",
+    "note": "中文部分: 标题前缀子串"
+  },
+  {
+    "query": "往昔低语",
+    "expected": "旧日回声",
+    "note": "别名: 标题的中文别名（标题格式：主标题 / 别名）"
+  },
+  {
+    "query": "远行者",
+    "expected": "远行计划",
+    "note": "别名: 标题的中文别名"
+  },
+  {
+    "query": "寂静海岸",
+    "expected": "沉默海岸",
+    "note": "别名: 标题的中文别名"
+  },
+  {
+    "query": "Hidden Shadow",
+    "expected": "深藏之影",
+    "note": "原名: 标题的英文原名别名"
+  },
+  {
+    "query": "Hidden Shadow 2023",
+    "expected": "深藏之影",
+    "note": "原名: 英文原名 + 年份"
+  },
+  {
+    "query": "Fak",
+    "expected": "Fake Title",
+    "note": "英文前缀: 英文标题前缀"
+  },
+  {
+    "query": "Hid",
+    "expected": "深藏之影",
+    "note": "英文前缀: 英文原名前缀"
+  },
+  {
+    "query": "Tit",
+    "expected": "Fake Title",
+    "note": "英文前缀: 英文标题词前缀"
+  },
+  {
+    "query": "shenyuanxingzhe",
+    "expected": "深渊行者",
+    "note": "拼音全拼: 标题全拼"
+  },
+  {
+    "query": "bianjiezhiwai",
+    "expected": "边界之外",
+    "note": "拼音全拼: 标题全拼"
+  },
+  {
+    "query": "chaoxihuisheng",
+    "expected": "潮汐回声",
+    "note": "拼音全拼: 标题全拼"
+  },
+  {
+    "query": "dengtashouyeren",
+    "expected": "灯塔守夜人",
+    "note": "拼音全拼: 标题全拼"
+  },
+  {
+    "query": "syxz",
+    "expected": "深渊行者",
+    "note": "拼音首字母: 标题拼音首字母"
+  },
+  {
+    "query": "bjzw",
+    "expected": "边界之外",
+    "note": "拼音首字母: 标题拼音首字母"
+  },
+  {
+    "query": "cxhs",
+    "expected": "潮汐回声",
+    "note": "拼音首字母: 标题拼音首字母"
+  },
+  {
+    "query": "gfyy",
+    "expected": "孤帆远影",
+    "note": "拼音首字母: 标题拼音首字母"
+  },
+  {
+    "query": "还阳",
+    "expected": "還陽",
+    "note": "繁体: 简体查询命中繁体标题（還陽）"
+  },
+  {
+    "query": "镜中人",
+    "expected": "鏡中人",
+    "note": "繁体: 简体查询命中繁体标题（鏡中人）"
+  },
+  {
+    "query": "深渊行着",
+    "expected": "深渊行者",
+    "note": "一个错字: 标题最后一字打错（者->着），靠 bigram 容错"
+  },
+  {
+    "query": "边介之外",
+    "expected": "边界之外",
+    "note": "一个错字: 标题一字打错（界->介）"
+  },
+  {
+    "query": "深藏之景",
+    "expected": "深藏之影",
+    "note": "一个错字: 标题一字打错（影->景）"
+  },
+  {
+    "query": "沉墨海岸",
+    "expected": "沉默海岸",
+    "note": "一个错字: 标题一字打错（默->墨）"
+  },
+  {
+    "query": "Hiden",
+    "expected": "深藏之影",
+    "note": "英文一个字母错: 英文别名少一个字母（Hidden->Hiden），走拼写纠错"
+  },
+  {
+    "query": "Shadoww",
+    "expected": "深藏之影",
+    "note": "英文一个字母错: 英文别名多一个字母（Shadow->Shadoww）"
+  },
+  {
+    "query": "Titlle",
+    "expected": "Fake Title",
+    "note": "英文一个字母错: 英文标题词多一个字母（Title->Titlle）"
+  },
+  {
+    "query": "边界之外 2023",
+    "expected": "边界之外",
+    "note": "带年份: 标题 + 年份"
+  },
+  {
+    "query": "潮汐回声 2022",
+    "expected": "潮汐回声",
+    "note": "带年份: 标题 + 年份"
+  },
+  {
+    "query": "深藏之影 2023",
+    "expected": "深藏之影",
+    "note": "带年份: 标题 + 年份"
+  },
+  {
+    "query": "旧梦重圆 2023",
+    "expected": "旧梦重圆",
+    "note": "带年份: 标题 + 年份"
+  },
+  {
+    "query": "深渊行者 第2季",
+    "expected": "深渊行者",
+    "note": "带季: 标题 + 中文季号"
+  },
+  {
+    "query": "深渊行者 S01",
+    "expected": "深渊行者",
+    "note": "带季: 标题 + S季号"
+  },
+  {
+    "query": "边界之外 S01",
+    "expected": "边界之外",
+    "note": "带季: 标题 + S季号"
+  },
+  {
+    "query": "夜航船 S01",
+    "expected": "夜航船",
+    "note": "带季: 标题 + S季号"
+  },
+  {
+    "query": "深渊行者 4K",
+    "expected": "深渊行者",
+    "note": "带画质: 标题 + 画质关键词"
+  },
+  {
+    "query": "深藏之影 1080p",
+    "expected": "深藏之影",
+    "note": "带画质: 标题 + 画质关键词"
+  },
+  {
+    "query": "边界之外 4K",
+    "expected": "边界之外",
+    "note": "带画质: 标题 + 画质关键词"
+  },
+  {
+    "query": "深渊蚀刻 4K",
+    "expected": "深渊蚀刻",
+    "note": "带画质: 标题 + 画质关键词"
+  },
+  {
+    "query": "深渊行者 115",
+    "expected": "深渊行者",
+    "note": "带网盘: 标题 + 网盘关键词"
+  },
+  {
+    "query": "深藏之影 quark",
+    "expected": "深藏之影",
+    "note": "带网盘: 标题 + 网盘关键词"
+  },
+  {
+    "query": "沉默海岸 115",
+    "expected": "沉默海岸",
+    "note": "带网盘: 标题 + 网盘关键词"
+  },
+  {
+    "query": "鏡中人 baidu",
+    "expected": "鏡中人",
+    "note": "带网盘: 标题 + 网盘关键词"
+  },
+  {
+    "query": "深渊行者 高清资源",
+    "expected": "深渊行者",
+    "note": "噪声词: 标题 + 噪声词（高清/资源）"
+  },
+  {
+    "query": "潮汐回声 在线",
+    "expected": "潮汐回声",
+    "note": "噪声词: 标题 + 噪声词（在线）"
+  },
+  {
+    "query": "边界之外 网盘链接",
+    "expected": "边界之外",
+    "note": "噪声词: 标题 + 噪声词（网盘/链接）"
+  },
+  {
+    "query": "沉默海岸 资源下载",
+    "expected": "沉默海岸",
+    "note": "噪声词: 标题 + 噪声词（资源/下载）"
+  },
+  {
+    "query": "2160p 115",
+    "expected": "深渊行者",
+    "note": "空查询+筛选: 查询全部由修饰词组成，剩余文本为空，走纯筛选浏览分支"
+  },
+  {
+    "query": "4K quark",
+    "expected": "填充剧集02",
+    "note": "空查询+筛选: 查询全部由修饰词组成，剩余文本为空"
+  },
+  {
+    "query": "1080p baidu",
+    "expected": "填充剧集09",
+    "note": "空查询+筛选: 查询全部由修饰词组成，剩余文本为空"
+  }
+]

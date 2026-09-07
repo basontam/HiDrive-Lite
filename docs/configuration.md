@@ -1,0 +1,30 @@
+# Configuration
+
+Copy `.env.example` to `.env` for a local installation. The values below are
+non-secret runtime settings; provider credentials are entered through Settings
+and encrypted in `HIDRIVE_DATA_DIR`.
+
+| Variable | Local default | Purpose |
+|---|---|---|
+| `HIDRIVE_AUTH_MODE` | `local` | `local`, `disabled` (tests), or `access` |
+| `HIDRIVE_PUBLIC_ORIGIN` | `http://127.0.0.1:12367` | Origin used for OAuth and CSRF |
+| `HIDRIVE_DATA_DIR` | `./data` | Encrypted application and library databases |
+| `HIDRIVE_MASTER_KEY_FILE` | `./secrets/master.key` | Fernet key, mode 0600 |
+| `HIDRIVE_BIND` / `HIDRIVE_PORT` | `127.0.0.1` / `12367` | Development listener |
+| `OPENLIST_URL` | `http://127.0.0.1:5244` | Optional OpenList API |
+| `OPENLIST_115PAN_PATH` | `/115pan` | Allowed 115 target root |
+| `OPENLIST_115STRM_PATH` | `/115strm` | Read-only STRM path |
+| `STRM_ROOT` | `./data/strm` | Optional local STRM root |
+| `TMDB_DAILY_BUDGET` | `300` | Upper cap for TMDB requests |
+
+Never put these values in `.env`, systemd units, or CI logs:
+
+* `HDHIVE_APP_SECRET`, HDHive OAuth access/refresh tokens;
+* `TMDB_API_KEY`;
+* 115 web Cookie and 115 Open Platform access/refresh tokens;
+* OpenList API tokens;
+* reverse-proxy identity secrets.
+
+Use the first-run bootstrap to create the master key, then use the Settings
+page to save provider credentials. The key is not recoverable from the database;
+back it up through the operator's private secret-management process.

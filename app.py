@@ -1576,8 +1576,11 @@ def _redact_hdhive_text(value: object) -> str:
     """Remove URLs and common access-code forms from provider text fields."""
     text = str(value)
     text = re.sub(r"https?://[^\s<>\"']+", "[redacted-url]", text, flags=re.I)
-    text = re.sub(r"(?i)(?:www\.)?115\.com/[^\s<>\"']+", "[redacted-url]", text)
-    text = re.sub(r"(?i)(password|access[_-]?code|cookie|token|secret)\s*[:=]\s*[^\s,;，；。]+", r"\1=[redacted]", text)
+    # Upstream descriptions sometimes omit the URL scheme.  Strip domain
+    # names with a path as well so a bare 115/115cdn/anxia/share URL cannot
+    # reach the browser through an otherwise harmless text field.
+    text = re.sub(r"(?i)\b(?:[a-z0-9-]+\.)+(?:com|cn|net|org|io|me|cc|tv)(?:/[^\s<>\"']*)?", "[redacted-url]", text)
+    text = re.sub(r"(?i)(password|access[\s_-]+code|cookie|token|secret)\s*[:=]\s*[^\s,;，；。]+", r"\1=[redacted]", text)
     text = re.sub(r"(访问码|提取码|密码|口令|密钥)\s*[:：=]\s*[^\s,;，；。]+", r"\1：[redacted]", text)
     return text[:500]
 

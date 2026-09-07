@@ -156,6 +156,23 @@ def test_resources_filters_share_urls_and_access_codes_from_browser(client, hidr
     assert "abcd" not in response.get_data(as_text=True)
 
 
+def test_resources_redacts_bare_provider_urls_and_spaced_access_codes(client, hidrive, http):
+    _authorize(hidrive)
+    http.route(
+        "GET",
+        RESOURCES_URL,
+        {"success": True, "data": [{"slug": "matrix-1999", "description": "备用 115cdn.com/s/bare access code: value"}]},
+    )
+
+    response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["data"] == [{"slug": "matrix-1999", "description": "备用 [redacted-url] access code=[redacted]"}]
+    assert "115cdn.com" not in response.get_data(as_text=True)
+    assert "value" not in response.get_data(as_text=True)
+
+
 def test_upstream_refresh_demand_retries_once_with_locally_valid_token(client, hidrive, http):
     """Documents current behaviour: on OPENAPI_REFRESH_REQUIRED the app calls
     refresh_hdhive_token(), which returns the stored token unchanged while the

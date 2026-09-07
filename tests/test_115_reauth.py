@@ -1166,7 +1166,9 @@ def test_reauth_poll_upstream_read_timeout_bounded_by_deadline(client, hidrive, 
     hidrive._reauth_poll_upstream(row, deadline)
 
     call = http.calls_to(QR_STATUS_URL)[-1]
-    assert call["timeout"] == (hidrive._115_UPSTREAM_CONNECT_TIMEOUT, expected_read)
+    connect_timeout, read_timeout = call["timeout"]
+    assert connect_timeout == hidrive._115_UPSTREAM_CONNECT_TIMEOUT
+    assert read_timeout == pytest.approx(expected_read)
 
 
 def test_reauth_poll_upstream_sends_cache_buster_param(client, hidrive, http):

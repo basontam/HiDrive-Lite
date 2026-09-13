@@ -1,6 +1,6 @@
-"""Page smoke tests: the four-tab shell (资源库/OpenList/STRM/设置) keeps its
-navigation, static asset wiring, transfer dialog and settings elements, and
-must never render stored secrets or leftover HDHive/OAuth/check-in UI."""
+"""Page smoke tests: the five-tab shell (资源库/OpenList/STRM/云下载/设置) keeps
+its navigation, static asset wiring, transfer dialog and settings elements, and
+must never render stored secrets while exposing the RE0 OAuth entry point."""
 
 from __future__ import annotations
 
@@ -45,10 +45,10 @@ def _static_js(client, page_html: str) -> str:
 def test_page_title_and_tabs(page):
     assert "<title>HiDrive-Lite</title>" in page
     assert 'role="tablist"' in page
-    assert page.count(' role="tab"') == 4
-    assert page.count("aria-selected=") == 4
-    assert page.count(' role="tabpanel"') == 4
-    for tab in ("library", "openlist", "strm", "settings"):
+    assert page.count(' role="tab"') == 5
+    assert page.count("aria-selected=") == 5
+    assert page.count(' role="tabpanel"') == 5
+    for tab in ("library", "openlist", "strm", "cloud", "settings"):
         assert f'data-tab="{tab}"' in page, tab
 
 
@@ -68,25 +68,13 @@ def test_static_assets_are_behind_access_in_access_mode(client, access_mode):
     assert client.get("/static/app.js").status_code == 401
 
 
-def _hdhive_field_access_ok(text: str) -> bool:
-    """`hdhive` may appear only as an API field access (`.hdhive.` or
-    `["hdhive"]`) -- e.g. `s.hdhive.authorized` for the settings-page
-    background-authorisation status row -- never as a UI label or any other
-    bare mention. HTML stays fully forbidden; this relaxation is JS-only."""
-    total = re.findall(r"hdhive", text, re.I)
-    field_access = re.findall(r'\.hdhive\.|\["hdhive"\]', text, re.I)
-    return len(total) == len(field_access)
-
-
-def test_no_leftover_hdhive_search_or_oauth_ui(page, client):
+def test_re0_oauth_ui_is_present_without_secret_fields(page, client):
     js = _static_js(client, page)
-    assert "hdhive" not in page.lower()
-    assert "oauth" not in page.lower()
-    assert "oauth" not in js.lower()
-    for forbidden in ("签到", "解锁"):
-        assert forbidden not in page, forbidden
-        assert forbidden not in js, forbidden
-    assert _hdhive_field_access_ok(js), "hdhive must appear only as .hdhive. / [\"hdhive\"] field access"
+    assert "RE0 OAuth 授权" in page
+    for element_id in ("re0OAuthCard", "re0OAuthStatus", "re0OAuthBtn", "re0OAuthRefresh", "re0OAuthResult"):
+        assert _has_id(page, element_id), element_id
+    assert "/api/hdhive/oauth/start" in js
+    assert "window.location.assign(d.url)" in js
     for element_id in ("hdSecret", "hdClient", "oauthBtn", "tmdbQuery"):
         assert not _has_id(page, element_id), element_id
         assert element_id not in js, element_id
@@ -117,7 +105,7 @@ def test_page_transfer_dialog_and_browser_ids_preserved(page):
     assert "folderChoose" not in page
     assert "选择此目录" not in page
     assert "转存到 115" in page
-    assert "保存设置" in page
+    assert "保存 115 配置" in page
 
 
 def test_settings_tmdb_key_field_wired_into_save(page, client):
@@ -329,12 +317,17 @@ def test_reauth_success_always_closes_even_if_refresh_status_rejects(client, pag
     assert authed, "authenticated branch not found"
     branch = authed.group(1)
 
-    then_call = re.search(r"refreshStatus\(\)\.then\((.*?)\);\s*\n\s*setTimeout", branch, re.S)
-    assert then_call, "refreshStatus().then(...) must run before the close timeout is scheduled"
+    # G06: the refresh is now afterAuthenticated() -- the member-safe set of
+    # status calls -- but the property under test is unchanged: it runs before
+    # the close is scheduled, it has a rejection handler, and the close is not
+    # scheduled from inside it.
+    then_call = re.search(r"views\.reauth\.afterAuthenticated\(\)\.then\((.*?)\);\s*\n\s*setTimeout",
+                          branch, re.S)
+    assert then_call, "the post-scan refresh must run before the close timeout is scheduled"
     assert then_call.group(1).count("function (") >= 2, \
-        "refreshStatus().then needs a rejection handler, not just a success one"
+        "the post-scan refresh needs a rejection handler, not just a success one"
     assert "setTimeout" not in then_call.group(1), \
-        "the close must not be scheduled from inside refreshStatus()'s callback"
+        "the close must not be scheduled from inside the refresh callback"
     assert re.search(r"setTimeout\(function \(\) \{\s*views\.reauth\.close\(\);", branch), \
         "close must be scheduled unconditionally"
 
@@ -389,7 +382,8 @@ def test_light_theme_adopts_re0_neutral_tokens(app_css):
 def test_460px_breakpoint_hides_tagline_keeps_compact_brand(app_css):
     # T7 §6: the brand wordmark must stay visible (just smaller) at narrow
     # widths -- only the tagline paragraph hides. A fully-hidden brand left
-    # the header with no wordmark at all on real phones.
+    # the header with no wordmark at all on real phones. The wordmark is the
+    # logo image since the 2026-09-11 branding work; the rule is unchanged.
     marker = "@media (max-width:460px)"
     assert marker in app_css, marker
     open_brace = app_css.index("{", app_css.index(marker))
@@ -406,8 +400,10 @@ def test_460px_breakpoint_hides_tagline_keeps_compact_brand(app_css):
     block = app_css[open_brace:end + 1]
     assert ".brand p" in block
     assert re.search(r'\.brand p\s*\{[^}]*display\s*:\s*none', block), "tagline should stay hidden"
-    assert ".brand h1" in block
-    assert not re.search(r'\.brand h1\s*\{[^}]*display\s*:\s*none', block), \
+    assert ".brand-logo-image" in block
+    assert re.search(r'\.brand-logo-image\s*\{[^}]*width\s*:\s*\d+px', block), \
+        "brand wordmark should be narrowed here, not removed"
+    assert not re.search(r'\.brand-logo-image\s*\{[^}]*display\s*:\s*none', block), \
         "brand wordmark must stay visible (compact), not hidden"
 
 
@@ -648,11 +644,17 @@ def test_proactive_csrf_refresh_interval_and_visibility_hook(client, page):
     assert interval_match, f"expected setInterval(..., {const_name}) refreshing the CSRF token"
     assert "csrf" in interval_match.group(1).lower()
 
-    vis_match = re.search(
+    # More than one visibilitychange listener exists now (the 云下载 tab
+    # pauses its polling too) -- find the CSRF one by its content.
+    vis_match = None
+    for candidate in re.finditer(
         r'addEventListener\("visibilitychange",\s*function\s*\(\)\s*\{([\s\S]*?)\n\s*\}\);',
         js,
-    )
-    assert vis_match, "expected a visibilitychange listener"
+    ):
+        if "api.csrfFetchedAt" in candidate.group(1):
+            vis_match = candidate
+            break
+    assert vis_match, "expected the CSRF visibilitychange listener"
     vis_body = vis_match.group(1)
     assert 'document.visibilityState === "visible"' in vis_body
     assert "api.csrfFetchedAt" in vis_body

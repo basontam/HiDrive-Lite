@@ -9,9 +9,9 @@ and stable identity/fingerprint keys used for deduplication.
 the output for some input, so callers (the importer, ``schema_meta``) can
 detect "same input + same version => same output" has broken.
 
-Design decisions taken where the architecture notes (docs/architecture.md)
-left the exact representation open are recorded next to the function/constant
-they affect, and are exercised by
+Design decisions taken where the construction plan (docs/claude-media-
+library-construction-plan.md §4) left the exact representation open are
+recorded next to the function/constant they affect, and are exercised by
 tests in ``tests/test_library_normalize.py``.
 """
 
@@ -528,7 +528,7 @@ PROVIDERS: dict[str, str] = {
     "alipan": "阿里云盘",
     "baidu": "百度网盘",
     "tianyicloud": "天翼云盘",
-    "guangya": "广亚",
+    "guangya": "光鸭网盘",
     "139cloud": "移动云盘",
     "123": "123 云盘",
     "ed2k": "ED2K",

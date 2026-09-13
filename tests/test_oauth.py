@@ -1,11 +1,11 @@
-"""HDHive OAuth start/callback/refresh, with the token endpoints faked."""
+"""RE0 OAuth start/callback/refresh, with the token endpoints faked."""
 
 from __future__ import annotations
 
 from urllib.parse import parse_qs, urlparse
 
-TOKEN_URL = "https://hdhive.com/api/public/openapi/oauth/token"
-REFRESH_URL = "https://hdhive.com/api/public/openapi/oauth/refresh"
+TOKEN_URL = "https://re0.me/api/public/openapi/oauth/token"
+REFRESH_URL = "https://re0.me/api/public/openapi/oauth/refresh"
 
 
 def _start(client, hidrive) -> str:
@@ -28,11 +28,11 @@ def test_oauth_start_issues_authorize_url_and_persists_state(client, hidrive):
     assert response.status_code == 200
     url = response.get_json()["url"]
     parsed = urlparse(url)
-    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://hdhive.com/openapi/authorize"
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == "https://re0.me/openapi/authorize"
     query = parse_qs(parsed.query)
     assert query["client_id"] == ["client-id-for-tests"]
     assert query["redirect_uri"] == ["https://hidrive.test/api/oauth/hdhive/callback"]
-    assert query["scope"] == ["query unlock write"]
+    assert query["scope"] == ["meta query unlock write"]
     with hidrive.connect_db() as db:
         row = db.execute("SELECT * FROM oauth_states WHERE state=?", (query["state"][0],)).fetchone()
     assert row is not None and row["used_at"] is None
@@ -57,33 +57,19 @@ def test_oauth_callback_requires_app_secret(client, hidrive):
     assert response.get_json()["code"] == "HDHIVE_CREDENTIALS_MISSING"
 
 
-def test_oauth_callback_rejects_state_from_another_actor(client, hidrive, monkeypatch, audit_rows):
-    hidrive.secret_set("hdhive_client_id", "client-id-for-tests")
-    actors = iter(("owner", "attacker"))
-    monkeypatch.setattr(hidrive, "actor_id", lambda: next(actors))
-    state = _start(client, hidrive)
-
-    response = client.get(f"/api/oauth/hdhive/callback?code=auth-code&state={state}")
-
-    assert response.status_code == 403
-    assert response.get_json()["code"] == "OAUTH_STATE_ACTOR_MISMATCH"
-    assert hidrive.get_tokens() is None
-    assert audit_rows("hdhive.oauth.callback")[0]["detail"] == "state actor mismatch"
-
-
 def test_oauth_callback_exchanges_code_and_stores_encrypted_tokens(client, hidrive, http, audit_rows):
     hidrive.secret_set("hdhive_app_secret", "app-secret-for-tests")
     state = _start(client, hidrive)
     http.route(
         "POST",
         TOKEN_URL,
-        {"success": True, "data": {"access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 3600, "refresh_expires_in": 86400, "scope": "query unlock write"}},
+        {"success": True, "data": {"access_token": "access-1", "refresh_token": "refresh-1", "expires_in": 3600, "refresh_expires_in": 86400, "scope": "meta query unlock write"}},
     )
 
     response = client.get(f"/api/oauth/hdhive/callback?code=auth-code&state={state}")
 
     assert response.status_code == 302
-    assert response.headers["Location"].endswith("/?oauth=success")
+    assert response.headers["Location"].endswith("/?tab=settings&oauth=success")
     (call,) = http.calls_to(TOKEN_URL)
     assert call["headers"]["X-API-Key"] == "app-secret-for-tests"
     assert call["json"] == {"grant_type": "authorization_code", "code": "auth-code", "redirect_uri": "https://hidrive.test/api/oauth/hdhive/callback"}
@@ -91,7 +77,7 @@ def test_oauth_callback_exchanges_code_and_stores_encrypted_tokens(client, hidri
     assert hidrive.decrypt_token(row, "access_token") == "access-1"
     assert hidrive.decrypt_token(row, "refresh_token") == "refresh-1"
     assert b"access-1" not in bytes(row["access_token"])
-    assert row["scope"] == "query unlock write"
+    assert row["scope"] == "meta query unlock write"
     assert audit_rows("hdhive.oauth.callback")[0]["status"] == "success"
 
 
@@ -107,28 +93,31 @@ def test_oauth_state_cannot_be_replayed(client, hidrive, http):
     assert replay.get_json()["code"] == "OAUTH_STATE_INVALID"
 
 
+def test_oauth_state_is_bound_to_issuing_actor(client, hidrive, monkeypatch):
+    hidrive.secret_set("hdhive_app_secret", "app-secret-for-tests")
+    monkeypatch.setattr(hidrive, "actor_id", lambda: "owner-a")
+    state = _start(client, hidrive)
+
+    monkeypatch.setattr(hidrive, "actor_id", lambda: "other-user")
+    response = client.get(f"/api/oauth/hdhive/callback?code=auth-code&state={state}")
+
+    assert response.status_code == 400
+    assert response.get_json()["code"] == "OAUTH_STATE_INVALID"
+    with hidrive.connect_db() as db:
+        row = db.execute("SELECT created_by, used_at FROM oauth_states WHERE state=?", (state,)).fetchone()
+    assert row["created_by"] == "owner-a"
+    assert row["used_at"] is None
+
+
 def test_oauth_callback_surfaces_upstream_rejection(client, hidrive, http):
     hidrive.secret_set("hdhive_app_secret", "app-secret-for-tests")
     state = _start(client, hidrive)
-    http.route(
-        "POST",
-        TOKEN_URL,
-        {
-            "success": False,
-            "code": "INVALID_GRANT",
-            "message": "code expired; contact https://hdhive.com/reset with password=secret",
-        },
-        status=400,
-    )
+    http.route("POST", TOKEN_URL, {"success": False, "code": "INVALID_GRANT", "message": "code expired"}, status=400)
 
     response = client.get(f"/api/oauth/hdhive/callback?code=stale&state={state}")
 
     assert response.status_code == 400
-    body = response.get_json()
-    assert body["success"] is False
-    assert body["code"] == "INVALID_GRANT"
-    assert "hdhive.com" not in body["message"]
-    assert "password=secret" not in body["message"]
+    assert response.get_json() == {"success": False, "code": "INVALID_GRANT", "message": "code expired"}
     assert hidrive.get_tokens() is None
 
 

@@ -19,6 +19,33 @@ media links, provider accounts, API keys and storage configuration.
 * supports QR-based 115 re-authorisation without returning the Cookie;
 * optionally browses OpenList/STRM paths without changing the underlying files.
 
+## Latest updates
+
+* optional password accounts with administrator approval and Cloudflare Access;
+* separate per-user 115 connections for share transfer and Open Platform features;
+* merged local/RE0 search, with explicit user-triggered resource imports;
+* light/dark themes, responsive layouts, rotating posters and recommendations;
+* directory authorization recovery for HTTP 200 responses carrying 115 auth errors.
+
+For account login, use an HTTPS deployment, set `HIDRIVE_ADMIN_EMAIL` to your
+own administrator identity and choose `HIDRIVE_AUTH_MODE=app` or `hybrid`.
+`local` mode is for loopback-only development. The two 115 QR steps are
+independent; Open Platform device authorization needs your own approved 115
+application. Provider credentials and imported resources are not included.
+Administrators use the Cloudflare Access/Google bridge, including under `app`
+mode; this release does not create a local administrator password. Configure
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUDIENCE` before enabling account login and
+validate your proxy's Access protection and signed identity assertions.
+For a 115 device application, supply `HIDRIVE_115_OPEN_CLIENT_ID` and
+`HIDRIVE_115_OPEN_CLIENT_SECRET` privately. Device-flow verification is an
+operator-side setup step; these environment variables alone do not enable
+the second QR step. Never commit a populated environment file.
+
+This public distribution excludes internal deployment records, private API
+documents, production screenshots, databases and real provider response data.
+Its configuration defaults and response redaction are maintained separately
+from any individual deployment. Tests use synthetic credentials and resources.
+
 The 115 web endpoints used for share receive and QR re-authorisation are not a
 stable public API. Read `docs/115-integration.md` and verify the provider's
 current terms before deploying the adapter.

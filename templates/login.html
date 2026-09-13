@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+// Apply the saved appearance before the stylesheet paints; storage can be blocked.
+(function () {
+  var preference = "system";
+  try { preference = localStorage.getItem("hidrive.theme") || "system"; } catch (_) {}
+  document.documentElement.dataset.theme = preference === "dark" || preference === "light" ? preference :
+    (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+}());
+</script>
+<title>登录 · HiDrive-Lite</title>
+<link rel="icon" type="image/svg+xml" href="/static/branding/hidrive-lite/favicon.svg?v=20260911">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/branding/hidrive-lite/favicon-16.png?v=20260911">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/branding/hidrive-lite/favicon-32.png?v=20260911">
+<link rel="icon" type="image/png" sizes="48x48" href="/static/branding/hidrive-lite/favicon-48.png?v=20260911">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/branding/hidrive-lite/apple-touch-icon.png?v=20260911">
+<link rel="stylesheet" href="/static/app.css?v={{ asset_version }}">
+</head>
+<body class="login-body" data-page="login" data-public-origin="{{ public_origin }}" data-asset-version="{{ asset_version }}">
+<main class="login-shell">
+  <header class="login-header">
+    <a class="brand-home" href="/" aria-label="返回首页"><picture class="brand-logo-picture">
+      <source media="(prefers-color-scheme: dark)" srcset="/static/branding/hidrive-lite/hidrive-lite-logo-on-dark.svg?v=20260911">
+      <img class="brand-logo-image" src="/static/branding/hidrive-lite/hidrive-lite-logo.svg?v=20260911" alt="HiDrive-Lite" width="248" height="44">
+    </picture></a>
+    <script data-theme-logo>
+    // Match the first logo paint too, without waiting for the main script download.
+    (function () {
+      var theme = document.documentElement.dataset.theme;
+      if (theme) document.currentScript.previousElementSibling.querySelector("source").media = theme === "dark" ? "all" : "not all";
+    }());
+    </script>
+    <label class="theme-control"><span>外观</span><select id="themePreference" aria-label="外观模式">
+      <option value="system">跟随系统</option><option value="light">白天模式</option><option value="dark">夜间模式</option>
+    </select></label>
+  </header>
+
+  <div class="login-columns">
+    <div class="login-left">
+      <section class="login-intro">
+        <h1 class="login-headline">搜索、转存、管理你自己的影视资源</h1>
+        <p class="login-subhead">一个地方搜遍资源库，把想看的转存到自己的 115和其他网盘，再按你习惯的方式观看。</p>
+      </section>
+
+      <section class="login-panel">
+        <div class="login-card">
+          <div class="login-card-head">
+            <h2 id="loginTitle">登录 HiDrive-Lite</h2>
+            <p id="loginLead" class="login-lead" hidden></p>
+          </div>
+
+          <button type="button" id="loginGoogle" class="login-google">
+            <svg class="login-google-mark" viewBox="0 0 24 24" aria-hidden="true">
+              <path fill="#4285F4" d="M21.6 12.2c0-.7-.06-1.37-.18-2.02H12v3.83h5.38a4.6 4.6 0 0 1-2 3.02v2.5h3.23c1.89-1.74 2.99-4.3 2.99-7.33z"/>
+              <path fill="#34A853" d="M12 22c2.7 0 4.97-.9 6.62-2.43l-3.23-2.5c-.9.6-2.05.96-3.39.96-2.6 0-4.81-1.76-5.6-4.13H3.06v2.6A10 10 0 0 0 12 22z"/>
+              <path fill="#FBBC05" d="M6.4 13.9a6 6 0 0 1 0-3.8V7.5H3.06a10 10 0 0 0 0 9z"/>
+              <path fill="#EA4335" d="M12 5.98c1.47 0 2.79.5 3.83 1.5l2.86-2.86A10 10 0 0 0 3.06 7.5l3.34 2.6C7.19 7.73 9.4 5.98 12 5.98z"/>
+            </svg>
+            <span>管理员使用 Google 登录</span>
+          </button>
+          <p class="login-google-note">Google 入口只对管理员开放，其他账号会被拒绝。</p>
+
+          <div class="login-divider"><span>或</span></div>
+
+          <form id="loginForm" class="login-form" novalidate>
+            <div class="login-field">
+              <label for="loginEmail">邮箱</label>
+              <input id="loginEmail" name="email" type="email" autocomplete="username" required>
+            </div>
+            <div class="login-field">
+              <label for="loginPassword">密码</label>
+              <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+            </div>
+            <div class="login-field" id="loginConfirmField" hidden>
+              <label for="loginConfirm">确认密码</label>
+              <input id="loginConfirm" name="confirm_password" type="password" autocomplete="new-password">
+              <p class="login-hint" id="loginPasswordRules">8–128 位，至少包含一个大写字母、一个小写字母和一个数字。</p>
+            </div>
+            <p id="loginMessage" class="login-message" role="status" aria-live="polite" hidden></p>
+            <button type="submit" id="loginSubmit" class="login-submit">登录</button>
+          </form>
+
+          <p class="login-switch">
+            <span id="loginSwitchLead">还没有账号？</span>
+            <button type="button" id="loginSwitch" class="login-link">申请账号</button>
+          </p>
+        </div>
+      </section>
+    </div>
+
+    <aside class="login-artwork" id="loginArtwork" aria-hidden="true">
+      <div class="login-artwork-grid" id="loginArtworkGrid"></div>
+    </aside>
+  </div>
+
+  <footer class="login-footer">
+    <p class="login-copyright">HiDrive Lite Copyright©2026</p>
+    <details class="login-attribution">
+      <summary>数据来源</summary>
+      <p class="login-legal"><span id="loginAttribution"></span></p>
+    </details>
+  </footer>
+</main>
+<script src="/static/app.js?v={{ asset_version }}"></script>
+</body>
+</html>

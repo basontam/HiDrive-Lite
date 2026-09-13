@@ -809,7 +809,7 @@ def test_hint_stats_five_way_metadata_breakdown(store):
 # decision == "confirmed", source == "codex_manual_confirmation",
 # candidates_json == [{"imdb_id", "tmdb_id": int, "tmdb_type": "movie"|"tv",
 # "confidence", "original_decision", "prior_hint_decision", "evidence": {}}].
-# See docs/metadata-enrichment.md §5.2-§5.5, §6.
+# See docs/codex-manual-matching-confirmation-20260906.md §5.2-§5.5, §6.
 
 
 def _confirmed_candidate(**overrides) -> dict:
@@ -842,6 +842,7 @@ def test_confirmed_hint_success_writes_exact_with_one_details_request(store):
     session = (
         FakeSession()
         .route(_details_url("movie", 4242), FakeResponse(200, _detail_payload()))
+        .route(tmdb.TMDB_BASE + "/find/tt9000001", FakeResponse(200, {"movie_results": [{"id": 4242}], "tv_results": []}))
         .route(GENRE_MOVIE_URL, FakeResponse(200, {"genres": [{"id": 18, "name": "剧情"}]}))
     )
     client, _clock = _client(store, session)
@@ -851,7 +852,7 @@ def test_confirmed_hint_success_writes_exact_with_one_details_request(store):
     assert stats.matched_exact == 1
     assert stats.confirmed_exact == 1
     assert stats.confirmed_details_requests == 1
-    assert stats.requests_made == 1  # one HTTP request end-to-end (judge + _write_exact reuses the cache)
+    assert stats.requests_made == 2  # details + independent IMDb identity confirmation
     assert len(session.calls_to(_details_url("movie", 4242))) == 1
 
     row = _get_media(store, media_id)
@@ -888,6 +889,34 @@ def test_confirmed_hint_transient_failure_leaves_row_untouched_for_retry(store):
     row = _get_media(store, media_id)
     assert row["match_status"] == "unmatched"
     assert row["tmdb_id"] is None
+
+
+def test_confirmed_hint_rejects_wrong_title_year_without_writing_artwork(store):
+    mid = _add_media(store, title_zh="真探", media_type="tv", year=2014, identity="title:真探:2014:tv")
+    _add_hint(store, "title:真探:2014:tv", decision="confirmed", source="codex_manual_confirmation",
+              candidates=[_confirmed_candidate(tmdb_id=270633, tmdb_type="tv", imdb_id="tt2356777")])
+    session = FakeSession().route(_details_url("tv", 270633), FakeResponse(200, {
+        "id": 270633, "name": "西游黑神话之悟空传", "original_name": "西游黑神话之悟空传",
+        "first_air_date": "2024-01-01", "poster_path": "/wrong.jpg", "overview": "西游简介"}))
+    client, _ = _client(store, session)
+    stats = tmdb.enrich_batch(store, client, limit=1)
+    row = _get_media(store, mid)
+    assert stats.confirmed_conflicts == 1 and row["match_status"] == "needs_review"
+    assert row["tmdb_id"] is None and row["poster_path"] is None
+    assert json.loads(row["match_candidates_json"])["conflict"] == "year"
+
+
+def test_confirmed_hint_rejects_imdb_mapping_to_a_different_tmdb_id(store):
+    mid = _add_media(store, title_zh="奇镜", media_type="movie", year=2024, identity="title:mirror:2024:movie")
+    _add_hint(store, "title:mirror:2024:movie", decision="confirmed", source="codex_manual_confirmation", candidates=[_confirmed_candidate()])
+    session = (FakeSession().route(_details_url("movie", 4242), FakeResponse(200, _detail_payload()))
+               .route(tmdb.TMDB_BASE + "/find/tt9000001", FakeResponse(200, {"movie_results": [{"id": 5555}], "tv_results": []})))
+    client, _ = _client(store, session)
+    stats = tmdb.enrich_batch(store, client, limit=1)
+    row = _get_media(store, mid)
+    assert stats.confirmed_conflicts == 1 and row["match_status"] == "needs_review"
+    assert row["tmdb_id"] is None and row["poster_path"] is None
+    assert json.loads(row["match_candidates_json"])["conflict"] == "imdb_tmdb_identity"
 
 
 def test_confirmed_hint_not_found_falls_through_to_search(store):
@@ -973,6 +1002,7 @@ def test_confirmed_hint_resolves_via_requeue_pathway(store):
             "overview": "o", "genres": [], "vote_average": 6.5, "vote_count": 10,
         }))
         .route(GENRE_TV_URL, FakeResponse(200, {"genres": []}))
+        .route(tmdb.TMDB_BASE + "/find/tt9000003", FakeResponse(200, {"movie_results": [], "tv_results": [{"id": 7777}]}))
     )
     client, _clock = _client(store, session)
 
@@ -1025,6 +1055,7 @@ def test_confirmed_hints_merge_by_tmdb_keeps_links(store):
     session = (
         FakeSession()
         .route(_details_url("movie", 709631), FakeResponse(200, _detail_payload(id=709631, title="蛛网男孩")))
+        .route(tmdb.TMDB_BASE + "/find/tt9100018", FakeResponse(200, {"movie_results": [{"id": 709631}], "tv_results": []}))
         .route(GENRE_MOVIE_URL, FakeResponse(200, {"genres": []}))
     )
     client, _clock = _client(store, session)

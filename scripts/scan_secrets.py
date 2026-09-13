@@ -136,11 +136,19 @@ def _is_placeholder(value: str) -> bool:
     return PLACEHOLDER_VALUE.search(value) is not None or IDENTIFIER_LIKE.match(value) is not None
 
 
+def _suppress(line: str, active: list[AllowRule]) -> str:
+    """Suppress only matched placeholders, never adjacent credentials."""
+    for rule in active:
+        line = rule.pattern.sub(lambda match: " " * len(match.group(0)), line)
+    return line
+
+
 def scan_text(text: str, path: str, allow: list[AllowRule]) -> list[Finding]:
     findings: list[Finding] = []
     active = [rule for rule in allow if rule.applies(path)]
-    for number, line in enumerate(text.splitlines(), start=1):
-        if any(rule.pattern.search(line) for rule in active):
+    for number, raw_line in enumerate(text.splitlines(), start=1):
+        line = _suppress(raw_line, active) if active else raw_line
+        if not line.strip():
             continue
         for name, pattern in CONTENT_RULES:
             match = pattern.search(line)

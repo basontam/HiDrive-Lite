@@ -1,6 +1,6 @@
 """Search engine for the HiDrive-Lite personal media-resource library.
 
-Implements the design in ``docs/architecture.md``
+Implements the design in ``docs/claude-media-library-construction-plan.md``
 §7.0 (7.0.1-7.0.5): a CJK-bigram + Okapi BM25 offline index built into the
 SQLite bundle by :func:`build_index`, queried at runtime by :func:`search`
 (query parsing -> SQL recall -> Python rerank -> filter/paginate), plus
@@ -87,6 +87,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import sqlite3
 import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable, Mapping
@@ -116,8 +117,37 @@ KIND_WEIGHTS = {
     "number": 1.0,
 }
 
+# docs/claude-search-precision-efficiency-20260910.md §3: the name fields a
+# candidate must match to be generated at all. `overview` is deliberately
+# absent -- it may only add score to a candidate the name gate already let
+# through (§3.3.3).
+NAME_FIELDS = ("title", "alias", "original")
+_NAME_FIELDS_SQL = "(" + ",".join("'%s'" % f for f in NAME_FIELDS) + ")"
+
+# §3.4 name-match tiers, in ranking order: an exact name, a full phrase or
+# prefix, a word/bigram or mid-coverage hit, and a lone character or
+# otherwise low-coverage hit (kept, but never above the tiers over it).
+TIER_EXACT, TIER_PHRASE, TIER_WORD, TIER_WEAK = 0, 1, 2, 3
+
+# §3.4 initial thresholds -- reproducible constants, tuned against
+# tests/fixtures/library/search_bench_queries.json (see scripts/bench_search.py):
+#   a candidate reaches TIER_WORD on a bigram hit or on this much coverage,
+COVERAGE_TIER_WORD = 0.50
+#   coverage adds at most this much to the BM25 score (monotonic, §3.4.2),
+COVERAGE_BONUS = 0.5
+#   and a digit in a mixed query carries this fraction of its BM25 weight
+#   (§3.4.4: a number must not outweigh real name evidence).
+NUMERIC_TERM_WEIGHT = 0.25
+
+# Recall stays bounded exactly as before (§4.3).
+MAX_QUERY_TERMS = 64
+
 _CJK_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 _DI_BU_RE = re.compile(r"第\s*([0-9一二三四五六七八九十]+)\s*部")
+# A query's own maximal runs -- one CJK run or one Latin/digit word each.
+# `fold()` has already turned every separator into a space, so this splits
+# exactly where the tokenizer does.
+_RUN_RE = re.compile(r"[\u4e00-\u9fff]+|[0-9a-z]+")
 
 _ROMAN_MAP = {
     "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5,
@@ -270,6 +300,9 @@ def build_index(
     *,
     pinyin: Callable[[str], tuple[str, str]] | None = None,
     charmap: Mapping[str, str] | None = None,
+    media_ids: list[int] | None = None,
+    clear_re0_dirty: bool = False,
+    pending_only: bool = False,
 ) -> IndexStats:
     """Clear and rebuild ``search_doc``/``search_term``/``search_vocab``/``search_charmap``.
 
@@ -278,16 +311,36 @@ def build_index(
     builds over identical input produce identical rows.
     """
     charmap = charmap or {}
+    if pending_only and media_ids is None:
+        raise ValueError("pending indexing requires explicit media_ids")
 
     conn = store.connect()
     try:
-        media_rows = conn.execute(
-            """
+        reweight_ids = set()
+        ids = sorted(set(media_ids)) if media_ids is not None else None
+        if ids == []:
+            return IndexStats(media_count=0, term_count=0, vocab_count=0)
+        # Incremental vocabulary deltas need serialization. The full build's
+        # expensive tokenization must not hold the database's single writer.
+        if ids is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            if pending_only:
+                ids = [mid for mid in ids if conn.execute(
+                    "SELECT 1 FROM re0_sync_state WHERE key IN (?,?)",
+                    (f"index_pending:{mid}", f"index_reweight:{mid}"),
+                ).fetchone()]
+                if not ids:
+                    return IndexStats(media_count=0, term_count=0, vocab_count=0)
+                reweight_ids = {mid for mid in ids if not conn.execute(
+                    "SELECT 1 FROM re0_sync_state WHERE key=?", (f"index_pending:{mid}",)
+                ).fetchone()}
+        selection = " WHERE id IN (%s)" % ",".join("?" for _ in ids) if ids else ""
+        media_sql = """
             SELECT id, title_zh, title_original, title_alt_json, overview,
                    year, match_status, link_count, has_115
-            FROM media ORDER BY id
-            """
-        ).fetchall()
+            FROM media
+            """ + selection + " ORDER BY id"
+        media_rows = conn.execute(media_sql, ids or []).fetchall()
 
         corpus_chars: set[str] = set()
         # media_id -> field -> Counter[(term, kind)]
@@ -344,6 +397,22 @@ def build_index(
             for term in terms_in_doc:
                 term_df[term] = term_df.get(term, 0) + 1
 
+        removed_terms = set()
+        if ids is not None:
+            placeholders = ",".join("?" for _ in ids)
+            old_df = {r["term"]: r["n"] for r in conn.execute(
+                f"SELECT term, COUNT(DISTINCT media_id) AS n FROM search_term WHERE media_id IN ({placeholders}) GROUP BY term", ids)}
+            remaining = conn.execute(
+                f"SELECT COUNT(*), COALESCE(SUM(doc_len), 0) FROM search_doc WHERE media_id NOT IN ({placeholders})", ids).fetchone()
+            n_docs = remaining[0] + len(media_rows)
+            avgdl = (remaining[1] + sum(doc_len.values())) / n_docs if n_docs else 1.0
+            removed_terms = set(old_df) - set(term_df)
+            for term in set(term_df) | set(old_df):
+                previous = conn.execute("SELECT kind, df FROM search_vocab WHERE term=?", (term,)).fetchone()
+                term_df[term] = (previous["df"] if previous else 0) - old_df.get(term, 0) + term_df.get(term, 0)
+                if previous:
+                    term_kind.setdefault(term, previous["kind"])
+
         def idf(term: str) -> float:
             df = term_df[term]
             return math.log(1 + (n_docs - df + 0.5) / (df + 0.5))
@@ -364,7 +433,7 @@ def build_index(
 
         term_rows.sort(key=lambda r: (r[0], r[1], r[2]))
         vocab_rows = sorted(
-            (term, term_kind[term], term_df[term], idf(term)) for term in term_df
+            (term, term_kind[term], term_df[term], idf(term)) for term in term_df if term_df[term] > 0
         )
         filtered_charmap = sorted((src, dst) for src, dst in charmap.items() if src in corpus_chars)
 
@@ -390,6 +459,14 @@ def build_index(
                 pinyin_full, pinyin_initials = pinyin(meta["title_zh"])
                 pinyin_full = _clean_pinyin_key(pinyin_full) or None
                 pinyin_initials = _clean_pinyin_key(pinyin_initials) or None
+            elif ids is not None:
+                previous = conn.execute("SELECT pinyin_full, pinyin_initials, title_key, alias_keys_json FROM search_doc WHERE media_id=?", (media_id,)).fetchone()
+                if previous and previous[2] == title_key:
+                    pinyin_full, pinyin_initials = previous[0], previous[1]
+                    # Weight-only maintenance must not erase offline-generated
+                    # alias pinyin. Actual metadata changes use the pending path.
+                    if media_id in reweight_ids:
+                        alias_keys = json.loads(previous[3] or "[]")
 
             static_boost = (
                 1
@@ -410,10 +487,19 @@ def build_index(
                 )
             )
 
-        conn.execute("DELETE FROM search_term")
-        conn.execute("DELETE FROM search_vocab")
-        conn.execute("DELETE FROM search_charmap")
-        conn.execute("DELETE FROM search_doc")
+        if ids is None:
+            conn.execute("BEGIN IMMEDIATE")
+            # Do not replace newer incremental entries with an old snapshot.
+            if conn.execute(media_sql).fetchall() != media_rows:
+                raise sqlite3.OperationalError("search index input changed; retry full build")
+            conn.execute("DELETE FROM search_term")
+            conn.execute("DELETE FROM search_vocab")
+            conn.execute("DELETE FROM search_charmap")
+            conn.execute("DELETE FROM search_doc")
+        else:
+            conn.execute(f"DELETE FROM search_term WHERE media_id IN ({placeholders})", ids)
+            conn.execute(f"DELETE FROM search_doc WHERE media_id IN ({placeholders})", ids)
+            conn.executemany("DELETE FROM search_vocab WHERE term=?", [(t,) for t in removed_terms if term_df[t] <= 0])
 
         conn.executemany(
             "INSERT INTO search_doc (media_id, title_key, alias_keys_json, pinyin_full, pinyin_initials, doc_len, static_boost) VALUES (?,?,?,?,?,?,?)",
@@ -424,13 +510,20 @@ def build_index(
             term_rows,
         )
         conn.executemany(
-            "INSERT INTO search_vocab (term, kind, df, idf) VALUES (?,?,?,?)",
+            "INSERT OR REPLACE INTO search_vocab (term, kind, df, idf) VALUES (?,?,?,?)",
             vocab_rows,
         )
         conn.executemany(
-            "INSERT INTO search_charmap (src, dst) VALUES (?,?)",
+            "INSERT OR REPLACE INTO search_charmap (src, dst) VALUES (?,?)",
             filtered_charmap,
         )
+        if ids is None and clear_re0_dirty:
+            conn.execute("UPDATE re0_sync_state SET value='0' WHERE key='index_dirty'")
+        if pending_only:
+            # ACK with the index commit. A later enqueue cannot be deleted by
+            # an earlier build; concurrent writers wait for this transaction.
+            conn.executemany("DELETE FROM re0_sync_state WHERE key IN (?,?)",
+                             [(f"index_pending:{mid}", f"index_reweight:{mid}") for mid in ids])
         conn.commit()
 
         return IndexStats(media_count=n_docs, term_count=len(term_rows), vocab_count=len(vocab_rows))
@@ -486,7 +579,7 @@ _PROVIDER_PATTERNS = [
     ("夸克", "quark"), ("quark", "quark"),
     ("百度", "baidu"), ("baidu", "baidu"),
     ("天翼", "tianyicloud"), ("189", "tianyicloud"), ("tianyi", "tianyicloud"),
-    ("广亚", "guangya"),
+    ("光鸭", "guangya"), ("广亚", "guangya"),
     ("139", "139cloud"),
     ("123", "123"),
     ("115", "115"),
@@ -706,14 +799,199 @@ class Hit:
     media_id: int
     score: float
     matched_terms: int
+    # §3.4 name evidence, all internal ranking detail: the distinct name-field
+    # terms this media matched, which of title/alias/original (or pinyin) they
+    # came from, and the tier/coverage rerank() derives from them.
+    # search()'s result items never carry any of it (§3.4.7).
+    name_terms: tuple[str, ...] = ()
+    match_source: tuple[str, ...] = ()
+    name_match_tier: int = TIER_WEAK
+    name_coverage: float = 0.0
+    name_units_matched: int = 0
+    name_units_total: int = 0
+
+
+@dataclass(frozen=True)
+class QueryTerms:
+    """A query's index terms split by the role §3.2 gives each of them.
+
+    ``all_terms`` is what recall matches on; ``name_terms`` is the subset
+    that may satisfy the name gate; ``units`` is the de-duplicated
+    denominator of ``name_coverage``; ``runs``/``bigrams`` are the query's
+    own full phrases and two-character words, used to tier a hit.
+    """
+
+    all_terms: tuple[str, ...]
+    name_terms: tuple[str, ...]
+    numeric_terms: tuple[str, ...]
+    units: tuple[str, ...]
+    runs: tuple[str, ...]
+    bigrams: tuple[str, ...]
+
+
+def _distinct(values: Iterable[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            out.append(value)
+    return tuple(out)
+
+
+def _units_of_term(term: str) -> set[str]:
+    """The coverage units one matched term accounts for: every CJK character
+    in it (so the bigram ``韩国`` covers ``韩`` and ``国``), or the Latin word
+    itself."""
+    cjk = {ch for ch in term if _is_cjk(ch)}
+    return cjk or {term}
+
+
+@dataclass(frozen=True)
+class _NameProbe:
+    """Everything about a query that is the same for every candidate, worked
+    out once so the per-candidate loop below only does substring tests.
+
+    A CJK term (bigram/char/run) is indexed for a name field exactly when it
+    is a substring of that field's folded key; a Latin or numeric term
+    exactly when it is one of the key's ascii-folded words. Reading the
+    evidence back off the keys this way costs no query at all -- rerank()
+    already holds every candidate's ``title_key``/``alias_keys_json`` --
+    where re-reading it from ``search_term`` measurably slows recall down.
+    """
+
+    cjk_terms: tuple[str, ...]
+    word_terms: tuple[str, ...]
+    units_of: dict[str, frozenset]
+
+
+def _name_probe(name_terms: tuple[str, ...], units: set[str]) -> _NameProbe:
+    cjk_terms = tuple(term for term in name_terms if any(_is_cjk(ch) for ch in term))
+    cjk_set = set(cjk_terms)
+    return _NameProbe(
+        cjk_terms=cjk_terms,
+        word_terms=tuple(term for term in name_terms if term not in cjk_set),
+        units_of={term: frozenset(_units_of_term(term) & units) for term in name_terms},
+    )
+
+
+def _name_evidence(probe: _NameProbe, title_key: str, alias_keys: list) -> tuple[set[str], tuple[str, ...]]:
+    """``(matched name terms, evidence sources)`` for one candidate.
+
+    ``alias_keys_json`` holds the folded aliases *and* the folded original
+    title (see module docstring), so evidence found there is reported as
+    ``alias`` -- the gate itself still runs over the index's own
+    title/alias/original rows, this is only the label.
+    """
+    title_hits = {term for term in probe.cjk_terms if term in title_key}
+    if probe.word_terms:
+        words = _ascii_fold(title_key).split()
+        title_hits |= {term for term in probe.word_terms if term in words}
+
+    alias_hits: set[str] = set()
+    for key in alias_keys:
+        alias_hits |= {term for term in probe.cjk_terms if term in key}
+        if probe.word_terms:
+            words = _ascii_fold(key).split()
+            alias_hits |= {term for term in probe.word_terms if term in words}
+
+    sources = ("title",) if title_hits else ()
+    if alias_hits:
+        sources += ("alias",)
+    return title_hits | alias_hits, sources
+
+
+def classify_terms(text: str, charmap: Mapping[str, str], *, expansions: Iterable[str] = ()) -> QueryTerms:
+    """Split ``text``'s index terms into §3.2's roles.
+
+    A digit is never name evidence on its own in a mixed query (``韩国制造2``
+    must not recall every media whose overview says "2"), but a query that
+    is *only* digits falls back to them, so a film actually titled ``2012``
+    stays reachable (§3.2.6). Latin stopwords fall back the same way.
+    ``expansions`` are the vocabulary words recall expands the trailing
+    Latin token into; they are name evidence like any other Latin word.
+    """
+    tokens = tokenize(text, charmap)
+    expansions = tuple(expansions)
+
+    all_terms = _distinct([term for term, _kind in tokens] + list(expansions))
+    numeric_terms = _distinct(term for term, kind in tokens if kind == "number")
+    non_numeric = _distinct([term for term, kind in tokens if kind != "number"] + list(expansions))
+    meaningful = tuple(term for term in non_numeric if term not in STOPWORDS_LATIN)
+    name_terms = meaningful or non_numeric or numeric_terms
+
+    units = _distinct(
+        [term for term, kind in tokens if kind == "cjk_char"]
+        + [term for term, kind in tokens if kind == "latin" and term not in STOPWORDS_LATIN]
+    )
+    units = units or numeric_terms or non_numeric
+
+    folded = fold(text, charmap)
+    runs = tuple(
+        run for run in _distinct(_RUN_RE.findall(folded))
+        if run not in STOPWORDS_LATIN
+    )
+    bigrams = _distinct(term for term, kind in tokens if kind == "cjk_bigram")
+
+    return QueryTerms(
+        all_terms=all_terms, name_terms=name_terms, numeric_terms=numeric_terms,
+        units=units, runs=runs, bigrams=bigrams,
+    )
+
+
+def name_tier(*, exact: bool, prefix: bool, phrase: bool, bigram: bool,
+              coverage: float, sources: Iterable[str]) -> int:
+    """§3.4's tier ladder, as one decision so no caller can disagree with another."""
+    sources = tuple(sources)
+    if exact:
+        return TIER_EXACT
+    if prefix or phrase or "pinyin" in sources:
+        return TIER_PHRASE
+    if bigram or coverage >= COVERAGE_TIER_WORD or "pinyin_initials" in sources:
+        return TIER_WORD
+    return TIER_WEAK
 
 
 def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def recall(conn, plan: QueryPlan, charmap, *, limit: int = 300) -> list[Hit]:
-    """SQL ``SUM(weight)`` recall over ``search_term`` plus pinyin recall.
+def _latin_expansions(conn, tokens: list[tuple[str, str]]) -> tuple[str, ...]:
+    """Vocabulary words the trailing Latin token prefix-expands into, so
+    typing ``matr`` still reaches ``matrix`` (unchanged behaviour, lifted out
+    of recall() so classify_terms() can see the words as name evidence)."""
+    if not tokens or tokens[-1][1] != "latin":
+        return ()
+    pattern = _like_escape(tokens[-1][0]) + "%"
+    rows = conn.execute(
+        "SELECT term FROM search_vocab WHERE kind='latin' AND term LIKE ? ESCAPE '\\' ORDER BY term LIMIT 20",
+        (pattern,),
+    ).fetchall()
+    return tuple(row["term"] for row in rows)
+
+
+def recall(conn, plan: QueryPlan, charmap, *, limit: int = 300, stats: dict | None = None) -> list[Hit]:
+    """Name-gated SQL recall over ``search_term``, plus pinyin recall.
+
+    Stage one of docs/claude-search-precision-efficiency-20260910.md §3:
+    candidates are generated by matching the query's NAME terms against the
+    name fields only (title/alias/original -- plus, for a single-word Latin
+    query, the pinyin columns). Because the restriction is in the recall
+    query's own WHERE clause, it applies *before* ``LIMIT`` (§3.3.6): an
+    overview-only or digit-only match can never fill the candidate budget
+    and push a real title out of it, and it costs less than the ungated
+    query it replaces rather than more.
+
+    A second, bounded pass then adds each qualified candidate's ``overview``
+    weight (§3.3.3: the overview may raise a candidate's score, never create
+    one), and a digit in a mixed CJK/Latin query carries a fraction of its
+    weight in both passes (§3.4.4).
+
+    Pass ``stats`` to also receive ``{"candidates", "pre_gate", "gated"}``
+    counts (scripts/bench_search.py's before/after evidence): the whole
+    ungated pool, what an ungated recall would have returned, and what the
+    gate let through. It costs one extra aggregate and is skipped entirely
+    when ``stats`` is None.
 
     Does not itself attempt spelling correction -- see module docstring
     ("search() owns the recall-empty -> correct_terms -> retry loop").
@@ -723,60 +1001,124 @@ def recall(conn, plan: QueryPlan, charmap, *, limit: int = 300) -> list[Hit]:
         return []
 
     tokens = tokenize(text, charmap)
-    terms: list[str] = []
-    seen: set[str] = set()
-    for term, _kind in tokens:
-        if term not in seen:
-            seen.add(term)
-            terms.append(term)
+    terms = classify_terms(text, charmap, expansions=_latin_expansions(conn, tokens))
 
-    if tokens and tokens[-1][1] == "latin":
-        prefix = tokens[-1][0]
-        pattern = _like_escape(prefix) + "%"
-        rows = conn.execute(
-            "SELECT term FROM search_vocab WHERE kind='latin' AND term LIKE ? ESCAPE '\\' ORDER BY term LIMIT 20",
-            (pattern,),
-        ).fetchall()
-        for row in rows:
-            if row["term"] not in seen:
-                seen.add(row["term"])
-                terms.append(row["term"])
-
-    terms = terms[:64]
+    # Name terms take the front of the capped list: the budget must never be
+    # spent on digits or stopwords and leave the gate nothing to match on.
+    all_terms = _distinct(terms.name_terms + terms.all_terms)[:MAX_QUERY_TERMS]
+    in_scope = set(all_terms)
+    name_terms = tuple(term for term in terms.name_terms if term in in_scope)
+    numeric_terms = tuple(term for term in terms.numeric_terms if term in in_scope)
 
     hits: dict[int, Hit] = {}
-    if terms:
-        placeholders = ",".join("?" for _ in terms)
+    if name_terms:
+        all_ph = ",".join("?" for _ in all_terms)
+        # The WHERE clause already restricts `term` to all_terms, so the gate
+        # only has to exclude the few terms that are NOT name evidence
+        # (digits in a mixed query, stopwords beside a real word). Testing a
+        # one- or two-item NOT IN per row costs a fraction of re-testing the
+        # whole term list, and when nothing is excluded the check collapses
+        # to the field test alone.
+        excluded = tuple(term for term in all_terms if term not in set(name_terms))
+        name_only = f"field IN {_NAME_FIELDS_SQL}"
+        if excluded:
+            name_only += f" AND term NOT IN ({','.join('?' for _ in excluded)})"
+
+        # A digit only loses weight when the query has real name evidence
+        # beside it; a pure-number query keeps its full score.
+        if numeric_terms and set(numeric_terms).isdisjoint(name_terms):
+            num_ph = ",".join("?" for _ in numeric_terms)
+            weight_sql = f"SUM(CASE WHEN term IN ({num_ph}) THEN weight * ? ELSE weight END)"
+            weight_params: list = [*numeric_terms, NUMERIC_TERM_WEIGHT]
+        else:
+            weight_sql, weight_params = "SUM(weight)", []
+
         rows = conn.execute(
-            f"SELECT media_id, SUM(weight) AS s, COUNT(DISTINCT term) AS m "
-            f"FROM search_term WHERE term IN ({placeholders}) GROUP BY media_id ORDER BY s DESC LIMIT ?",
-            (*terms, limit),
+            f"SELECT media_id, {weight_sql} AS s, COUNT(DISTINCT term) AS m "
+            f"FROM search_term WHERE term IN ({all_ph}) AND {name_only} "
+            f"GROUP BY media_id ORDER BY s DESC LIMIT ?",
+            (*weight_params, *all_terms, *excluded, limit),
         ).fetchall()
         for row in rows:
-            hits[row["media_id"]] = Hit(media_id=row["media_id"], score=float(row["s"]), matched_terms=row["m"])
+            hits[row["media_id"]] = Hit(
+                media_id=row["media_id"], score=float(row["s"]), matched_terms=row["m"],
+            )
+
+        # §3.3.3: the overview may only add score to a candidate the name
+        # already qualified -- never generate one. Restricted to the rows
+        # just recalled, so it stays bounded (one query, at most `limit`
+        # groups) and reads through idx_search_term_media.
+        if hits:
+            id_ph = ",".join("?" for _ in hits)
+            for row in conn.execute(
+                f"SELECT media_id, {weight_sql} AS s FROM search_term "
+                f"WHERE media_id IN ({id_ph}) AND term IN ({all_ph}) AND field = 'overview' "
+                f"GROUP BY media_id",
+                (*weight_params, *hits, *all_terms),
+            ).fetchall():
+                prior = hits[row["media_id"]]
+                hits[row["media_id"]] = Hit(
+                    media_id=prior.media_id, score=prior.score + float(row["s"]),
+                    matched_terms=prior.matched_terms,
+                )
 
     stripped = text.strip()
     if stripped and stripped.isascii() and " " not in stripped:
         pattern = _like_escape(fold(text, charmap)) + "%"
         rows = conn.execute(
-            "SELECT media_id FROM search_doc WHERE pinyin_full LIKE ? ESCAPE '\\' OR pinyin_initials LIKE ? ESCAPE '\\' LIMIT 100",
-            (pattern, pattern),
+            "SELECT media_id, (pinyin_full LIKE ? ESCAPE '\\') AS full_hit FROM search_doc "
+            "WHERE pinyin_full LIKE ? ESCAPE '\\' OR pinyin_initials LIKE ? ESCAPE '\\' LIMIT 100",
+            (pattern, pattern, pattern),
         ).fetchall()
         top_text_score = max((h.score for h in hits.values()), default=0.0)
         pinyin_score = top_text_score * 0.6 if top_text_score > 0 else 1.0
         for row in rows:
             media_id = row["media_id"]
-            if media_id in hits:
-                if pinyin_score > hits[media_id].score:
-                    hits[media_id] = Hit(media_id=media_id, score=pinyin_score, matched_terms=hits[media_id].matched_terms)
+            # The pinyin columns are built from the title, so a hit here is
+            # name evidence in its own right (§3.3.1) -- a full-pinyin prefix
+            # ranks as a phrase, initials one tier below it.
+            source = "pinyin" if row["full_hit"] else "pinyin_initials"
+            prior = hits.get(media_id)
+            if prior is None:
+                hits[media_id] = Hit(media_id=media_id, score=pinyin_score, matched_terms=1, match_source=(source,))
             else:
-                hits[media_id] = Hit(media_id=media_id, score=pinyin_score, matched_terms=1)
+                hits[media_id] = replace(
+                    prior,
+                    score=max(prior.score, pinyin_score),
+                    match_source=_distinct(prior.match_source + (source,)),
+                )
+
+    if stats is not None:
+        candidates = 0
+        if all_terms:
+            all_ph = ",".join("?" for _ in all_terms)
+            candidates = conn.execute(
+                f"SELECT COUNT(*) AS c FROM (SELECT media_id FROM search_term "
+                f"WHERE term IN ({all_ph}) GROUP BY media_id)",
+                tuple(all_terms),
+            ).fetchone()["c"]
+        stats["candidates"] = candidates
+        # What an ungated recall would have handed the reranker, so the
+        # benchmark can compare like with like.
+        stats["pre_gate"] = min(candidates, limit)
+        stats["gated"] = len(hits)
 
     ordered = sorted(hits.values(), key=lambda h: (-h.score, h.media_id))
     return ordered[:limit]
 
 
 def rerank(conn, hits: list[Hit], plan: QueryPlan, charmap) -> list[Hit]:
+    """Stage two of §3: rank what the name gate let through.
+
+    The sort key is ``(name_match_tier, -score, media_id)``. Putting the tier
+    first is what §3.4.2/§3.4.5 ask for: an exact or full-phrase name match
+    cannot be overtaken by a single-character or digit match however large
+    that candidate's BM25 sum, ``has_115``/link-count static boost or
+    overview weight grows. Inside a tier the existing BM25F score and its
+    exact/prefix/substring/year multipliers decide, now scaled by a
+    monotonic ``name_coverage`` bonus, with ``media_id`` as the stable
+    tie-break so the same query always renders in the same order.
+    """
     if not hits:
         return hits
 
@@ -791,6 +1133,12 @@ def rerank(conn, hits: list[Hit], plan: QueryPlan, charmap) -> list[Hit]:
     doc_map = {row["media_id"]: row for row in rows}
 
     fold_text = fold(plan.text, charmap) if plan.text else ""
+    terms = classify_terms(plan.text, charmap) if plan.text else None
+    units = set(terms.units) if terms else set()
+    runs = set(terms.runs) if terms else set()
+    bigrams = set(terms.bigrams) if terms else set()
+    probe = _name_probe(terms.name_terms if terms else (), units)
+    unit_total = len(units)
 
     reranked: list[Hit] = []
     for hit in hits:
@@ -798,7 +1146,23 @@ def rerank(conn, hits: list[Hit], plan: QueryPlan, charmap) -> list[Hit]:
         if row is None:
             continue
         title_key = row["title_key"]
-        alias_keys = json.loads(row["alias_keys_json"] or "[]")
+        alias_json = row["alias_keys_json"]
+        # Most media carry no alias at all; parsing "[]" 300 times a query is
+        # measurable next to the rest of this loop.
+        alias_keys = json.loads(alias_json) if alias_json and alias_json != "[]" else []
+        matched, sources = _name_evidence(probe, title_key, alias_keys)
+        if hit.match_source:
+            sources = _distinct(sources + hit.match_source)
+
+        covered: set[str] = set()
+        for term in matched:
+            covered |= probe.units_of[term]
+        units_matched = len(covered)
+        if "pinyin" in sources:
+            # A pinyin prefix matched the whole query string, so there are no
+            # per-unit terms to count -- it covers every unit by construction.
+            units_matched = unit_total
+        coverage = units_matched / unit_total if unit_total else 0.0
 
         harmony = 1 + 0.15 * (hit.matched_terms - 1)
         # An exact match against title_key OR one of the media's alias keys
@@ -812,10 +1176,26 @@ def rerank(conn, hits: list[Hit], plan: QueryPlan, charmap) -> list[Hit]:
         else:
             year_mult = 1.0
 
-        score = hit.score * harmony * exact * prefix * substring * year_mult * row["static_boost"]
-        reranked.append(Hit(media_id=hit.media_id, score=score, matched_terms=hit.matched_terms))
+        tier = name_tier(
+            exact=exact > 1.0,
+            prefix=prefix > 1.0 or (bool(fold_text) and any(key.startswith(fold_text) for key in alias_keys)),
+            phrase=bool(matched & runs),
+            bigram=bool(matched & bigrams),
+            coverage=coverage,
+            sources=sources,
+        )
 
-    reranked.sort(key=lambda h: (-h.score, h.media_id))
+        score = (
+            hit.score * harmony * exact * prefix * substring * year_mult * row["static_boost"]
+            * (1 + COVERAGE_BONUS * coverage)
+        )
+        reranked.append(Hit(
+            media_id=hit.media_id, score=score, matched_terms=hit.matched_terms,
+            name_terms=tuple(sorted(matched)), match_source=sources, name_match_tier=tier,
+            name_coverage=coverage, name_units_matched=units_matched, name_units_total=unit_total,
+        ))
+
+    reranked.sort(key=lambda h: (h.name_match_tier, -h.score, h.media_id))
     return reranked
 
 
@@ -894,6 +1274,7 @@ class Filters:
     has_backdrop: bool = False
     # at least one resource_group with complete_season=1.
     complete_season: bool = False
+    include_re0: bool = False
 
 
 @dataclass(frozen=True)
@@ -913,6 +1294,28 @@ _SORT_SQL = {
     # (pure filter browse): mirrors media's own idx_media_rank index.
     "relevance": "m.has_115 DESC, m.link_count DESC, m.id ASC",
 }
+
+
+def _re0_filter_sql(filters: Filters) -> tuple[str, list]:
+    """Same resource must satisfy all requested filters; never fabricate links."""
+    clauses = ["rr.media_type=m.media_type", "rr.tmdb_id=m.tmdb_id", "rr.state != 'permanent_error'"]
+    params = []
+    if not filters.include_deleted:
+        clauses += ["COALESCE(LOWER(TRIM(rr.upstream_validate_status)), '') != 'invalid'",
+                    "NOT EXISTS (SELECT 1 FROM re0_file_preview fp WHERE fp.re0_resource_id=rr.id "
+                    "AND fp.status='invalid' AND fp.expires_at > CAST(strftime('%s','now') AS INTEGER))"]
+    if filters.providers:
+        clauses.append("rr.provider_code IN (%s)" % ",".join("?" for _ in filters.providers))
+        params.extend(filters.providers)
+    for key, value in (("quality", filters.quality), ("hdr", filters.hdr), ("source_type", filters.source)):
+        if value:
+            clauses.append("json_extract(rr.spec_json, ?) = ?")
+            params.extend(["$." + key, value])
+    # A locked candidate's edition does not establish season completeness.
+    # Until it has a local group, do not make unsupported matches here.
+    if filters.season is not None or filters.complete_season:
+        clauses.append("0=1")
+    return "EXISTS (SELECT 1 FROM re0_resource rr WHERE " + " AND ".join(clauses) + ")", params
 
 
 def _apply_filters_sql(filters: Filters) -> tuple[list[str], list]:
@@ -978,16 +1381,27 @@ def _apply_filters_sql(filters: Filters) -> tuple[list[str], list]:
         )
         group_params.extend(providers)
 
+    resource_clauses = []
+    resource_params = []
     if group_predicates:
         group_where = " AND ".join(group_predicates)
-        clauses.append(f"EXISTS (SELECT 1 FROM resource_group rg WHERE rg.media_id = m.id AND {group_where})")
-        params.extend(group_params)
+        resource_clauses.append(f"EXISTS (SELECT 1 FROM resource_group rg WHERE rg.media_id = m.id AND {group_where})")
+        resource_params.extend(group_params)
 
     if not filters.include_deleted:
-        clauses.append(
+        resource_clauses.append(
             "EXISTS (SELECT 1 FROM resource_group rg3 JOIN resource_link rl3 ON rl3.group_id = rg3.id "
             f"WHERE rg3.media_id = m.id AND {live_link_sql('rl3')})"
         )
+
+    if resource_clauses:
+        resource_sql = " AND ".join(resource_clauses)
+        if filters.include_re0:
+            remote_sql, remote_params = _re0_filter_sql(filters)
+            resource_sql = "(" + resource_sql + ") OR (" + remote_sql + ")"
+            resource_params.extend(remote_params)
+        clauses.append("(" + resource_sql + ")")
+        params.extend(resource_params)
 
     return clauses, params
 
@@ -1027,6 +1441,7 @@ def _order_providers(codes) -> list[str]:
 
 def _fetch_items(
     conn, media_ids: list[int], include_deleted: bool = False, providers: tuple[str, ...] = (),
+    include_re0: bool = False,
 ) -> list[dict]:
     placeholders = ",".join("?" for _ in media_ids)
 
@@ -1146,6 +1561,16 @@ def _fetch_items(
     }
 
     items: list[dict] = []
+    re0_ids = set()
+    if include_re0:
+        remote_sql, remote_params = _re0_filter_sql(Filters(providers=providers, include_deleted=include_deleted))
+        re0_ids = {r[0] for r in conn.execute(
+            f"SELECT m.id FROM media m WHERE m.id IN ({placeholders}) AND {remote_sql}", (*media_ids, *remote_params))}
+    live_re0_ids = re0_ids
+    if include_re0 and include_deleted:
+        live_sql, live_params = _re0_filter_sql(Filters(providers=providers, include_deleted=False))
+        live_re0_ids = {r[0] for r in conn.execute(
+            f"SELECT m.id FROM media m WHERE m.id IN ({placeholders}) AND {live_sql}", (*media_ids, *live_params))}
     for media_id in media_ids:
         row = media_by_id.get(media_id)
         if row is None:
@@ -1191,6 +1616,11 @@ def _fetch_items(
                 "all_links_invalid": all_links_invalid_by_media.get(media_id, False),
             }
         )
+        if include_re0:
+            items[-1]["sources"] = (["local"] if row["link_count"] else []) + (["re0"] if media_id in re0_ids else [])
+            # A visible candidate, not proof that an unlocked share is valid.
+            items[-1]["has_usable_re0"] = media_id in live_re0_ids
+            items[-1]["tmdb_id"] = row["tmdb_id"]
     return items
 
 
@@ -1201,7 +1631,7 @@ def search(
     *,
     sort: str = "relevance",
     page: int = 1,
-    page_size: int = 24,
+    page_size: int = 25,
     charmap=None,
 ) -> SearchPage:
     charmap = charmap or {}
@@ -1271,20 +1701,34 @@ def search(
                     ordered_ids = [mid for mid in hit_ids if mid in eligible]
                 else:
                     ordered_ids = _sort_media_ids(conn, list(eligible), sort)
+                if effective_filters.include_re0:
+                    identities = {r["id"]: (r["media_type"], r["tmdb_id"]) if r["tmdb_id"] else ("local", r["id"])
+                                  for r in conn.execute(
+                                      f"SELECT id, media_type, tmdb_id FROM media WHERE id IN ({placeholders})", hit_ids)}
+                    seen = set()
+                    unique_ids = []
+                    for mid in ordered_ids:
+                        identity = identities[mid]
+                        if identity not in seen:
+                            seen.add(identity)
+                            unique_ids.append(mid)
+                    ordered_ids = unique_ids
                 total = len(ordered_ids)
                 page_ids = ordered_ids[(page - 1) * page_size : page * page_size]
-                items = _fetch_items(conn, page_ids, effective_filters.include_deleted, effective_filters.providers) if page_ids else []
+                items = _fetch_items(conn, page_ids, effective_filters.include_deleted, effective_filters.providers, effective_filters.include_re0) if page_ids else []
         else:
             count_row = conn.execute(f"SELECT COUNT(*) AS c FROM media m WHERE {where_sql}", params).fetchone()
             total = count_row["c"]
             order_sql = _SORT_SQL.get(sort, _SORT_SQL["relevance"])
             offset = (page - 1) * page_size
+            # COUNT already bounds valid offsets. Avoid scanning/binding an
+            # arbitrarily large offset while allowing every real catalog page.
             rows = conn.execute(
                 f"SELECT m.id AS id FROM media m WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?",
                 (*params, page_size, offset),
-            ).fetchall()
+            ).fetchall() if offset < total else []
             page_ids = [row["id"] for row in rows]
-            items = _fetch_items(conn, page_ids, effective_filters.include_deleted, effective_filters.providers) if page_ids else []
+            items = _fetch_items(conn, page_ids, effective_filters.include_deleted, effective_filters.providers, effective_filters.include_re0) if page_ids else []
 
         interpreted = {
             "text": plan.text,

@@ -539,7 +539,9 @@ def test_six_sizes_eight_pages():
     assert keyboard["provider_tab_arrow_right_moves_focus"] is True
     assert keyboard["provider_tab_end_selects_last_tab"] is True
     assert keyboard["provider_tab_home_selects_first_tab"] is True
-    assert keyboard["provider_tab_activation_filters_group_links"] is True
+    # Round 32: activating a pan tab narrows the cards to that pan while every
+    # tab button stays on screen.
+    assert keyboard["provider_tab_activation_filters_cards_and_keeps_tabs"] is True
 
     contrast_failures = [item for item in report["contrast"] if not item["pass"]]
     assert not contrast_failures, f"contrast check(s) failed: {contrast_failures}"
@@ -599,8 +601,10 @@ def test_six_sizes_eight_pages():
     assert provider_isolation["unfiltered_view_shows_other_provider"] is True
     # I1: the in-page tab switch (selectProvider, not just a URL-driven
     # open()) must be equally isolated in the real rendered DOM/a11y tree.
-    assert provider_isolation["tab_switch_dom_excludes_other_provider"] is True
-    assert provider_isolation["tab_switch_accessibility_tree_excludes_other_provider"] is True
+    # Round 32: a tab narrows the cards to its pan while the tab row stays
+    # complete. The ?provider= isolation asserted above is unchanged.
+    assert provider_isolation["tab_switch_shows_only_the_selected_pans_card"] is True
+    assert provider_isolation["tab_switch_keeps_every_tab_button"] is True
 
     # T21 §8.4: layered detail-page backdrop -- 4 different-ratio fixtures
     # (16:9, 4:3, 2.39:1, 1:1) plus the no-backdrop fallback, at the five
@@ -655,6 +659,96 @@ def test_six_sizes_eight_pages():
     # reachability of 重新检测, the card corner badge, and the settings
     # card's four provider rows, all against the real app.js with only the
     # seeded fixtures' own network responses patched.
+    # Composition work order §8.3: the RE0 candidate cards really show the
+    # publisher's remark and a composition summary (three cards that are NOT
+    # three identical titles), the file preview really lists name/path/size,
+    # a pan filter isolates them, and no slug/link reaches the markup.
+    re0 = report["re0_candidates"]
+    assert not re0["violations"], f"RE0 candidate UI violations: {re0['violations']}"
+    assert re0["ok"] is True and re0["sizes"] == list(uis.RE0_CAPTURE_SIZES)
+    assert {r["size"] for r in re0["results"]} == set(uis.RE0_CAPTURE_SIZES)
+    for entry in re0["results"]:
+        assert entry["cards"] >= 4, entry
+        assert entry["preview_rows"] >= 10, entry
+        assert entry["overflow_ok"] is True, entry
+        # Invalid-candidate work order §5.3.
+        assert entry["dead_hidden_by_default"] is True, entry
+        # Round 37: the auxiliary toolbar and its two buttons are gone. The
+        # audit view and "a dead candidate cannot be unlocked" are covered at
+        # the API and row level, since a browser can no longer reach them.
+        assert entry["auxiliary_toolbar_removed"] is True, entry
+        assert entry["ed2k_has_no_preview"] is True, entry
+        # Round 40: the pan tab counts links + RE0 candidates, each once.
+        assert entry["tab_counts_include_re0"] is True, entry
+        # Movie work order §6: a film hides the composition, a series keeps it.
+        assert entry["movie_hides_composition"] is True, entry
+        assert entry["movie_keeps_remark_and_actions"] is True, entry
+        assert entry["movie_preview_has_no_composition"] is True, entry
+        assert entry["series_keeps_composition"] is True, entry
+    for label in uis.RE0_CAPTURE_SIZES:
+        for page_name in ("detail-re0-candidates", "detail-re0-file-preview"):
+            png_path = out_dir / label / f"{page_name}.png"
+            assert png_path.exists(), f"missing {png_path}"
+            assert png_path.stat().st_size > 1024, f"{png_path} is suspiciously small"
+
+    # Sticky-header work order §6: hides on the way down, returns on the way
+    # up, stays in the flow and in the accessibility tree, reveals on focus.
+    sticky = report["sticky_header"]
+    assert not sticky["violations"], f"sticky-header violations: {sticky['violations']}"
+    assert sticky["ok"] is True and sticky["sizes"] == list(uis.STICKY_CAPTURE_SIZES)
+    assert {r["size"] for r in sticky["results"]} == set(uis.STICKY_CAPTURE_SIZES)
+    for entry in sticky["results"]:
+        assert entry["hides_on_scroll_down"] is True, entry
+        assert entry["returns_on_scroll_up"] is True, entry
+        assert entry["stays_in_flow"] is True, entry
+        assert entry["stays_in_a11y_tree"] is True, entry
+        assert entry["reveals_on_focus"] is True, entry
+    for label in uis.STICKY_CAPTURE_SIZES:
+        for page_name in ("sticky-header-top", "sticky-header-hidden"):
+            png_path = out_dir / label / f"{page_name}.png"
+            assert png_path.exists(), f"missing {png_path}"
+
+    # Logo work order §验证清单 items 4 and 6: the wordmark follows the system
+    # colour scheme, keeps its aspect ratio, and costs the page no sideways
+    # scroll at either end of the range.
+    brand = report["brand_logo"]
+    assert not brand["violations"], f"brand-logo violations: {brand['violations']}"
+    assert brand["ok"] is True and brand["sizes"] == list(uis.BRAND_CAPTURE_SIZES)
+    assert {r["size"] for r in brand["results"]} == set(uis.BRAND_CAPTURE_SIZES)
+    for entry in brand["results"]:
+        assert entry["light_file"] == "hidrive-lite-logo.svg", entry
+        assert entry["dark_file"] == "hidrive-lite-logo-on-dark.svg", entry
+        assert entry["swaps_with_colour_scheme"] is True, entry
+        assert entry["undistorted"] is True, entry
+        assert entry["no_horizontal_overflow"] is True, entry
+    for label in uis.BRAND_CAPTURE_SIZES:
+        for page_name in ("brand-logo-light", "brand-logo-dark"):
+            png_path = out_dir / label / f"{page_name}.png"
+            assert png_path.exists(), f"missing {png_path}"
+            assert png_path.stat().st_size > 1024, f"{png_path} is suspiciously small"
+
+    # Multi-user plan §16.5: the sign-in card stays usable at both ends of
+    # the range, the collage gives way before it does, and a TMDB outage
+    # leaves a gradient rather than a broken image.
+    login = report["login_page"]
+    assert not login["violations"], f"login-page violations: {login['violations']}"
+    assert login["ok"] is True and login["sizes"] == list(uis.LOGIN_CAPTURE_SIZES)
+    assert {r["size"] for r in login["results"]} == set(uis.LOGIN_CAPTURE_SIZES)
+    for entry in login["results"]:
+        assert entry["card_usable"] is True, entry
+        assert entry["no_horizontal_overflow"] is True, entry
+        assert entry["no_broken_images"] is True, entry
+        assert entry["keyboard_order_ok"] is True, entry
+    wide = [r for r in login["results"] if r["size"] == "1440x900"][0]
+    narrow = [r for r in login["results"] if r["size"] == "390x844"][0]
+    assert wide["two_column"] is True, wide
+    assert narrow["artwork_shown"] is False, "the collage must not compete with the card on a phone"
+    for label in uis.LOGIN_CAPTURE_SIZES:
+        for page_name in ("login-desktop", "login-register", "login-error"):
+            png_path = out_dir / label / f"{page_name}.png"
+            assert png_path.exists(), f"missing {png_path}"
+            assert png_path.stat().st_size > 1024, f"{png_path} is suspiciously small"
+
     linkcheck = report["linkcheck"]
     assert not linkcheck["violations"], f"link-check UI violations: {linkcheck['violations']}"
     assert linkcheck["ok"] is True

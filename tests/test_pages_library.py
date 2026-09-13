@@ -85,13 +85,14 @@ def test_library_type_segmented_has_four_values(page):
         assert f'data-value="{value}"' in block, value
 
 
-def test_library_type_unknown_option_matches_card_and_detail_wording(page):
-    # Cards/detail localise media_type "unknown" as 未分类 (MEDIA_TYPE_LABEL);
-    # the #libraryType segmented control must use the same word, not 待定.
+def test_library_type_unknown_option_matches_detail_wording(page, js):
+    # A display-only rename: the wire enum remains "unknown".
     block_match = re.search(r'<[^>]*\bid="libraryType"[^>]*>.*?</div>\s*(?=<)', page, re.S)
     assert block_match, "libraryType block not found"
     block = block_match.group(0)
-    assert re.search(r'data-value="unknown"[^>]*>未分类<', block)
+    assert re.search(r'data-value="unknown"[^>]*>系列合集<', block)
+    assert 'unknown: "系列合集"' in js
+    assert "未分类" not in block
     assert "待定" not in block
 
 
@@ -247,10 +248,11 @@ def test_detail_no_console_log_with_url_or_access_code(js):
 
 
 def test_no_group_expand_toggle_or_cache_anywhere(js, css):
-    # T18 §13.1/§13.5 "must-delete" list: the old expand/collapse
-    # mechanism is gone entirely -- no button/class/state/wording for it,
-    # and no lazy per-group resource fetch.
-    for needle in ("toggleGroup", "renderGroupPanel", "state.detail.groupCache", "group-expand"):
+    # T18 §13.1/§13.5 "must-delete" list: the old lazy per-group panel
+    # (fetch-on-expand + cache) is gone. Round 25 re-introduced a purely
+    # client-side 展开/收起 per group (groupFoldOpen / .group-fold-btn) --
+    # the rows it hides are already in the media response.
+    for needle in ("renderGroupPanel", "state.detail.groupCache", "group-expand"):
         assert needle not in js, needle
     assert ".group-expand" not in css
     # The old lazy per-group fetch call is gone (a comment may still
@@ -268,17 +270,20 @@ def test_no_group_expand_toggle_or_cache_anywhere(js, css):
         assert "recheck" in line and '"POST"' in line, f"unexpected /api/library/resource/ call: {line}"
 
 
-def test_all_link_rows_render_without_a_prior_expand_click(js):
-    # T18 §13.1/§13.6: every group's links come straight from
-    # `group.links` in the initial media response -- groupRowHtml builds
-    # every link row unconditionally, not behind any expanded/collapsed
-    # state.
+def test_link_rows_come_from_the_media_response_never_a_fetch(js):
+    # T18 §13.1/§13.6 (kept in round 25): every link row is built from
+    # `group.links` already in the media response (visibleLinks); round
+    # 25's 展开/收起 only hides rows client-side (groupFoldOpen), it never
+    # fetches on expand.
     match = re.search(r'groupRowHtml:\s*function\s*\(group, code\)\s*\{([\s\S]*?)\n    \},', js)
     assert match, "expected a groupRowHtml function"
     body = match.group(1)
-    assert "group.links" in body
+    assert "visibleLinks(group, code)" in body and "groupFoldOpen(" in body
     assert "links.map(views.detail.linkRowHtml)" in body
     assert "暂无可用链接" in body
+    assert ".request(" not in body
+    visible = re.search(r"function visibleLinks\(group, code\) \{([\s\S]*?)\n  \}", js)
+    assert visible and "group.links" in visible.group(1) and ".request(" not in visible.group(1)
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +393,7 @@ SETTINGS_IDS = (
     "cookie115", "tmdbKey", "tmdbBudget", "tmdbEnrichEnabled", "settingPid",
     "settingsSave", "statusList", "settingsHelp",
     "tmdbScrapeStatus", "tmdbCheck", "tmdbEnrichNow", "tmdbScrapeResult",
+    "re0OAuthCard", "re0OAuthStatus", "re0OAuthBtn", "re0OAuthRefresh", "re0OAuthResult",
 )
 
 
@@ -396,7 +402,9 @@ def test_settings_element_ids_present(page):
         assert _has_id(page, element_id), element_id
 
 
-def test_settings_no_hdhive_input_ids(page, js):
+def test_settings_re0_oauth_ids_and_no_secret_inputs(page, js):
+    for element_id in ("re0OAuthCard", "re0OAuthStatus", "re0OAuthBtn", "re0OAuthRefresh", "re0OAuthResult"):
+        assert _has_id(page, element_id), element_id
     for element_id in ("hdSecret", "hdClient", "oauthBtn"):
         assert not _has_id(page, element_id), element_id
         assert element_id not in js, element_id
@@ -423,7 +431,7 @@ def test_refresh_library_status_seeds_enrich_checkbox_from_server(js):
     # always sends the checkbox's current .checked) would silently
     # disable enrichment on the very first save. refreshLibraryStatus
     # must seed it from the tmdb-status payload's enrich_enabled field.
-    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]{0,2600}?\n  \}', js)
+    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]*?\n  \}', js)
     assert match, "expected refreshLibraryStatus function"
     body = match.group(0)
     assert re.search(r'\$\("tmdbEnrichEnabled"\)\.checked = .*enrich_enabled', body)
@@ -434,22 +442,17 @@ def test_refresh_library_status_seeds_budget_input_from_configured_not_effective
     # (what the operator asked for), never the effective/env-capped one --
     # seeding from the old d.budget.budget field showed a value the
     # operator never actually set.
-    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]{0,2600}?\n  \}', js)
+    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]*?\n  \}', js)
     assert match, "expected refreshLibraryStatus function"
     body = match.group(0)
     assert re.search(r'\$\("tmdbBudget"\)\.value = .*configured_budget', body)
     assert "d.budget.budget" not in body
 
 
-def test_settings_save_writes_configured_budget_back_into_input(js):
-    # After a successful settings save, the response's tmdb.configured_budget
-    # (when present) must be written into #tmdbBudget. Scoped to the save
-    # handler's own source region (like its sibling test above) so this
-    # fails if the writeback inside $("settingsSave").onclick is removed --
-    # an unscoped search of the whole file would still pass on
-    # refreshLibraryStatus's unrelated seed of the same input.
-    match = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,2000}?\n      \};', js)
-    assert match, "expected settingsSave onclick handler"
+def test_tmdb_save_writes_configured_budget_back_into_input(js):
+    # Only the TMDB form owns its configured budget and successful writeback.
+    match = re.search(r'\$\("tmdbSave"\)\.onclick = function \(\)[\s\S]*?\n      \};', js)
+    assert match, "expected tmdbSave onclick handler"
     body = match.group(0)
     assert re.search(r'\$\("tmdbBudget"\)\.value = .*configured_budget', body)
 
@@ -458,7 +461,7 @@ def test_refresh_library_status_lamp_uses_error_code_not_generic_pending(js):
     # Minor fix: the .catch() branch always showed a generic "待检查"
     # regardless of *why* the request failed -- distinguish 未安装 /
     # 未加密 / 索引不可读 via e.code so the settings lamp is informative.
-    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]{0,2600}?\n  \}', js)
+    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]*?\n  \}', js)
     assert match, "expected refreshLibraryStatus function"
     body = match.group(0)
     catch_match = re.search(r'\.catch\(function \((\w*)\)[\s\S]*$', body)
@@ -471,35 +474,74 @@ def test_refresh_library_status_lamp_uses_error_code_not_generic_pending(js):
     assert "未安装" in catch_body
 
 
-def test_settings_three_column_grid_at_desktop_and_two_at_1199(css):
-    assert re.search(r'\.settings-grid\{[^}]*grid-template-columns:repeat\(3', css)
+def test_settings_sidebar_and_content_columns_at_desktop(css):
+    assert re.search(r'\.settings-layout\{[^}]*grid-template-columns:210px minmax\(0,1fr\)', css)
     block = re.search(r'@media \(max-width:1199px\)\{([\s\S]*?)\n\}', css)
     assert block, "expected a max-width:1199px media block"
-    assert re.search(r'\.settings-grid\{[^}]*grid-template-columns:repeat\(2', block.group(1))
+    assert re.search(r'\.settings-layout\{[^}]*grid-template-columns:185px minmax\(0,1fr\)', block.group(1))
 
 
-def test_settings_one_column_at_650(css):
-    block = re.search(r'@media \(max-width:650px\)\{([\s\S]*?)\n\}', css)
-    assert block, "expected a max-width:650px media block"
-    assert re.search(r'\.settings-grid\{[^}]*grid-template-columns:1fr', block.group(1))
+def test_settings_one_column_at_mobile(css):
+    blocks = re.findall(r'@media \(max-width:760px\)\{([\s\S]*?)\n\}', css)
+    assert any(re.search(r'\.settings-layout\{[^}]*grid-template-columns:minmax\(0,1fr\)', block)
+               for block in blocks), "expected the settings layout to stack at max-width:760px"
 
 
-def test_settings_grid_children_equal_height(css):
-    assert ".settings-grid>.card{height:100%" in css
+def test_settings_cards_keep_natural_height_and_hidden_panels_are_hidden(css):
+    assert re.search(r'\.settings-panel>\.card\{[^}]*height:auto', css)
+    assert re.search(r'\.settings-panel\[hidden\][^{]*\{display:none\}', css)
 
 
-def test_settings_save_sends_tmdb_budget_and_enrich_fields(js):
-    region = re.search(r'settingsSave[\s\S]{0,900}', js)
-    assert region, "expected the settingsSave click handler"
+def test_settings_sidebar_stretches_with_content_only_on_desktop(css):
+    assert re.search(r'\.settings-layout\{[^}]*align-items:stretch', css)
+    assert re.search(r'\.settings-nav\{[^}]*align-content:start', css)
+    blocks = re.findall(r'@media \(max-width:760px\)\{([\s\S]*?)\n\}', css)
+    assert any(re.search(r'\.settings-layout\{[^}]*align-items:start', block) for block in blocks)
+
+
+def test_settings_type_hierarchy_keeps_group_headings_above_navigation(css):
+    assert re.search(r'\.settings-nav-label\{[^}]*font-size:16px;[^}]*font-weight:650', css)
+    assert re.search(r'#settings button\{[^}]*min-height:44px;[^}]*font-size:14px', css)
+    assert re.search(r'#settings \.page-intro h2\{font-size:32px\}', css)
+    assert re.search(r'#settings \.section-head h3\{font-size:18px\}', css)
+    assert re.search(r'#settings \.section-head p\{font-size:13px;', css)
+    assert re.search(r'\.settings-metric strong\{[^}]*font-size:16px;', css)
+    assert '#settings input,#settings select{font-size:14px}' in css
+
+
+@pytest.mark.parametrize("global_settings,expected", [(True, "检查服务状态"), (False, "个人空间")])
+def test_workspace_badge_is_neutral_for_members(hidrive, global_settings, expected):
+    html = hidrive.app.jinja_env.get_template("index.html").render(
+        capabilities={"global_settings": global_settings}, asset_version="fixture",
+        public_origin="https://hidrive.test",
+    )
+    assert re.search(r'<span id="globalStatusText">([^<]+)</span>', html).group(1) == expected
+
+
+def test_tmdb_save_sends_tmdb_budget_and_enrich_fields(js):
+    region = re.search(r'\$\("tmdbSave"\)\.onclick = function \(\)[\s\S]*?\n      \};', js)
+    assert region, "expected the tmdbSave click handler"
     assert "tmdb_daily_budget" in region.group(0)
     assert "tmdb_enrich_enabled" in region.group(0)
 
 
 def test_settings_save_clears_password_inputs_after_save(js):
-    region = re.search(r'settingsSave[\s\S]{0,900}', js)
-    assert region
-    assert '$("cookie115").value = ""' in region.group(0)
-    assert '$("tmdbKey").value = ""' in region.group(0)
+    for button, field in (("settingsSave", "cookie115"), ("tmdbSave", "tmdbKey")):
+        region = re.search(rf'\$\("{button}"\)\.onclick = function \(\)[\s\S]*?\n      \}};', js)
+        assert region
+        assert f'$("{field}").value = ""' in region.group(0)
+
+
+def test_settings_sections_and_service_navigation_have_unique_panels(page):
+    for section in ("my115", "account", "users", "services", "system"):
+        assert page.count(f'data-settings-section="{section}"') == 1
+        assert page.count(f'data-settings-panel="{section}"') == 1
+        assert f'aria-controls="settings-panel-{section}"' in page
+    for service in ("re0", "tmdb", "linkcheck", "cloud"):
+        assert page.count(f'data-settings-service="{service}"') == 1
+        assert page.count(f'data-service-panel="{service}"') == 1
+    assert 'id="settings-panel-my115"' in page
+    assert re.search(r'<details[^>]+id="legacy115Card"[^>]*>[\s\S]*?id="cookie115"[\s\S]*?</details>', page)
 
 
 # ---------------------------------------------------------------------------
@@ -557,16 +599,16 @@ def test_enrich_switch_change_sets_a_dirty_flag(js):
     assert match, "expected a change listener on #tmdbEnrichEnabled setting a state flag"
     flag_name = match.group(1)
 
-    # And the settingsSave handler must only include tmdb_enrich_enabled in
+    # And the TMDB save handler must only include tmdb_enrich_enabled in
     # the request body when that same flag is set -- an unconditional send
     # would silently disable enrichment on a save fired before
     # refreshLibraryStatus has ever seeded the checkbox from server state.
-    region = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,2000}?\n      \};', js)
-    assert region, "expected settingsSave onclick handler"
+    region = re.search(r'\$\("tmdbSave"\)\.onclick = function \(\)[\s\S]*?\n      \};', js)
+    assert region, "expected tmdbSave onclick handler"
     assert re.search(r'if \(state\.' + flag_name + r'\) payload\["tmdb_enrich_enabled"\] = ', region.group(0))
 
 
-def test_settings_save_resets_the_dirty_flag_on_success(js):
+def test_tmdb_save_resets_the_dirty_flag_on_success(js):
     # T10 fix wave 1 #4: once a save actually succeeds, the switch's dirty
     # flag must be cleared -- otherwise a stale "dirty" from an earlier page
     # visit would keep re-sending tmdb_enrich_enabled on every later save.
@@ -574,8 +616,8 @@ def test_settings_save_resets_the_dirty_flag_on_success(js):
     assert match, "expected a change listener on #tmdbEnrichEnabled setting a state flag"
     flag_name = match.group(1)
 
-    region = re.search(r'\$\("settingsSave"\)\.onclick = function \(\)[\s\S]{0,2000}?\n      \};', js)
-    assert region, "expected settingsSave onclick handler"
+    region = re.search(r'\$\("tmdbSave"\)\.onclick = function \(\)[\s\S]*?\n      \};', js)
+    assert region, "expected tmdbSave onclick handler"
     assert re.search(r"state\." + flag_name + r"\s*=\s*false;", region.group(0))
 
 
@@ -605,13 +647,13 @@ def test_tmdb_check_and_enrich_now_disable_while_pending(js):
 
 
 def test_refresh_library_status_renders_tmdb_scrape_status(js):
-    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]{0,2600}?\n  \}', js)
+    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]*?\n  \}', js)
     assert match, "expected refreshLibraryStatus function"
     assert "renderTmdbScrapeStatus(d)" in match.group(0)
 
 
 def test_render_tmdb_scrape_status_reads_progress_and_error_fields(js):
-    match = re.search(r'function renderTmdbScrapeStatus\(d\)[\s\S]{0,1600}?\n  \}', js)
+    match = re.search(r'function renderTmdbScrapeStatus\(d\)[\s\S]*?\n  \}', js)
     assert match, "expected renderTmdbScrapeStatus function"
     body = match.group(0)
     for field in (
@@ -626,7 +668,7 @@ def test_render_tmdb_scrape_status_reads_progress_and_error_fields(js):
 
 
 STATUS_LABELS = (
-    "Cloudflare Access", "115 Cookie（转存）", "115 开放平台令牌", "后台授权",
+    "Cloudflare Access", "115 Cookie（转存）", "115 开放平台令牌", "RE0 授权",
     "OpenList API Token", "Infuse STRM 目录", "资源库索引", "TMDB 补全",
 )
 
@@ -640,36 +682,24 @@ def test_status_list_no_longer_shows_substituted_115_target_dir_row(js):
     assert '"115 默认目标目录"' not in js
 
 
-def _hdhive_field_access_ok(text: str) -> bool:
-    """`hdhive` may appear only as an API field access (`.hdhive.` or
-    `["hdhive"]`) -- e.g. `s.hdhive.authorized` -- never as a UI label,
-    an OAuth/check-in word, or any other bare mention."""
-    total = re.findall(r"hdhive", text, re.I)
-    field_access = re.findall(r'\.hdhive\.|\["hdhive"\]', text, re.I)
-    return len(total) == len(field_access)
-
-
 def test_status_list_labels_avoid_forbidden_words(js, page):
-    # HTML stays fully forbidden -- no field-access excuse applies there.
+    # The HTML uses the public RE0 name; historical hdhive identifiers are
+    # retained only in the backend/JS API contract.
     assert "hdhive" not in page.lower()
-    assert "oauth" not in page.lower()
-    for forbidden in ("签到", "解锁"):
-        assert forbidden not in page, forbidden
-        assert forbidden not in js, forbidden
-    # JS: relaxed ONLY for `hdhive` as a plain API field access; oauth and
-    # the check-in/unlock words stay fully forbidden.
-    assert "oauth" not in js.lower()
-    assert _hdhive_field_access_ok(js), "hdhive must appear only as .hdhive. / [\"hdhive\"] field access"
+    assert "RE0 OAuth 授权" in page
+    assert "RE0 授权" in js
+    assert "oauth" in js.lower()
 
 
-def test_background_auth_status_row_reads_hdhive_authorized_and_checkin(js):
-    region = re.search(r'"后台授权"[\s\S]{0,50}|后台授权[\s\S]{0,400}', js)
-    assert region, "expected the 后台授权 status row"
+def test_re0_auth_status_row_reads_hdhive_authorized_and_checkin(js):
+    region = re.search(r'"RE0 授权"[\s\S]{0,400}', js)
+    assert region, "expected the RE0 授权 status row"
     # the row (and its immediate construction) must read the authorized flag
     # and the last background task's result/time straight from the API.
-    assert re.search(r'\.hdhive\.authorized', js)
-    assert re.search(r'\.hdhive\.checkin\.last_success', js)
-    assert re.search(r'\.hdhive\.checkin\.last_at', js)
+    assert re.search(r'\bh\.authorized', js)
+    assert re.search(r'\bh\.checkin\b', js)
+    assert re.search(r'\bcheckin\.last_success', js)
+    assert re.search(r'\bcheckin\.last_at', js)
     assert "已授权" in js and "未授权" in js
     assert "最近自动任务" in js
     assert "暂无记录" in js
@@ -952,9 +982,145 @@ def test_rail_headings_exact_and_ordered_no_trending_words(js, page):
     assert "热门" not in page and "趋势" not in page
 
 
-def test_rails_use_page_size_12_and_hero_uses_has_backdrop(js):
+def test_rails_use_page_size_12(js):
     assert "page_size=12" in js
-    assert "has_backdrop=1" in js
+
+
+def test_hero_preserves_the_full_image_and_stacks_on_small_screens(css):
+    backdrop = re.search(r'\.library-hero-backdrop\{([^}]*)\}', css)
+    assert backdrop and "object-fit:contain" in backdrop.group(1)
+    assert "object-fit:cover" not in backdrop.group(1)
+    mobile = re.search(r'@media\s*\(max-width:760px\)\s*\{\s*\.library-hero\{([^}]*)\}([\s\S]*?)\n\}', css)
+    assert mobile, "the hero needs its own small-screen layout"
+    assert "grid-template-columns:minmax(0,1fr)" in mobile.group(1)
+    assert re.search(r'\.library-hero-media\{[^}]*grid-row:1', mobile.group(2))
+    assert re.search(r'\.library-hero-content\{[^}]*grid-row:2', mobile.group(2))
+
+
+def _run_node(harness: str) -> str:
+    result = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+# Round 17: the home hero is the server's own daily pick
+# (`placement=hero`), never "the media with the most links".
+def _load_hero_body(js: str) -> str:
+    match = re.search(r"loadHero:\s*function\s*\(\)\s*\{([\s\S]*?)\n    \},", js)
+    assert match, "expected a loadHero function"
+    return match.group(1)
+
+
+def test_load_hero_uses_placement_hero(js):
+    body = _load_hero_body(js)
+    assert '"/api/library/recommendations?placement=hero&limit=5"' in body
+
+
+def test_hero_no_longer_ranks_by_link_count(js):
+    # The 电影/剧集 rails and the results sort menu still offer links_desc
+    # legitimately -- only the hero must not depend on it.
+    body = _load_hero_body(js)
+    assert "sort=links_desc" not in body and "link_count" not in body
+    assert "has_backdrop=1" not in body
+    assert "/api/library/search" not in body
+    hero_fetches = re.findall(r'fetchChannel\("hero",\s*"([^"]+)"', js)
+    assert hero_fetches == ["/api/library/recommendations?placement=hero&limit=5"]
+
+
+def _hero_harness(js: str, candidates: str, failing: str, shown_before: str = "null") -> str:
+    apply_fn = re.search(r"applyHeroCandidates:\s*function\s*\(items, date\)\s*\{([\s\S]*?)\n    \},", js)
+    try_fn = re.search(r"tryHeroCandidate:\s*function\s*\(candidates, index, date\)\s*\{([\s\S]*?)\n    \},", js)
+    assert apply_fn and try_fn, "expected applyHeroCandidates/tryHeroCandidate helpers"
+    return """
+var MEDIA_TYPE_LABEL = { movie: "电影", tv: "剧集" };
+var failing = """ + failing + """;
+var elements = {};
+function el() { return { textContent: "", src: "", hidden: true, onclick: null,
+  style: { setProperty: function (key, value) { this[key] = value; } } }; }
+var hero = { hidden: true, parts: {}, querySelector: function (sel) { return hero.parts[sel] || (hero.parts[sel] = el()); } };
+function $(id) { if (id === "libraryHero") return hero; return elements[id] || (elements[id] = el()); }
+var loaded = [];
+function Image() {
+  var self = this;
+  self.listeners = {};
+  self.addEventListener = function (name, fn) { self.listeners[name] = fn; };
+  Object.defineProperty(self, "src", { set: function (url) {
+    loaded.push(url);
+    setTimeout(function () { (failing.indexOf(url) !== -1 ? self.listeners.error : self.listeners.load)(); }, 0);
+  } });
+}
+var state = { library: { hero: { date: null, mediaId: null, fetchedAt: 0 } } };
+var views = { library: { openDetail: function () {}, heroOnScreen: function () { return true; },
+  syncHeroControls: function () {}, renderHeroThumbnails: function () {} } };
+views.library.applyHeroCandidates = function (items, date) {""" + apply_fn.group(1) + """};
+views.library.tryHeroCandidate = function (candidates, index, date) {""" + try_fn.group(1) + """};
+if (""" + shown_before + """) { state.library.hero = """ + shown_before + """; hero.hidden = false; hero.querySelector(".library-hero-title").textContent = "旧横幅"; }
+views.library.applyHeroCandidates(""" + candidates + """, "2026-03-14");
+setTimeout(function () {
+  console.log(JSON.stringify({ hidden: hero.hidden, title: hero.querySelector(".library-hero-title").textContent,
+    backdrop: hero.querySelector(".library-hero-backdrop").src, tried: loaded, heroState: state.library.hero }));
+}, 20);
+"""
+
+
+_HERO_ITEMS = """[
+  { media_id: 1, title: "甲", media_type: "movie", backdrop_url: "https://img.test/a.jpg", overview_short: "a" },
+  { media_id: 2, title: "乙", media_type: "tv", backdrop_url: "https://img.test/b.jpg", overview_short: "b" },
+  { media_id: 3, title: "丙", media_type: "movie", backdrop_url: "", overview_short: "c" },
+  { media_id: 4, title: "丁", media_type: "movie", backdrop_url: "https://img.test/d.jpg", overview_short: "" }
+]"""
+
+
+def test_hero_uses_first_candidate_whose_backdrop_loads(js):
+    out = json.loads(_run_node(_hero_harness(js, _HERO_ITEMS, "[]")))
+    assert out["hidden"] is False and out["title"] == "甲"
+    assert out["backdrop"] == "https://img.test/a.jpg"
+    assert out["tried"] == ["https://img.test/a.jpg"]
+    assert out["heroState"]["mediaId"] == 1 and out["heroState"]["date"] == "2026-03-14"
+
+
+def test_hero_falls_through_to_next_candidate_when_image_fails(js):
+    out = json.loads(_run_node(_hero_harness(js, _HERO_ITEMS, '["https://img.test/a.jpg"]')))
+    assert out["hidden"] is False and out["title"] == "乙"
+    assert out["tried"] == ["https://img.test/a.jpg", "https://img.test/b.jpg"]
+
+
+def test_hero_skips_items_without_backdrop_or_overview(js):
+    out = json.loads(_run_node(_hero_harness(js, _HERO_ITEMS, '["https://img.test/a.jpg", "https://img.test/b.jpg"]')))
+    # 丙 has no backdrop, 丁 has no overview -- nothing left, and no hero was showing before.
+    assert out["hidden"] is True
+    assert out["tried"] == ["https://img.test/a.jpg", "https://img.test/b.jpg"]
+
+
+def test_hero_keeps_current_banner_when_refresh_finds_nothing_loadable(js):
+    shown = '{ date: "2026-03-13", mediaId: 9, fetchedAt: 1 }'
+    out = json.loads(_run_node(_hero_harness(js, _HERO_ITEMS, '["https://img.test/a.jpg", "https://img.test/b.jpg"]', shown)))
+    assert out["hidden"] is False and out["title"] == "旧横幅"
+
+
+def test_hero_same_day_same_pick_does_not_reload_image(js):
+    shown = '{ date: "2026-03-14", mediaId: 1, fetchedAt: 1 }'
+    out = json.loads(_run_node(_hero_harness(js, _HERO_ITEMS, "[]", shown)))
+    assert out["hidden"] is False and out["tried"] == []
+
+
+def test_load_hero_keeps_existing_banner_on_fetch_failure(js):
+    body = _load_hero_body(js)
+    catch = re.search(r"\.catch\(function \([^)]*\) \{([\s\S]*?)\}\);", body)
+    assert catch, "expected a .catch handler"
+    assert "state.library.hero.mediaId" in catch.group(1)
+    assert re.search(r"if \(!state\.library\.hero\.mediaId\) \$\(\"libraryHero\"\)\.hidden = true", catch.group(1))
+
+
+def test_hero_refreshes_on_focus_or_visibility_only_while_browsing_home(js):
+    match = re.search(r"maybeRefreshHero:\s*function\s*\(\)\s*\{([\s\S]*?)\n    \},", js)
+    assert match, "expected a maybeRefreshHero function"
+    body = match.group(1)
+    assert "isBrowsing()" in body and "state.library.media" in body
+    assert "loadHero()" in body
+    assert 'addEventListener("visibilitychange"' in js and "maybeRefreshHero()" in js
+    assert 'addEventListener("focus"' in js
+    assert "Math.random" not in _load_hero_body(js)
 
 
 # ---------------------------------------------------------------------------
@@ -1124,21 +1290,21 @@ def test_review_reason_localisation_map_present(js):
 
 
 def test_tmdb_budget_seeded_from_configured_budget_never_effective(js):
-    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]{0,2600}?\n  \}', js)
+    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]*?\n  \}', js)
     assert match, "expected refreshLibraryStatus function"
     body = match.group(0)
     assert "configured_budget" in body
     assert re.search(r'\$\("tmdbBudget"\)\.value = d\.configured_budget', body)
 
 
-def test_settings_save_backfills_budget_from_response_tmdb_configured_budget(js):
-    region = re.search(r'settingsSave[\s\S]{0,1100}', js)
-    assert region, "expected the settingsSave click handler"
+def test_tmdb_save_backfills_budget_from_response_tmdb_configured_budget(js):
+    region = re.search(r'\$\("tmdbSave"\)\.onclick = function \(\)[\s\S]*?\n      \};', js)
+    assert region, "expected the tmdbSave click handler"
     assert "d.tmdb.configured_budget" in region.group(0)
 
 
 def test_worker_state_row_shows_used_over_effective_budget(js):
-    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]{0,2600}?\n  \}', js)
+    match = re.search(r'function refreshLibraryStatus\(\)[\s\S]*?\n  \}', js)
     assert match, "expected refreshLibraryStatus function"
     body = match.group(0)
     assert "effective_budget" in body
@@ -1163,20 +1329,10 @@ def test_css_has_both_reduced_motion_and_reduced_transparency_blocks(css):
     assert "@media (prefers-reduced-transparency: reduce)" in css
 
 
-def test_css_media_grid_uses_fixed_columns_not_auto_fill(css):
-    # x1-provider-ui §3.1: home/results grid columns are 桌面 5 / 平板 3 /
-    # 窄屏 2 (down from the earlier graduated 6/5/4/3/2). Fix wave 1, item 5:
-    # 1024/1280/1440px used to each carry their own identical repeat(5,1fr)
-    # rule -- collapsed into the one min-width:1024px rule (already the
-    # narrowest of the three, so it covers every wider viewport too).
-    assert "auto-fill" not in css
-    expectations = {1024: 5, 768: 3}
-    for width, columns in expectations.items():
-        block = re.search(rf'@media \(min-width:{width}px\)\{{([\s\S]*?)\n\}}', css)
-        assert block, f"expected a min-width:{width}px media block"
-        assert f"repeat({columns}," in block.group(1)
-    assert not re.search(r'@media \(min-width:1280px\)\{\.media-grid\{', css)
-    assert not re.search(r'@media \(min-width:1440px\)\{\.media-grid\{', css)
+def test_css_media_grid_shares_home_poster_width_and_keeps_empty_tracks(css):
+    # User replaced the old desktop-five-column rule with home-sized posters.
+    assert "repeat(auto-fill,var(--poster-rail-width))" in css
+    assert not re.search(r'\.media-grid\{[^}]*auto-fit', css)
     assert re.search(r'\.media-grid\{[^}]*repeat\(2,', css), "expected a 2-column base (<768px) rule"
 
 
@@ -1190,16 +1346,22 @@ def test_css_defines_hover_and_dialog_shadow_tokens(css):
     assert "var(--shadow-dialog)" in match.group(1)
 
 
-def test_page_title_has_no_sub_clamp_override_at_narrow_widths(css):
-    # The page-title clamp(40px, ..., 48px) rule already handles narrow
-    # screens down to a 40px floor; a later @media override that shrinks
-    # `.page-intro h2` below that floor would defeat the clamp everywhere
-    # under that breakpoint (e.g. 390x844 / 375x812).
+def test_page_title_keeps_global_clamp_with_only_settings_overrides(css):
+    # Keep the shared page-title clamp. The approved settings hierarchy
+    # alone uses 32px on desktop and 28px on mobile.
     clamp_rule = re.search(r'\.page-intro h2\{[^}]*font-size:clamp\([^}]*\}', css)
     assert clamp_rule, "expected the .page-intro h2 clamp(40px, ..., 48px) rule"
     rest = css[clamp_rule.end():]
-    assert not re.search(r'\.page-intro h2\{font-size:(?!clamp\()', rest), \
-        "found a non-clamp font-size override for .page-intro h2 after the clamp rule"
+    overrides = []
+    for selector, declarations in re.findall(r'([^{}\n]*\.page-intro h2)\{([^{}]*)\}', rest):
+        sizes = re.findall(r'(?:^|;)\s*font-size\s*:\s*([^;]+)', declarations)
+        if not sizes:
+            continue
+        assert len(sizes) == 1, "duplicate font-size declarations can hide a later title override"
+        if not sizes[0].strip().startswith("clamp("):
+            overrides.append((selector.strip(), sizes[0].strip()))
+    allowed = {("#settings .page-intro h2", "32px"), ("#settings .page-intro h2", "28px")}
+    assert set(overrides) == allowed
 
 
 EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF☀-➿]")
@@ -1487,15 +1649,20 @@ def test_on_enter_resets_detail_pushed_flag(js):
 
 
 def test_transfer_folder_list_error_never_shows_raw_upstream_text(js):
+    # R05: both pickers (the OpenList path walk and the per-user cid walk)
+    # fail through the same folderFailed handler, so the mapping is asserted
+    # there once.
     assert "目录读取失败" in js, "expected a friendly Chinese fallback message"
-    match = re.search(r'loadFolders:\s*function[\s\S]{0,2100}?\n    \},', js)
-    assert match, "expected a loadFolders function"
-    body = match.group(0)
+    match = re.search(r'folderFailed:\s*function\s*\(e\)\s*\{([\s\S]*?)\n    \},', js)
+    assert match, "expected a folderFailed handler"
+    body = match.group(1)
     assert not re.search(r'setEmpty\("folderResult",\s*e\.message\)', body), (
         "must not pass the raw upstream/exception-class-name message "
         "through unchecked -- map it to a friendly Chinese fallback first"
     )
-    assert re.search(r'setEmpty\("folderResult",\s*friendlyFolderError\(e\.message\)\)', body)
+    assert re.search(r'setEmpty\("folderResult",\s*friendlyFolderError\(e && e\.message\)\)', body)
+    for loader in ("loadFolders", "loadOwnFolders"):
+        assert re.search(loader + r':\s*function[\s\S]*?\.catch\(views\.transfer\.folderFailed\)', js), loader
 
 
 def test_filter_drawer_has_genre_and_source_chip_groups(page):
@@ -1608,8 +1775,11 @@ def test_transfer_load_failed_flag_tracks_success_and_failure(js):
     then_match = re.search(r"\.then\(function\s*\(d\)\s*\{([\s\S]*?)\n      \}\)", body)
     assert then_match, "expected loadFolders' .then() success handler"
     assert "state.transferLoadFailed = false" in then_match.group(1)
-    catch_match = re.search(r"\.catch\(function\s*\(e\)\s*\{([\s\S]*?)\n      \}\);", body)
-    assert catch_match, "expected loadFolders' .catch() failure handler"
+    assert ".catch(views.transfer.folderFailed)" in body, (
+        "loadFolders must route failures through the shared folderFailed handler"
+    )
+    catch_match = re.search(r"folderFailed:\s*function\s*\(e\)\s*\{([\s\S]*?)\n    \},", js)
+    assert catch_match, "expected a folderFailed handler"
     assert "state.transferLoadFailed = true" in catch_match.group(1)
     assert '$("saveBtn").disabled = true' in catch_match.group(1)
 
@@ -1633,13 +1803,15 @@ def test_load_folders_reopen_after_failure_enables_save_btn_on_empty_directory(j
     # clear transferLoadFailed exactly like a non-empty directory would.
     match = re.search(r"loadFolders:\s*function\s*\(path\)\s*\{([\s\S]*?)\n    \},", js)
     assert match, "expected a loadFolders function"
+    failed = re.search(r"folderFailed:\s*function\s*\(e\)\s*\{([\s\S]*?)\n    \},", js)
+    assert failed, "expected a folderFailed handler"
     harness = """
 var els = {};
 function $(id) { return els[id] || (els[id] = { textContent: "", disabled: false, innerHTML: "" }); }
 function setEmpty(id, message) { $(id).innerHTML = message; }
 function esc(s) { return String(s == null ? "" : s); }
 function friendlyFolderError(message) { return message; }
-var state = { currentTransferPath: "/", transferRoot: "/", transferRootPid: "0", transferBusy: false, transferLoadFailed: false };
+var state = { currentTransferPath: "/", transferRoot: "/", transferRootPid: "0", transferBusy: false, transferLoadFailed: false, transferOwnCids: false, transferOwnStack: [] };
 var callCount = 0;
 var api = { request: function () {
   callCount += 1;
@@ -1647,6 +1819,7 @@ var api = { request: function () {
   return Promise.resolve({ items: [] });
 } };
 var views = { transfer: {} };
+views.transfer.folderFailed = function (e) {""" + failed.group(1) + """};
 views.transfer.loadFolders = function (path) {""" + match.group(1) + """};
 views.transfer.loadFolders("/").then(function () {
   return views.transfer.loadFolders("/");
@@ -1659,6 +1832,87 @@ views.transfer.loadFolders("/").then(function () {
     out = json.loads(result.stdout)
     assert out["transferLoadFailed"] is False
     assert out["saveBtnDisabled"] is False
+
+
+def _folder_picker_harness(js, body):
+    """The two folder loaders plus folderFailed, on a minimal DOM stub."""
+    loaders = {}
+    for name, pattern in (("loadFolders", r"loadFolders:\s*function\s*\(path\)\s*\{([\s\S]*?)\n    \},"),
+                          ("loadOwnFolders", r"loadOwnFolders:\s*function\s*\(cid\)\s*\{([\s\S]*?)\n    \},"),
+                          ("folderFailed", r"folderFailed:\s*function\s*\(e\)\s*\{([\s\S]*?)\n    \},")):
+        match = re.search(pattern, js)
+        assert match, name
+        loaders[name] = match.group(1)
+    return """
+var els = {};
+function $(id) { return els[id] || (els[id] = { textContent: "", disabled: false, innerHTML: "", querySelectorAll: function () { return []; } }); }
+function setEmpty(id, message) { $(id).innerHTML = message; }
+function esc(s) { return String(s == null ? "" : s); }
+function friendlyFolderError(message) { return message || "目录读取失败"; }
+var state = { currentTransferPath: "/115pan", currentTransferPid: "", transferRoot: "/115pan",
+              transferRootPid: "0", transferBusy: false, transferLoadFailed: false,
+              transferOwnCids: false, transferOwnStack: [] };
+var requested = [];
+var views = { transfer: {} };
+views.transfer.folderFailed = function (e) {""" + loaders["folderFailed"] + """};
+views.transfer.loadOwnFolders = function (cid) {""" + loaders["loadOwnFolders"] + """};
+views.transfer.loadFolders = function (path) {""" + loaders["loadFolders"] + """};
+""" + body
+
+
+def test_folder_picker_switches_to_the_users_own_115_by_cid(js):
+    """R05: when the server answers `mode: "115"` the picker walks the
+    user's own account by cid, and the submitted target is that cid with no
+    path beside it -- a displayed name is never the boundary."""
+    harness = _folder_picker_harness(js, """
+var api = { request: function (url) {
+  requested.push(url);
+  if (url.indexOf("cid=") !== -1) return Promise.resolve({ mode: "115", cid: "0", items: [{ cid: "a1", name: "我的收藏" }] });
+  return Promise.resolve({ mode: "115", cid: "0", items: [{ cid: "a1", name: "我的收藏" }] });
+} };
+views.transfer.loadFolders("/115pan").then(function () {
+  console.log(JSON.stringify({
+    own: state.transferOwnCids, pid: state.currentTransferPid, path: state.currentTransferPath,
+    requested: requested, label: $("targetPath").textContent, disabled: $("saveBtn").disabled,
+  }));
+});
+""")
+    result = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["own"] is True
+    assert out["pid"] == "0"
+    assert out["path"] == "", "a cid-mode target submits no path at all"
+    assert out["requested"][-1] == "/api/115/folders?cid=0"
+    assert "115" in out["label"]
+    assert out["disabled"] is False
+
+
+def test_folder_picker_guides_a_member_who_has_not_authorised(js):
+    """R05: no folder choice without step B, but the transfer itself still
+    works -- the share goes to the user's own default inbox, so the button
+    stays enabled and the copy says which one to press."""
+    harness = _folder_picker_harness(js, """
+var api = { request: function (url) {
+  requested.push(url);
+  var err = new Error("请先在设置页完成「目录与云下载」授权。");
+  err.code = "OPEN115_NOT_AUTHORIZED";
+  return Promise.reject(err);
+} };
+views.transfer.loadFolders("/115pan").then(function () {
+  console.log(JSON.stringify({
+    pid: state.currentTransferPid, path: state.currentTransferPath, failed: state.transferLoadFailed,
+    disabled: $("saveBtn").disabled, notice: $("folderResult").innerHTML, label: $("targetPath").textContent,
+  }));
+});
+""")
+    result = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert out["pid"] == "" and out["path"] == "", "no unproved target may survive the refusal"
+    assert out["disabled"] is False and out["failed"] is False
+    assert "授权" in out["notice"] and "默认接收" in out["notice"]
+    assert "默认接收" in out["label"]
 
 
 def test_transfer_duplicate_error_renders_as_info_notice_not_red_error(js):
@@ -1724,19 +1978,17 @@ def test_media_card_html_poster_image_error_is_bound_after_insertion(js):
     assert "poster-broken" in bind_body
 
 
-def test_hero_backdrop_hides_hero_on_image_load_error(js):
-    # T8 #6: a stale backdrop_url must not leave the 340px black
-    # .library-hero block showing a broken image -- bind an "error"
-    # listener (never an inline onerror= attribute, T8 #9) that hides
-    # #libraryHero.
-    match = re.search(r"loadHero:\s*function\s*\(\)\s*\{([\s\S]*?)\n    \},", js)
-    assert match, "expected a loadHero function"
+def test_hero_backdrop_never_shows_a_broken_image(js):
+    # T8 #6 / round 17: a stale backdrop_url must not leave the 340px black
+    # .library-hero block showing a broken image -- each candidate is
+    # preloaded and only a successfully loaded one is ever assigned to the
+    # visible <img>; listeners, never inline onerror= attributes (T8 #9).
+    match = re.search(r"tryHeroCandidate:\s*function\s*\(candidates, index, date\)\s*\{([\s\S]*?)\n    \},", js)
+    assert match, "expected a tryHeroCandidate function"
     body = match.group(1)
-    assert 'addEventListener("error"' in body
+    assert 'addEventListener("error"' in body and 'addEventListener("load"' in body
     assert "onerror=" not in body
-    error_handler = re.search(r'addEventListener\("error",\s*function\s*\(\)\s*\{([^}]*)\}', body)
-    assert error_handler, "expected an error listener callback"
-    assert "hero.hidden = true" in error_handler.group(1)
+    assert "new Image()" in body
 
 
 def test_old_hdr_codec_audio_subtitle_label_machinery_is_gone(js):
@@ -1823,7 +2075,7 @@ def test_interpreted_provider_chip_uses_localised_label_not_raw_code(js):
     match = re.search(r'renderChips:\s*function\s*\(interpreted\)\s*\{([\s\S]*?)\n    \},', js)
     assert match, "expected a renderChips function"
     body = match.group(1)
-    providers_block = re.search(r'\(interpreted\.providers \|\| \[\]\)\.forEach\(function \(pv\) \{([\s\S]*?)\n      \}\);', body)
+    providers_block = re.search(r'\(state\.library\.provider\.length \? \[\] : interpreted\.providers \|\| \[\]\)\.forEach\(function \(pv\) \{([\s\S]*?)\n      \}\);', body)
     assert providers_block, "expected an interpreted.providers forEach block"
     assert "label: providerLabel(pv)" in providers_block.group(1)
     assert "label: pv," not in providers_block.group(1)
@@ -1955,7 +2207,7 @@ def test_detail_render_only_shows_all_tab_when_more_than_one_provider_or_scoped_
 
 
 def test_provider_tabs_have_roving_tabindex_and_aria_selected(js):
-    match = re.search(r'renderProviderTabs:\s*function[\s\S]{0,1400}?\n    \},', js)
+    match = re.search(r'renderProviderTabs:\s*function[\s\S]*?\n    \},', js)
     assert match, "expected a renderProviderTabs function"
     body = match.group(0)
     assert 'role="tab"' in body
@@ -1975,28 +2227,24 @@ def test_provider_tabs_keyboard_navigation_arrows_home_end(js):
     assert "selectProvider(btn.dataset.provider)" in body
 
 
-def test_select_provider_refetches_media_scoped_to_the_new_provider(js):
-    # I1 (§14.1): the in-page tab switch must be backend-scoped, the same
-    # as open() -- re-filtering `state.detail.media` client-side (the old
-    # behaviour) left every other provider's tab/logo/count sitting in the
-    # DOM/a11y tree, and inflated the summary row's counts. No more direct
-    # aria-selected/tabindex twiddling or a renderGroupList() call here --
-    # render() (invoked from the fetch's .then below) rebuilds the whole
-    # tablist and group list from the scoped response instead.
+def test_select_provider_filters_the_cards_without_refetching(js):
+    # I1 (§14.1) required a backend-scoped tab switch so a filtered view could
+    # not leave another provider's tab/logo/count in the DOM. Round 32 changed
+    # the tab's job at the user's request: it narrows the CARDS to its pan
+    # while the tab row keeps every button -- the old refetch with ?provider=
+    # is what deleted those buttons. Server-side scoping is untouched: a
+    # response fetched with ?provider= still carries only that pan (see
+    # test_detail_request_url_scopes_to_provider and the API suite).
     match = re.search(r'selectProvider:\s*function\s*\(code\)\s*\{([\s\S]*?)\n    \},', js)
     assert match, "expected a selectProvider function"
     body = match.group(1)
-    assert 'state.library.provider = normalized ? [normalized] : []' in body
-    assert "pushUrl(false)" in body
-    # Round 16: the URL is built by detailRequestUrl (provider scoping +
-    # the include_deleted flag) -- see test_detail_request_url_scopes_to_provider.
-    assert "detailRequestUrl(state.library.media, normalized)" in body
-    assert 'fetchChannel("detail", url)' in body
-    assert 'views.detail.render(d, !!normalized)' in body
-    assert 'focusProviderTab(state.detail.provider)' in body
-    # no leftover client-side residue from the old, buggy implementation
-    assert "renderGroupList()" not in body
-    assert 'setAttribute("aria-selected"' not in body
+    assert "state.detail.panFilter = normalized" in body
+    assert "views.detail.renderGroupList()" in body and "aria-selected" in body
+    # No refetch, and the search view's own provider filter is left alone.
+    assert "fetchChannel(" not in body and "detailRequestUrl(" not in body
+    assert "state.library.provider" not in body and "pushUrl(" not in body
+    cards = re.search(r'panCards:\s*function\s*\(\)\s*\{([\s\S]*?)\n    \},', js)
+    assert cards and "state.detail.panFilter" in cards.group(1)
 
 
 def test_close_detail_resets_provider_filter_so_it_cannot_leak_into_search(js):
@@ -2045,7 +2293,9 @@ def test_detail_render_computes_selected_provider_from_url_and_facets(js):
     match = re.search(r'render:\s*function\s*\(media[^)]*\)\s*\{([\s\S]*?)\n    \},', js)
     assert match, "expected a detail render function"
     body = match.group(1)
-    assert "media.provider_facets" in body
+    assert "visibleFacets(media)" in body  # round 25: same facets, counted from the visible rows
+    facets_fn = re.search(r"function visibleFacets\(media\) \{([\s\S]*?)\n  \}", js)
+    assert facets_fn and "media.provider_facets" in facets_fn.group(1)
     assert "codes.indexOf(requested)" in body
     assert "state.detail.provider = selected" in body
     assert "state.library.provider = selected ? [selected] : []" in body
@@ -2068,8 +2318,15 @@ def test_group_row_html_filters_a_mixed_provider_groups_links_by_selected_code(j
     match = re.search(r'groupRowHtml:\s*function\s*\(group, code\)\s*\{([\s\S]*?)\n    \},', js)
     assert match, "expected a groupRowHtml(group, code) function"
     body = match.group(1)
-    assert "l.provider === code" in body
-    assert 'code ? ((group.providers && group.providers[code]) || 0) : groupLiveLinkCount(group)' in body
+    assert "visibleLinks(group, code)" in body
+    visible = re.search(r"function visibleLinks\(group, code\) \{([\s\S]*?)\n  \}", js)
+    assert visible and "l.provider !== code" in visible.group(1)
+    # Round 25/29: the displayed count is the rows actually shown -- live, and
+    # either unchecked or checker-confirmed valid (linkIsUsable) -- not the
+    # server's per-provider total.
+    assert "links.filter(linkIsUsable).length" in body
+    usable = re.search(r"function linkIsUsable\(link\) \{([\s\S]*?)\n  \}", js)
+    assert usable and 'status === "valid"' in usable.group(1) and 'status === "queued"' in usable.group(1)
 
 
 def _extract_group_row_functions(js):
@@ -2093,8 +2350,17 @@ def _extract_group_row_functions(js):
     error_label_fn = extract(r'function linkcheckErrorClassLabel\(code\) \{([\s\S]*?)\n  \}')
     status_tooltip = extract(r'function linkStatusTooltip\(link\) \{([\s\S]*?)\n  \}')
     status_badge = extract(r'function linkStatusBadgeHtml\(link\) \{([\s\S]*?)\n  \}')
+    # Round 25: groupRowHtml reads its rows through these two helpers.
+    visible_links = extract(r'function visibleLinks\(group, code\) \{([\s\S]*?)\n  \}')
+    usable = extract(r'function linkIsUsable\(link\) \{([\s\S]*?)\n  \}')
+    fold_open = extract(r'function groupFoldOpen\(key\) \{([\s\S]*?)\n  \}')
+    fold_button = extract(r'function foldButtonHtml\(key, open\) \{([\s\S]*?)\n  \}')
     return """
 var ICONS_URL = "/static/icons.svg?v=test";
+function linkIsUsable(link) {""" + usable + """}
+function visibleLinks(group, code) {""" + visible_links + """}
+function groupFoldOpen(key) {""" + fold_open + """}
+function foldButtonHtml(key, open) {""" + fold_button + """}
 var PROVIDER_LABEL = { "115": "115网盘" };
 function providerLabel(code) { return PROVIDER_LABEL[code] || code; }
 var PROVIDER_META_BY_CODE = { "115": { code: "115", symbol: "provider-115" } };
@@ -2108,6 +2374,7 @@ var LINKCHECK_ERROR_CLASS_LABEL = """ + error_label + """;
 function linkcheckErrorClassLabel(code) {""" + error_label_fn + """}
 function linkStatusTooltip(link) {""" + status_tooltip + """}
 function linkStatusBadgeHtml(link) {""" + status_badge + """}
+var state = { cloudEnabled: false };
 function groupLiveLinkCount(group) {""" + live_count + """}
 function seasonLabel(g) {""" + season + """}
 function specRowHtml(specs) {""" + specs + """}
@@ -2122,12 +2389,11 @@ function groupRowHtml(group, code) {""" + group_row + """}
 
 
 def test_group_row_html_link_count_excludes_deleted_links_of_the_selected_provider(js):
-    # I2: a deleted link still renders (disabled, for audit -- §13.3), so
-    # counting `links.length` after filtering by provider double-counts a
-    # deleted+live pair of the same provider as 2. The displayed count
-    # must match the server's live-only `group.providers[code]` total.
+    # I2 / round 25: a deleted link is hidden by default and never counted;
+    # under include_deleted it renders (disabled, for audit -- §13.3) but
+    # the displayed count stays the live+valid rows.
     harness = _extract_group_row_functions(js) + """
-console.log(JSON.stringify(groupRowHtml({
+var group = {
   group_id: 1,
   display_title: "测试资源",
   providers: { "115": 1 },
@@ -2135,15 +2401,19 @@ console.log(JSON.stringify(groupRowHtml({
     { link_id: "live", provider: "115", label: "live", deleted: false, actions: [] },
     { link_id: "gone", provider: "115", label: "gone", deleted: true, actions: [] }
   ]
-}, "115")));
+};
+var plain = groupRowHtml(group, "115");
+state.detail = { includeDeleted: true };
+console.log(JSON.stringify({ plain: plain, audit: groupRowHtml(group, "115") }));
 """
     result = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    html = json.loads(result.stdout)
-    assert "1 条链接" in html
-    assert "2 条链接" not in html
-    # both rows still render (deleted ones stay visible, disabled, per §13.3)
-    assert html.count("link-row") >= 2
+    out = json.loads(result.stdout)
+    for html in (out["plain"], out["audit"]):
+        assert "1 条链接" in html
+        assert "2 条链接" not in html
+    assert out["plain"].count('data-link-id="') == 1 and 'data-link-id="gone"' not in out["plain"]
+    assert out["audit"].count('data-link-id="') == 2 and "link-row-deleted" in out["audit"]
 
 
 def test_group_row_html_unfiltered_branch_counts_live_links_only(js):
@@ -2173,31 +2443,30 @@ console.log(JSON.stringify(groupRowHtml({
     assert "3 条链接" not in html
 
 
-def test_detail_summary_link_count_sums_per_group_live_counts(js):
-    # I2: the summary row's "N 条链接" must match what the groups actually
-    # display below it -- the sum of each group's own live-only count --
-    # rather than trusting the backend's `media.link_count`, which sums
-    # each group's non-live-only `link_count` and so isn't live-only
-    # either.
-    render_match = re.search(r"render:\s*function\s*\(media[^)]*\)\s*\{([\s\S]*?)\n    \},", js)
-    assert render_match, "expected a detail render function"
-    body = render_match.group(1)
-    linkcount_match = re.search(
-        r"var linkCount = \(media\.groups \|\| \[\]\)\.reduce\(function \(sum, g\) \{ return sum \+ groupLiveLinkCount\(g\); \}, 0\);",
-        body,
-    )
-    assert linkcount_match, "expected linkCount to sum groupLiveLinkCount(g) across every group"
-
-    live_count_match = re.search(r"function groupLiveLinkCount\(group\) \{([\s\S]*?)\n  \}", js)
-    assert live_count_match, "expected a groupLiveLinkCount helper"
-    harness = "function groupLiveLinkCount(group) {" + live_count_match.group(1) + """}
+def test_detail_summary_link_count_matches_the_rows_actually_shown(js):
+    # I2 / round 25: the summary row's "N 条链接" must match what the cards
+    # actually list below it -- live and not checker-invalid (panLinkCount)
+    # -- rather than the backend's `media.link_count`, which is neither
+    # live-only nor invalid-aware. The full cross-check (summary, pan tabs
+    # and card headers agreeing) lives in tests/test_detail_pan_cards.py.
+    # Round 40: the row is built by summaryRowHtml() so an RE0 refresh can
+    # rebuild it in place; the rule it applies is unchanged.
+    summary_match = re.search(r"summaryRowHtml:\s*function\s*\(media, facetCount\)\s*\{([\s\S]*?)\n    \},", js)
+    assert summary_match, "expected a summaryRowHtml function"
+    body = summary_match.group(1)
+    assert 'var linkCount = panLinkCount(media, "");' in body
+    count_fn = re.search(r"function panLinkCount\(media, code\) \{([\s\S]*?)\n  \}", js)
+    assert count_fn and "linkIsUsable(l)" in count_fn.group(1)
+    usable_fn = re.search(r"function linkIsUsable\(link\) \{([\s\S]*?)\n  \}", js)
+    assert usable_fn, "expected a linkIsUsable helper"
+    harness = ("function linkIsUsable(link) {" + usable_fn.group(1) + "}\n"
+               "function panLinkCount(media, code) {" + count_fn.group(1) + """}
 var media = { groups: [
-  { providers: { "115": 1, "quark": 1 }, link_count: 3 },
-  { providers: { "115": 1 }, link_count: 1 }
+  { links: [{ provider: "115" }, { provider: "quark" }, { provider: "115", invalid: true }] },
+  { links: [{ provider: "115" }, { provider: "115", deleted: true }] }
 ] };
-""" + linkcount_match.group(0) + """
-console.log(JSON.stringify({ linkCount: linkCount }));
-"""
+console.log(JSON.stringify({ linkCount: panLinkCount(media, "") }));
+""")
     result = subprocess.run(["node", "-e", harness], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["linkCount"] == 3
@@ -2335,21 +2604,18 @@ def test_provider_tab_id_escapes_the_code(js):
     assert 'esc(code' in match.group(1)
 
 
-def test_media_grid_five_column_breakpoint_is_not_duplicated(css):
-    # Item 5: 1024/1280/1440px used to each carry their own identical
-    # repeat(5,1fr) rule -- collapse that redundancy into the one
-    # min-width:1024px rule that already covers every wider viewport.
+def test_media_grid_does_not_restore_stretched_desktop_columns(css):
     assert not re.search(r'@media \(min-width:1280px\)\{\.media-grid\{', css)
     assert not re.search(r'@media \(min-width:1440px\)\{\.media-grid\{', css)
-    rule = re.search(r'@media \(min-width:1024px\)\{\.media-grid\{([^}]*)\}\}', css)
-    assert rule, "expected a single min-width:1024px .media-grid rule"
-    assert 'repeat(5,1fr)' in rule.group(1)
+    assert not re.search(r'@media \(min-width:1024px\)\{\.media-grid\{', css)
+    rule = re.search(r'@media \(min-width:768px\)\{\.media-grid\{([^}]*)\}\}', css)
+    assert rule and 'var(--poster-rail-width)' in rule.group(1)
 
 
 # ---------------------------------------------------------------------------
 # T13 y1-cards: cards show only title + one "年份 · 类型" line; single 2:3
 # poster box shared by image/fallback/skeleton with explicit rail/grid
-# widths (docs/architecture.md §1, §2).
+# widths (docs/claude-media-card-meta-and-tmdb-review-20260906.md §1, §2).
 # ---------------------------------------------------------------------------
 
 def test_format_card_meta_function_defined(js):
@@ -2484,7 +2750,7 @@ def test_provider_icons_are_aria_hidden_with_a_visible_text_label(js):
     link_row_match = re.search(r'linkRowHtml:\s*function\s*\(link\)\s*\{([\s\S]*?)\n    \},', js)
     assert link_row_match, "expected a linkRowHtml function"
     assert 'class="link-provider-icon provider-logo" aria-hidden="true"' in link_row_match.group(1)
-    tabs_match = re.search(r'renderProviderTabs:\s*function[\s\S]{0,1400}?\n    \},', js)
+    tabs_match = re.search(r'renderProviderTabs:\s*function[\s\S]*?\n    \},', js)
     assert tabs_match, "expected a renderProviderTabs function"
     assert 'class="provider-logo" aria-hidden="true"' in tabs_match.group(0)
 
@@ -2888,3 +3154,91 @@ def test_filter_group_order_matches_re0_hierarchy(page):
     filters_tag_start = page.index('id="libraryFilters"')
     positions = [page.index(f'id="{element_id}"', filters_tag_start) for element_id in order]
     assert positions == sorted(positions), "filter groups must appear in the RE0-derived order"
+
+
+# ---------------------------------------------------------------------------
+# Round 18: the access-code panel only appears when the revealed link
+# actually carries an access code -- a code-less link (most 115/天翼
+# shares) used to leave a "访问码 ••••" row with a dead 显示访问码 button.
+# ---------------------------------------------------------------------------
+
+
+def _reveal_harness(js: str, response: str, clipboard_ok: str = "true") -> str:
+    def part(name, sig):
+        match = re.search(name + r":\s*function\s*" + sig + r"\s*\{([\s\S]*?)\n    \},", js)
+        assert match, "expected views.detail." + name
+        return match.group(1)
+    return """
+var elements = {};
+function $(id) { return elements[id] || (elements[id] = { hidden: false, textContent: "", value: "", disabled: false }); }
+$("revealPanel").hidden = true; $("revealCodeRow").hidden = false; $("revealFallbackRow").hidden = true;
+var opened = [], clipboard = [], toasts = [];
+var window = { open: function (url) { opened.push(url); } };
+// Node 22 ships a read-only global `navigator`; a plain `var` would be ignored.
+Object.defineProperty(globalThis, "navigator", { configurable: true, value: { clipboard: { writeText: function (t) { clipboard.push(t); return """ + clipboard_ok + """ ? Promise.resolve() : Promise.reject(new Error("denied")); } } } });
+function toast(msg, kind) { toasts.push(msg); }
+var api = { request: function () { return Promise.resolve(""" + response + """); } };
+function encodeURIComponent(s) { return s; }
+var views = { detail: { currentCode: "", fallbackTimer: null } };
+views.detail.hideReveal = function () {""" + part("hideReveal", r"\(\)") + """};
+views.detail.showFallback = function (text) {""" + part("showFallback", r"\(text\)") + """};
+views.detail.toggleCode = function () {""" + part("toggleCode", r"\(\)") + """};
+views.detail.reveal = function (linkId, mode, btn) {""" + part("reveal", r"\(linkId, mode, btn\)") + """};
+function snapshot() {
+  return { panel: $("revealPanel").hidden, codeRow: $("revealCodeRow").hidden, code: $("revealCode").textContent,
+    fallbackRow: $("revealFallbackRow").hidden, fallback: $("revealFallback").value, current: views.detail.currentCode,
+    opened: opened, clipboard: clipboard, toasts: toasts };
+}
+"""
+
+
+def test_reveal_hides_access_code_panel_for_a_codeless_link(js):
+    harness = _reveal_harness(js, '{ url: "https://115.com/s/swfake1", access_code: "" }') + """
+views.detail.reveal("l1", "open", { disabled: false }).then(function () { console.log(JSON.stringify(snapshot())); });
+"""
+    out = json.loads(_run_node(harness))
+    assert out["panel"] is True
+    assert out["current"] == ""
+    assert out["opened"] == ["https://115.com/s/swfake1"]
+    assert out["clipboard"] == []
+
+
+def test_reveal_shows_masked_panel_and_working_toggle_when_link_has_a_code(js):
+    harness = _reveal_harness(js, '{ url: "https://pan.quark.cn/s/swfake2", access_code: "ab12" }') + """
+views.detail.reveal("l2", "open", { disabled: false }).then(function () {
+  var before = snapshot();
+  views.detail.toggleCode();
+  var after = snapshot();
+  clearTimeout(views.detail.fallbackTimer);
+  console.log(JSON.stringify({ before: before, after: after }));
+});
+"""
+    out = json.loads(_run_node(harness))
+    assert out["before"]["panel"] is False and out["before"]["codeRow"] is False
+    assert out["before"]["code"] == "••••" and out["before"]["current"] == "ab12"
+    assert out["before"]["clipboard"] == ["ab12"]
+    assert out["after"]["code"] == "ab12"
+
+
+def test_reveal_of_a_codeless_link_clears_a_previous_links_code(js):
+    harness = _reveal_harness(js, '{ url: "https://115.com/s/swfake3", access_code: "" }') + """
+views.detail.currentCode = "zz99"; $("revealPanel").hidden = false; $("revealCode").textContent = "zz99";
+views.detail.reveal("l3", "copy", { disabled: false }).then(function () { console.log(JSON.stringify(snapshot())); });
+"""
+    out = json.loads(_run_node(harness))
+    assert out["panel"] is True and out["current"] == "" and out["code"] == "••••"
+    assert out["clipboard"] == ["https://115.com/s/swfake3"]
+
+
+def test_reveal_clipboard_fallback_for_codeless_link_shows_textarea_without_code_row(js):
+    harness = _reveal_harness(js, '{ url: "https://115.com/s/swfake4", access_code: "" }', clipboard_ok="false") + """
+views.detail.reveal("l4", "copy", { disabled: false }).then(function () { console.log(JSON.stringify(snapshot())); });
+"""
+    out = json.loads(_run_node(harness))
+    assert out["panel"] is False and out["fallbackRow"] is False
+    assert out["fallback"] == "https://115.com/s/swfake4"
+    assert out["codeRow"] is True
+
+
+def test_reveal_panel_markup_has_a_dedicated_code_row(page):
+    assert 'id="revealCodeRow"' in page

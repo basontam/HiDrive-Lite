@@ -191,6 +191,19 @@ def test_main_refuses_targets_outside_root(repo, tmp_path, capsys):
     assert "outside" in capsys.readouterr().err
 
 
+def test_allowlist_never_hides_an_adjacent_credential():
+    allow = scan_secrets.parse_allowlist(["src/*.py :: marker-value"])
+    secret = "Ab3" * 8
+    line = 'x = marker-value; token = "' + secret + '"'
+    assert rules(line, "src/a.py", allow) == ["credential-assignment"]
+
+
+def test_project_password_placeholder_does_not_hide_adjacent_bearer():
+    allow = scan_secrets.load_allowlist(ROOT / "scripts" / "secret-scan-allowlist.txt")
+    line = 'client.post(url, json={"password": GOOD_PASSWORD}, headers={"Authorization": "Bearer ' + "Zx9" * 12 + '"})'
+    assert "bearer-token" in rules(line, "tests/t.py", allow)
+
+
 def test_project_allowlist_file_parses():
     allow = scan_secrets.load_allowlist(ROOT / "scripts" / "secret-scan-allowlist.txt")
     assert allow, "the project allowlist must contain at least the API-doc placeholders"

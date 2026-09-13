@@ -34,6 +34,7 @@ from fixtures.library.build_installed import build_synthetic_library  # noqa: E4
 # Environment fallbacks that app.config_value() honours in local mode.  They
 # are removed so a developer shell can never leak credentials into a test.
 SECRET_ENV_NAMES = (
+    "HDHIVE_BASE_URL",
     "HDHIVE_APP_SECRET",
     "HDHIVE_CLIENT_ID",
     "TMDB_API_KEY",
@@ -123,7 +124,18 @@ def workspace(hidrive, tmp_path, monkeypatch):
     # restarts from 1 in every test's own fresh database.
     monkeypatch.setattr(hidrive, "_RECHECK_LAST_QUEUED_AT", {})
     hidrive.init_db()
-    return tmp_path
+    try:
+        yield tmp_path
+    finally:
+        # A test may enable the production autostart path or otherwise leave
+        # the module-owned worker running.  Stop it before monkeypatch tears
+        # down the per-test path/global overrides; otherwise the daemon can
+        # retain late-bound LIBRARY_DB_PATH and mutate the next test's
+        # projections (e.g. turning a freshly projected row retryable).
+        for name in ("_library_enricher", "_library_linkchecker"):
+            worker = getattr(hidrive, name, None)
+            if worker is not None:
+                worker.stop(timeout=5)
 
 
 @pytest.fixture

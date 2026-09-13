@@ -45,6 +45,9 @@
 <symbol id="icon-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
 <path d="m8 6 8 6-8 6"></path>
 </symbol>
+<symbol id="icon-caret" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+<path d="M12 16 5.5 8.5h13z"></path>
+</symbol>
 <symbol id="icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
 <circle cx="10.5" cy="10.5" r="6.5"></circle>
 <path d="m20 20-4.6-4.6"></path>
@@ -116,49 +119,55 @@
 <path d="m10 7 5 5-5 5"></path>
 <path d="M20 5v14"></path>
 </symbol>
-<!-- x1-provider-ui §4.1: provider-identity symbols for the detail-page
-     logo tablist and resource link rows. Line-style, 24x24, brand colour
-     used only for a small-area fill/accent inside each mark, never a
-     bitmap, never fetched from a remote host. "provider-link" is the
-     neutral fallback used for "unknown". -->
+<!-- Provider marks are local vector reconstructions based on each service's
+     current public app mark. They are intentionally small, source-free
+     assets: no remote image, font, or CDN request is made at runtime. The
+     provider labels remain the source of truth for accessibility. -->
 <symbol id="provider-115" viewBox="0 0 24 24">
-<rect x="2" y="2" width="20" height="20" rx="5" fill="#2f7df6"></rect>
-<text x="12" y="15.6" text-anchor="middle" font-family="sans-serif" font-size="7.6" font-weight="700" fill="#fff">115</text>
+<circle cx="12" cy="12" r="10" fill="#2b5795"></circle>
+<path fill="#fff" d="M17.5 5.2H8.2L6.8 10.6c1.8-.5 3.8-.6 5.4-.3 2 .4 3.2 1.5 3.2 3.2 0 2.7-3.1 4.7-8.4 4.9 1.7-.7 3-1.7 3.8-2.9.6-.9.4-1.7-.4-2.2-.9-.6-2.4-.6-4.1-.3l-1.1.2 1.3-8h11z"></path>
 </symbol>
-<symbol id="provider-tianyicloud" viewBox="0 0 24 24" fill="none" stroke="#f59e0b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<path d="M7 18a4.5 4.5 0 0 1-.5-8.98A5.5 5.5 0 0 1 17 8.5 4 4 0 0 1 17.5 18H7z"></path>
+<symbol id="provider-tianyicloud" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path d="M5.1 15.6a3.7 3.7 0 0 1 .6-7.3 5.4 5.4 0 0 1 10.2 1.2 3.4 3.4 0 0 1 .1 6.8H5.1z" stroke="#25b9ec" stroke-width="2.1"></path>
+<path d="M17.4 15.1V8.4m0 0-2.2 2.2m2.2-2.2 2.2 2.2" stroke="#f05b78" stroke-width="1.8"></path>
 </symbol>
-<symbol id="provider-quark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<path d="M7 18a4.5 4.5 0 0 1-.5-8.98A5.5 5.5 0 0 1 17 8.5 4 4 0 0 1 17.5 18H7z"></path>
-<circle cx="17.2" cy="7" r="2.4" fill="#5b67e8" stroke="none"></circle>
+<symbol id="provider-quark" viewBox="0 0 24 24">
+<rect x="1.7" y="1.7" width="20.6" height="20.6" rx="6" fill="#fff" stroke="#dfe5fb"></rect>
+<path fill="#316cf2" d="M12 4.6a7.4 7.4 0 1 0 5.7 12.1l1.7 1.7 1.4-1.4-1.7-1.7A7.4 7.4 0 0 0 12 4.6z"></path>
+<circle cx="12" cy="12" r="4.2" fill="#fff"></circle>
+</symbol>
+<symbol id="provider-baidu" viewBox="0 0 24 24" fill="none" stroke-linecap="round">
+<circle cx="12" cy="8.2" r="3.8" stroke="#39c9ec" stroke-width="2.5"></circle>
+<circle cx="8.1" cy="15.1" r="3.8" stroke="#49c3ed" stroke-width="2.5"></circle>
+<circle cx="15.9" cy="15.1" r="3.8" stroke="#41afea" stroke-width="2.5"></circle>
+<path d="M9.2 6.1a3.8 3.8 0 0 1 5.6 1.2" stroke="#ef5a88" stroke-width="2.5"></path>
+<rect x="9.2" y="20" width="5.6" height="1.3" rx=".65" fill="#ef5a88" stroke="none"></rect>
+</symbol>
+<symbol id="provider-guangya" viewBox="0 0 24 24">
+<rect x="2" y="2" width="20" height="20" rx="5" fill="#ff7900"></rect>
+<path d="M17.4 12a5.4 5.4 0 1 1-2.1-4.3" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round"></path>
+<path d="M4.2 12h15.6" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round"></path>
+<circle cx="12" cy="12" r="1.25" fill="#ff7900"></circle>
+</symbol>
+<symbol id="provider-139cloud" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<path d="M5.2 7.8c2.9-1.9 6.7-2.4 10.1-1.2" stroke="#1d8cf2" stroke-width="2.3"></path>
+<path d="M4.2 12.1c1.8 3.8 6.3 5.7 10.2 4.1 2.7-1.1 4.2-3.5 3.7-5.8-.4-1.8-2-3.1-3.8-3.1-1.7 0-3.1 1.2-3.1 2.7 0 1.2.9 2.1 2.1 2.1" stroke="#21a9ed" stroke-width="2.4"></path>
+<path d="M8.3 5.1c1.5-.8 3.2-1.1 4.8-1" stroke="#1673ed" stroke-width="1.7"></path>
+</symbol>
+<symbol id="provider-123" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.55" stroke-linecap="round" stroke-linejoin="round">
+<rect x="2" y="2" width="20" height="20" rx="5" fill="#4d7ff1" stroke="none"></rect>
+<path d="M4.8 8.2 6.9 6.9v10.2M5 17.1h4"></path>
+<path d="M10.3 9.1c.3-1.5 1.5-2.3 2.8-2.1 1.3.2 2.2 1.2 2.1 2.4-.1 1-.8 1.6-1.9 2.4l-3 2.3h5.3"></path>
+<path d="M17 7.2h1.9c1.2 0 2 .7 2 1.7s-.8 1.6-2 1.6h-1.2m1.2 0c1.3 0 2.1.7 2.1 1.8 0 1.3-1 2.1-2.4 2.1H17"></path>
 </symbol>
 <symbol id="provider-alipan" viewBox="0 0 24 24">
-<rect x="2" y="2" width="20" height="20" rx="5" fill="#6d5ce7"></rect>
-<circle cx="12" cy="12" r="5" fill="none" stroke="#fff" stroke-width="2.2"></circle>
-</symbol>
-<symbol id="provider-baidu" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<path d="M7 18a4.5 4.5 0 0 1-.5-8.98A5.5 5.5 0 0 1 17 8.5 4 4 0 0 1 17.5 18H7z"></path>
-<circle cx="17.2" cy="7" r="2.4" fill="#2f7df6" stroke="none"></circle>
-</symbol>
-<symbol id="provider-guangya" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<rect x="3.5" y="3.5" width="17" height="17" rx="5"></rect>
-<path d="M8.5 12.5h7" stroke="#64748b"></path>
-</symbol>
-<symbol id="provider-139cloud" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<path d="M7 18a4.5 4.5 0 0 1-.5-8.98A5.5 5.5 0 0 1 17 8.5 4 4 0 0 1 17.5 18H7z"></path>
-<circle cx="17.2" cy="7" r="2.4" fill="#64748b" stroke="none"></circle>
-</symbol>
-<symbol id="provider-123" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<rect x="3.5" y="3.5" width="17" height="17" rx="5"></rect>
-<circle cx="9" cy="12" r="1.1" fill="#64748b" stroke="none"></circle>
-<circle cx="12" cy="12" r="1.1" fill="#64748b" stroke="none"></circle>
-<circle cx="15" cy="12" r="1.1" fill="#64748b" stroke="none"></circle>
+<defs><linearGradient id="provider-alipan-grad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#7771ee"></stop><stop offset="1" stop-color="#5aa6f3"></stop></linearGradient></defs>
+<rect x="2" y="2" width="20" height="20" rx="5" fill="url(#provider-alipan-grad)"></rect>
+<path fill="#fff" d="M12 4.4a7.6 7.6 0 1 0 5.8 12.5l1.7 1.7 1.4-1.4-1.7-1.7A7.6 7.6 0 0 0 12 4.4z"></path>
+<circle cx="12" cy="12" r="4.5" fill="url(#provider-alipan-grad)"></circle>
 </symbol>
 <symbol id="provider-ed2k" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-<path d="M9.5 14.5 14.5 9.5"></path>
-<path d="M8.5 15.5a3 3 0 0 1 0-4.24l1.5-1.5"></path>
-<path d="M15.5 8.5a3 3 0 0 1 0 4.24l-1.5 1.5"></path>
-<circle cx="17.2" cy="7" r="2.4" fill="#64748b" stroke="none"></circle>
+<path d="M9.5 14.5 14.5 9.5"></path><path d="M8.5 15.5a3 3 0 0 1 0-4.24l1.5-1.5"></path><path d="M15.5 8.5a3 3 0 0 1 0 4.24l-1.5 1.5"></path>
 </symbol>
 <symbol id="provider-link" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
 <path d="M9.5 14.5 14.5 9.5"></path>

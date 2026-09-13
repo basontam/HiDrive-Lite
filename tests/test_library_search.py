@@ -763,6 +763,65 @@ def filters_store(tmp_path):
 
 
 class TestSearchFiltersAndBrowse:
+    def test_browse_reaches_real_page_after_200_and_skips_huge_offsets(self, store):
+        expected_ids = []
+        for index in range(201):
+            media_id = store.upsert_media(_make_media(
+                title_zh=f"深分页资源{index:03d}", search_key=f"深分页资源{index:03d}",
+                media_type="movie", year=2026,
+            ))
+            expected_ids.append(media_id)
+            group_id = store.upsert_group(ls.GroupRecord(
+                media_id=media_id, edition_fingerprint=f"deep-page-fixture-{index}", display_title="测试版本",
+            ))
+            store.upsert_link(ls.LinkRecord(
+                public_id=f"deep-page-fixture-{index}", group_id=group_id, provider="115",
+                canonical_url_hash=f"deep-page-fixture-hash-{index}", url_label="测试分享",
+            ))
+        store.recount()
+        filters = lse.Filters(media_type="movie")
+        # Compare the same stable sort at two page sizes, not insertion order.
+        all_ids = [item["media_id"] for page in range(1, 6)
+                   for item in lse.search(store, "", filters, page=page, page_size=50).items]
+        last = lse.search(store, "", filters, page=201, page_size=1)
+        assert last.total == 201 and len(last.items) == 1
+        assert last.items[0]["media_id"] == all_ids[-1]
+        assert set(all_ids) == set(expected_ids)
+        for page in (202, 10**30):
+            empty = lse.search(store, "", filters, page=page, page_size=1)
+            assert empty.total == 201 and empty.items == []
+
+    @pytest.mark.parametrize("media_type", ["movie", "tv", "unknown"])
+    def test_default_pages_fill_five_rows_without_duplicate_or_fabricated_tail(self, store, media_type):
+        expected_ids = set()
+        for index in range(51):
+            media_id = store.upsert_media(_make_media(
+                title_zh=f"分页资源{index:02d}", search_key=f"分页资源{index:02d}",
+                media_type=media_type, year=2026,
+            ))
+            expected_ids.add(media_id)
+            group_id = store.upsert_group(ls.GroupRecord(
+                media_id=media_id, edition_fingerprint=f"pagination-fixture-{index}", display_title="测试版本",
+            ))
+            store.upsert_link(ls.LinkRecord(
+                public_id=f"pagination-fixture-{index}", group_id=group_id, provider="115",
+                canonical_url_hash=f"pagination-fixture-hash-{index}", url_label="测试分享",
+            ))
+        store.recount()
+        lse.build_index(store)
+        filters = lse.Filters(media_type=media_type)
+        for query in ("", "分页资源"):
+            pages = [lse.search(store, query, filters, page=page) for page in (1, 2, 3)]
+            assert [len(page.items) for page in pages] == [25, 25, 1]
+            assert all(page.total == 51 and page.page_size == 25 for page in pages)
+            ids = [item["media_id"] for page in pages for item in page.items]
+            assert len(ids) == len(set(ids)) == 51
+            assert set(ids) == expected_ids
+            assert all(item["media_type"] == media_type for page in pages for item in page.items)
+            repeated = lse.search(store, query, filters, page=2)
+            assert [item["media_id"] for item in repeated.items] == [item["media_id"] for item in pages[1].items]
+            assert not lse.search(store, query, filters, page=4).items
+
     def test_empty_q_with_type_filter_is_pure_browse(self, filters_store):
         store, ids = filters_store
         page = lse.search(store, "", lse.Filters(media_type="movie"))

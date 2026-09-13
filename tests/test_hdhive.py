@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from urllib.parse import parse_qs, urlparse
+
+import pytest
 import requests as requests_lib
 
 from conftest import FakeResponse
+from test_re0_search_api import re0_env, _unlock_payload  # noqa: F401
 
 TMDB_MULTI = "https://api.themoviedb.org/3/search/multi"
-RESOURCES_URL = "https://hdhive.com/api/open/resources/movie/603"
-UNLOCK_URL = "https://hdhive.com/api/open/resources/unlock"
-CHECKIN_URL = "https://hdhive.com/api/open/checkin"
-REFRESH_URL = "https://hdhive.com/api/public/openapi/oauth/refresh"
+RESOURCES_URL = "https://re0.me/api/open/resources/movie/603"
+UNLOCK_URL = "https://re0.me/api/open/resources/unlock"
+CHECKIN_URL = "https://re0.me/api/open/checkin"
+TOKEN_URL = "https://re0.me/api/public/openapi/oauth/token"
+REFRESH_URL = "https://re0.me/api/public/openapi/oauth/refresh"
 
 
 def _authorize(hidrive, *, expires_in: int = 3600):
@@ -119,7 +124,7 @@ def test_resources_proxies_upstream_with_bearer_and_api_key(client, hidrive, htt
     response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
 
     assert response.status_code == 200
-    assert response.get_json() == {"success": True, "data": [{"slug": "matrix-1999", "title": "The Matrix", "points": 0}], "resource_count": 1}
+    assert response.get_json() == {**upstream, "resource_count": 1}
     (call,) = http.calls_to(RESOURCES_URL)
     assert call["headers"]["Authorization"] == "Bearer access-1"
     assert call["headers"]["X-API-Key"] == "app-secret-for-tests"
@@ -127,50 +132,97 @@ def test_resources_proxies_upstream_with_bearer_and_api_key(client, hidrive, htt
 
 def test_resources_filters_share_urls_and_access_codes_from_browser(client, hidrive, http):
     _authorize(hidrive)
-    http.route(
-        "GET",
-        RESOURCES_URL,
-        {
-            "success": True,
-            "data": [
-                {
-                    "slug": "matrix-1999",
-                    "title": "The Matrix",
-                    "description": "下载 https://115.com/s/secret?password=xyz，访问码：abcd",
-                    "share_url": "https://115.com/s/secret",
-                    "access_code": "abcd",
-                    "download_token": "token",
-                }
-            ],
-        },
-    )
-
+    http.route("GET", RESOURCES_URL, {"success": True, "data": [{
+        "slug": "fixture-movie", "title": "Fixture Movie",
+        "description": "下载 https://115.com/s/swfakeprivate?password=ab12，访问码：cd34",
+        "share_url": "https://115.com/s/swfakeprivate", "access_code": "cd34",
+        "download_token": "private-token-fixture",
+    }]})
     response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
-
     assert response.status_code == 200
-    body = response.get_json()
-    assert body["data"] == [{"slug": "matrix-1999", "title": "The Matrix", "description": "下载 [redacted-url]"}]
-    assert "115.com" not in response.get_data(as_text=True)
-    assert "access_code" not in response.get_data(as_text=True)
-    assert "secret" not in response.get_data(as_text=True)
-    assert "abcd" not in response.get_data(as_text=True)
+    assert response.get_json()["data"] == [{
+        "slug": "fixture-movie", "title": "Fixture Movie", "description": "下载 [redacted-url]",
+    }]
+    for private in ("115.com", "access_code", "swfakeprivate", "cd34", "private-token-fixture"):
+        assert private not in response.get_data(as_text=True)
 
 
 def test_resources_redacts_bare_provider_urls_and_spaced_access_codes(client, hidrive, http):
     _authorize(hidrive)
-    http.route(
-        "GET",
-        RESOURCES_URL,
-        {"success": True, "data": [{"slug": "matrix-1999", "description": "备用 115cdn.com/s/bare access code: value"}]},
-    )
-
+    http.route("GET", RESOURCES_URL, {"success": True, "data": [{
+        "slug": "fixture-movie", "description": "备用 115cdn.com/s/swfakebare access code: ab12",
+    }]})
     response = client.get("/api/hdhive/resources?media_type=movie&tmdb_id=603")
-
     assert response.status_code == 200
-    body = response.get_json()
-    assert body["data"] == [{"slug": "matrix-1999", "description": "备用 [redacted-url] access code=[redacted]"}]
+    assert response.get_json()["data"] == [{
+        "slug": "fixture-movie", "description": "备用 [redacted-url] access code=[redacted]",
+    }]
     assert "115cdn.com" not in response.get_data(as_text=True)
-    assert "value" not in response.get_data(as_text=True)
+    assert "ab12" not in response.get_data(as_text=True)
+
+
+def test_checkin_response_and_saved_message_are_anonymized(client, hidrive, http):
+    _authorize(hidrive)
+    http.route("POST", CHECKIN_URL, {
+        "success": True, "message": "ok token=private-token-fixture",
+        "share_url": "https://115.com/s/swfakeprivate", "token": "private-token-fixture",
+    })
+    response = client.post("/api/hdhive/checkin")
+    assert response.status_code == 200
+    assert response.get_json() == {"success": True, "message": "ok token=[redacted]"}
+    with hidrive.connect_db() as db:
+        assert db.execute("SELECT message FROM checkins ORDER BY id DESC LIMIT 1").fetchone()[0] == "ok token=[redacted]"
+
+
+def test_oauth_rejection_does_not_echo_upstream_private_values(client, hidrive, http):
+    hidrive.secret_set("hdhive_client_id", "client-id-for-tests")
+    hidrive.secret_set("hdhive_app_secret", "app-secret-for-tests")
+    url = client.post("/api/hdhive/oauth/start").get_json()["url"]
+    state = parse_qs(urlparse(url).query)["state"][0]
+    http.route("POST", TOKEN_URL, {
+        "success": False, "code": "INVALID_GRANT",
+        "message": "token=private-token-fixture https://115.com/s/swfakeprivate",
+    }, status=400)
+    response = client.get(f"/api/oauth/hdhive/callback?code=fixture-code&state={state}")
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "success": False, "code": "INVALID_GRANT", "message": "token=[redacted] [redacted-url]",
+    }
+    assert hidrive.get_tokens() is None
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_coordinated_legacy_unlock_keeps_private_payload_server_side(
+        client, re0_env, hidrive, http, audit_rows, success):
+    assert client.get("/api/library/search/re0?q=本地片&type=all").status_code == 200
+    upstream = _unlock_payload("https://115.com/s/swfakeprivate", "cd34") if success else {
+        "success": False, "code": "INSUFFICIENT_POINTS",
+        "message": "token=private-token-fixture https://115.com/s/swfakeprivate",
+    }
+    upstream["token"] = "private-token-fixture"
+    http.route("POST", UNLOCK_URL, upstream, status=200 if success else 402)
+    response = client.post("/api/hdhive/unlock", json={"slug": "fixture-slug-a", "allow_points": True})
+    assert response.status_code == (200 if success else 402), response.get_json()
+    body = response.get_json()
+    for private in ("115.com", "swfakeprivate", "cd34", "private-token-fixture"):
+        assert private not in response.get_data(as_text=True)
+        assert all(private not in row["detail"] for row in audit_rows("hdhive.unlock"))
+    if success:
+        # Sanitise only the browser boundary: the encrypted local result and
+        # its public id must survive so the next click never spends twice.
+        assert body["success"] is True and body["link_public_id"]
+        assert body["data"]["links_available"] is True
+        assert body["data"]["link_count"] == 1
+        row = re0_env["store"].link_by_public_id(body["link_public_id"])
+        assert row is not None
+        assert re0_env["store"].fernet.decrypt(bytes(row["url_ciphertext"])).decode() == "https://115.com/s/swfakeprivate"
+        assert re0_env["store"].fernet.decrypt(bytes(row["access_code_ciphertext"])).decode() == "cd34"
+        replay = client.post("/api/hdhive/unlock", json={"slug": "fixture-slug-a"})
+        assert replay.get_json()["link_public_id"] == body["link_public_id"]
+        assert replay.get_json()["replayed"] is True
+        assert len(http.calls_to(UNLOCK_URL)) == 1
+    else:
+        assert body == {"success": False, "code": "INSUFFICIENT_POINTS", "message": "token=[redacted] [redacted-url]"}
 
 
 def test_upstream_refresh_demand_retries_once_with_locally_valid_token(client, hidrive, http):
@@ -220,18 +272,6 @@ def test_resources_reports_upstream_outage(client, hidrive, http):
     assert response.get_json()["code"] == "UPSTREAM_UNAVAILABLE"
 
 
-def test_checkin_response_is_anonymized(client, hidrive, http):
-    _authorize(hidrive)
-    http.route("POST", CHECKIN_URL, {"success": True, "message": "ok", "share_url": "https://115.com/s/private", "token": "secret"})
-
-    response = client.post("/api/hdhive/checkin")
-
-    assert response.status_code == 200
-    assert response.get_json() == {"success": True, "message": "ok"}
-    assert "115.com" not in response.get_data(as_text=True)
-    assert "secret" not in response.get_data(as_text=True)
-
-
 # --- unlock -----------------------------------------------------------------
 
 
@@ -241,40 +281,37 @@ def test_unlock_validates_slug(client, hidrive):
     assert client.post("/api/hdhive/unlock", json={}).status_code == 400
 
 
-def test_unlock_posts_slug_without_points_by_default(client, hidrive, http, audit_rows):
-    _authorize(hidrive)
-    http.route("POST", UNLOCK_URL, {"success": True, "data": {"links": ["https://115.com/s/abc?password=defg"]}})
-
-    response = client.post("/api/hdhive/unlock", json={"slug": "matrix-1999", "allow_points": "yes"})
-
-    assert response.status_code == 200
-    assert response.get_json() == {"success": True, "data": {"links_available": True, "link_count": 1}}
-    assert "115.com" not in response.get_data(as_text=True)
-    assert "password" not in response.get_data(as_text=True)
-    (call,) = http.calls_to(UNLOCK_URL)
-    assert call["json"] == {"slug": "matrix-1999"}
-    (entry,) = audit_rows("hdhive.unlock")
-    assert entry["status"] == "success"
-    assert "115.com" not in entry["detail"], "share links must never be written to the audit log"
-
-
-def test_unlock_forwards_explicit_points_consent(client, hidrive, http, audit_rows):
+def test_unlock_refuses_when_there_is_no_library_to_coordinate_through(client, hidrive, http, audit_rows):
+    """G03.2: this endpoint used to fall through to the upstream whenever the
+    resource library could not be opened. That was safe while there was one
+    caller; with several users it is exactly how two purchases happen. It now
+    refuses, and nothing goes upstream."""
     _authorize(hidrive)
     http.route("POST", UNLOCK_URL, {"success": True, "data": {}})
 
-    response = client.post("/api/hdhive/unlock", json={"slug": "matrix-1999", "allow_points": True})
-
-    assert response.status_code == 200
-    assert http.calls_to(UNLOCK_URL)[0]["json"] == {"slug": "matrix-1999", "allow_points": True}
-    assert audit_rows("hdhive.unlock")[0]["detail"] == "points unlock requested"
-
-
-def test_unlock_failure_is_passed_through_and_not_audited_as_success(client, hidrive, http, audit_rows):
-    _authorize(hidrive)
-    http.route("POST", UNLOCK_URL, {"success": False, "code": "INSUFFICIENT_POINTS", "message": "积分不足"}, status=402)
-
     response = client.post("/api/hdhive/unlock", json={"slug": "matrix-1999"})
 
-    assert response.status_code == 402
-    assert response.get_json()["code"] == "INSUFFICIENT_POINTS"
+    assert response.status_code == 503
+    assert response.get_json()["code"] == "RE0_COORDINATION_UNAVAILABLE"
+    assert http.calls_to(UNLOCK_URL) == [], "a refusal must not reach RE0"
     assert audit_rows("hdhive.unlock") == []
+
+
+def test_unlock_refuses_a_slug_with_no_local_candidate(client, hidrive, http, workspace, audit_rows):
+    """G03.4: with a library but no candidate row, there is nowhere to record
+    the result -- so there is no way to make the next click free. Refuse before
+    spending."""
+    import library_store as ls
+
+    _authorize(hidrive)
+    store = ls.LibraryStore(hidrive.LIBRARY_DB_PATH, hidrive.load_fernet())
+    store.create_schema()
+    store.meta_set("encrypted", "1")
+    http.route("POST", UNLOCK_URL, {"success": True, "data": {}})
+
+    response = client.post("/api/hdhive/unlock", json={"slug": "nobody-knows-this"})
+
+    assert response.status_code == 409
+    assert response.get_json()["code"] == "RE0_CANDIDATE_UNKNOWN"
+    assert http.calls_to(UNLOCK_URL) == []
+    assert audit_rows("hdhive.unlock")[-1]["status"] == "refused"

@@ -36,6 +36,13 @@ EXPECTED_TABLES = {
     "imdb_ratings",
     "link_check",
     "link_check_state",
+    # RE0 projections (re0_sync.ensure_tables, self-healed by connect()).
+    "re0_sync_state", "re0_sync_run", "re0_search_cache", "re0_media_projection", "re0_resource", "re0_resource_link", "re0_action",
+    # Phase 7: one lease per RE0 resource, so two people clicking the same
+    # share at once produce one unlock and one charge.
+    "re0_unlock_lease",
+    "re0_file_preview",
+    "re0_calendar_event", "re0_tv_follow_pack", "re0_tv_follow_item",
 }
 
 
@@ -1419,7 +1426,8 @@ class TestRecommendationCandidates:
 # ---------------------------------------------------------------------------
 # w6: link validity checker -- live_link_sql() parity and the new
 # due_link_checks/record_link_check/queue_group_for_recheck/
-# link_check_counts query helpers (docs/architecture.md).
+# link_check_counts query helpers (docs/claude-link-validity-check-design-
+# 20260906.md, .superpowers/sdd/briefs/w6-contract.md).
 # ---------------------------------------------------------------------------
 
 

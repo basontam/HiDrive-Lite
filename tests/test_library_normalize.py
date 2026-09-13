@@ -346,7 +346,9 @@ def test_providers_and_host_providers_tables():
     assert ln.PROVIDERS["alipan"] == "阿里云盘"
     assert ln.PROVIDERS["baidu"] == "百度网盘"
     assert ln.PROVIDERS["tianyicloud"] == "天翼云盘"
-    assert ln.PROVIDERS["guangya"] == "广亚"
+    # Round 32: the pan is 光鸭网盘 (a Xunlei product). The provider CODE and
+    # every stored row keep the old spelling -- only the label changed.
+    assert ln.PROVIDERS["guangya"] == "光鸭网盘"
     assert ln.PROVIDERS["139cloud"] == "移动云盘"
     assert ln.PROVIDERS["123"] == "123 云盘"
     assert ln.PROVIDERS["ed2k"] == "ED2K"

@@ -1,6 +1,6 @@
 """Tests for scripts/import_media_library.py's w5-confirm-import addition:
 ``--confirmations`` (Codex's manual TMDB-identity confirmations, see
-docs/metadata-enrichment.md §1-§6).
+docs/codex-manual-matching-confirmation-20260906.md §1-§6).
 
 Uses the same synthetic ``library_sources`` fixture as
 tests/test_import_media_library.py. Confirmation rows are built FROM the

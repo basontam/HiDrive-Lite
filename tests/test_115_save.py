@@ -89,7 +89,7 @@ def test_save_rejects_text_without_valid_link(client, hidrive):
 def test_save_requires_cookie(client, audit_rows):
     # T19: an unconfigured cookie is folded into the same 115_REAUTH_REQUIRED
     # code/message as an expired one -- both are resolved by the same QR
-    # re-auth flow (docs/115-integration.md
+    # re-auth flow (docs/claude-115-cookie-persistence-and-reauth-20260906.md
     # §6.2).
     response = client.post("/api/115/save", json={"share_url": "https://115.com/s/swabc123?password=k9x8"})
     assert response.status_code == 409

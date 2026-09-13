@@ -6,7 +6,7 @@ Builds a real search index from the synthetic ``library_sources`` fixture
 ``tests/test_import_media_library.py``'s end-to-end tests) and runs the
 golden query set (``tests/fixtures/library/search_golden.json``, >= 50
 queries covering every category in
-docs/architecture.md §7.0.5) through
+docs/claude-media-library-construction-plan.md §7.0.5) through
 ``eval_library_search.evaluate``, then checks the CI gate
 (MRR@10 >= 0.85, P@1 >= 0.80) and the report's no-links/no-codes rule.
 

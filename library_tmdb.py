@@ -26,14 +26,14 @@ import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import requests
 
-from library_store import LibraryKeyUnavailable
+from library_store import LibraryKeyUnavailable, enqueue_index
 
 if TYPE_CHECKING:
     from library_store import LibraryStore
@@ -66,7 +66,7 @@ ADAPTIVE_SLOWDOWN_SECONDS = 60
 def ensure_tables(conn: sqlite3.Connection) -> None:
     """Create the ``tmdb_cache`` and ``tmdb_budget`` tables if missing.
 
-    Matches the DDL in docs/architecture.md §3.
+    Matches the DDL in docs/claude-media-library-construction-plan.md §3.
     """
     conn.execute(
         """
@@ -162,7 +162,7 @@ class Limits:
 
 # T14/user instruction: ~25 req/s global pacing (1000ms / 40ms) with
 # concurrency 2, and a 3000/day default budget sized for the review-pending
-# backlog (§4/§5.1 of docs/architecture.md;
+# backlog (§4/§5.1 of docs/claude-media-card-meta-and-tmdb-review-20260906.md;
 # the chat instruction overrides that doc's 500ms/day-2000-3000 suggestion).
 DEFAULT_LIMITS = Limits(2, 40, 3000)
 
@@ -538,6 +538,199 @@ class TmdbCache:
         finally:
             conn.close()
         return {status: count for status, count in rows}
+
+
+# ---------------------------------------------------------------------------
+# Login-page artwork (multi-user plan §11.2)
+#
+# One TMDB request every six hours, made by the server and cached in the same
+# `tmdb_cache` table. The browser receives image URLs and nothing else: no
+# key, no title, no id. A failure never blocks the login page -- it falls back
+# to a copy up to a week old, and failing that to the page's own gradient.
+# ---------------------------------------------------------------------------
+
+LOGIN_ARTWORK_FRESH_SECONDS = 6 * 3600
+LOGIN_ARTWORK_STALE_SECONDS = 7 * 24 * 3600
+# After a failure, wait this long before asking TMDB again. Without it, an
+# outage turns every anonymous visit to the login page into an upstream
+# request -- the six-hour window only ever applied to a *success* (R20).
+LOGIN_ARTWORK_FAILURE_COOLDOWN_SECONDS = 15 * 60
+LOGIN_ARTWORK_LIMIT = 24
+LOGIN_ARTWORK_SIZE = "w342"
+
+IMAGE_BASE_URL = "https://image.tmdb.org/t/p/"
+# TMDB's documented poster widths, as a closed set: a size is never taken
+# from a payload or a query string.
+ALLOWED_IMAGE_SIZES = frozenset({"w92", "w154", "w185", "w342", "w500", "w780"})
+# TMDB's own image paths: a leading slash, then an opaque name. Anything else
+# -- a full URL, a protocol-relative host, a traversal -- is not one.
+_IMAGE_PATH_RE = re.compile(r"^/[A-Za-z0-9][A-Za-z0-9._-]{5,63}\.(?:jpg|png|webp)$")
+
+
+def image_url(path, size: str = LOGIN_ARTWORK_SIZE) -> str | None:
+    """A TMDB image URL for ``path``, or None if it is not one.
+
+    Both halves are constrained: the size comes from a closed set and the
+    path must look like TMDB's own, so a payload can never steer the browser
+    at another host (plan §11.2's fixed allowlist).
+    """
+    if size not in ALLOWED_IMAGE_SIZES:
+        return None
+    if not isinstance(path, str) or not _IMAGE_PATH_RE.match(path):
+        return None
+    return IMAGE_BASE_URL + size + path
+
+
+def artwork_from_payload(results, *, limit: int = LOGIN_ARTWORK_LIMIT) -> list[str]:
+    """Poster URLs for the collage: films and series that actually have one.
+
+    Returns URLs only. The collage is decorative, so no title, id or overview
+    needs to reach the browser -- and what is not sent cannot leak.
+    """
+    urls: list[str] = []
+    for entry in results or []:
+        if not isinstance(entry, dict) or entry.get("media_type") not in {"movie", "tv"}:
+            continue
+        url = image_url(entry.get("poster_path"), LOGIN_ARTWORK_SIZE)
+        if url and url not in urls:
+            urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+_LOGIN_ARTWORK_LOCKS: dict[str, "threading.Lock"] = {}
+_LOGIN_ARTWORK_LOCKS_GUARD = threading.Lock()
+
+
+def _login_artwork_lock(key: str) -> "threading.Lock":
+    with _LOGIN_ARTWORK_LOCKS_GUARD:
+        return _LOGIN_ARTWORK_LOCKS.setdefault(str(key), threading.Lock())
+
+
+def _login_artwork_stale(cached_urls: list[str], fetched_at: int | None, now: int, limit: int) -> tuple[list[str], str]:
+    """What to serve when the upstream is not going to be asked.
+
+    One rule for "how old may a copy be", used by both the cooldown branch and
+    the just-failed branch (review F10). They disagreed: a copy older than a
+    week produced ``unavailable`` on the first failure and ``stale`` on every
+    later request inside the same cooldown.
+    """
+    if cached_urls and fetched_at is not None and now - fetched_at < LOGIN_ARTWORK_STALE_SECONDS:
+        return cached_urls[:limit], "stale"
+    return [], "unavailable"
+
+
+def _login_artwork_cached(read_cache, read_failure, now: int, limit: int):
+    """``(answer, cached_urls, fetched_at)``; ``answer`` is None when the
+    upstream still has to be asked."""
+    cached = read_cache() or (None, None)
+    cached_urls = [url for url in (cached[0] or []) if isinstance(url, str)]
+    fetched_at = cached[1]
+    if cached_urls and fetched_at is not None and now - fetched_at < LOGIN_ARTWORK_FRESH_SECONDS:
+        return (cached_urls[:limit], "cache"), cached_urls, fetched_at
+    failed_at = read_failure() if read_failure else None
+    if failed_at is not None and now - failed_at < LOGIN_ARTWORK_FAILURE_COOLDOWN_SECONDS:
+        # Still in the cooldown: serve what there is rather than asking again.
+        return _login_artwork_stale(cached_urls, fetched_at, now, limit), cached_urls, fetched_at
+    return None, cached_urls, fetched_at
+
+
+def login_artwork(*, api_key: str | None, session, now: int, read_cache, write_cache,
+                  language: str = "zh-CN", limit: int = LOGIN_ARTWORK_LIMIT,
+                  timeout: float = 6.0, read_failure=None, write_failure=None,
+                  coalesce_key: str = "login-artwork") -> tuple[list[str], str]:
+    """``(poster urls, source)`` for the login page.
+
+    ``source`` is ``fresh`` (just fetched), ``cache`` (inside the six-hour
+    window), ``stale`` (the fetch failed, a copy under a week old was used)
+    or ``unavailable`` (nothing to show -- the page draws its own gradient).
+
+    Storage is the caller's: ``read_cache()`` returns ``(urls, fetched_at)``
+    or None, ``write_cache(urls, now)`` persists. Keeping it out of here is
+    what lets the login page work without the media-library bundle, and
+    without adding a table anywhere.
+
+    ``read_failure()``/``write_failure(now)`` are the same arrangement for
+    the failure cooldown: while TMDB is down, the page serves whatever copy
+    it has (or its own gradient) and stops asking for a quarter of an hour.
+    A caller that passes neither simply has no cooldown.
+
+    Deliberately outside the enricher's daily budget and rate limiter: this
+    is at most two pages per six-hour refresh of one fixed endpoint, and making
+    the login page wait on a shared budget lock would be the wrong trade.
+
+    Concurrent cold requests are merged (review F10): the first caller fetches
+    while the others wait on ``coalesce_key``, and each of them then re-reads
+    the cache and the cooldown, so one cold start is one upstream request
+    rather than one per visitor. **The merge is per process.** The deployment
+    runs two gunicorn workers, so a genuinely simultaneous cold start can
+    still cost one request per worker -- two, not one per visitor. That is the
+    honest bound; making it exactly one would need shared state this does not
+    justify.
+    """
+    answer, cached_urls, fetched_at = _login_artwork_cached(read_cache, read_failure, now, limit)
+    if answer is not None:
+        return answer
+
+    with _login_artwork_lock(coalesce_key):
+        # Whoever held the lock has either filled the cache or started a
+        # cooldown; either way there is nothing left for this caller to ask.
+        answer, cached_urls, fetched_at = _login_artwork_cached(read_cache, read_failure, now, limit)
+        if answer is not None:
+            return answer
+
+        urls: list[str] = []
+        fetch_failed = False
+        if api_key:
+            try:
+                response = session.get(
+                    f"{TMDB_BASE}/trending/all/day",
+                    params={"api_key": api_key, "language": language},
+                    timeout=timeout,
+                )
+                if getattr(response, "status_code", 0) == 200:
+                    payload = response.json()
+                    results = payload.get("results") if isinstance(payload, dict) else None
+                    urls = artwork_from_payload(results, limit=limit)
+                    # Trending pages contain up to 20 entries (including people).
+                    # A 12-tile, two-sided wall needs 24 distinct movie/TV posters.
+                    if len(urls) < limit and isinstance(payload.get("total_pages"), int) and payload["total_pages"] > 1:
+                        second = session.get(
+                            f"{TMDB_BASE}/trending/all/day",
+                            params={"api_key": api_key, "language": language, "page": 2},
+                            timeout=timeout,
+                        )
+                        if getattr(second, "status_code", 0) == 200:
+                            more = second.json()
+                            extra_urls = artwork_from_payload(more.get("results") if isinstance(more, dict) else None, limit=limit)
+                            fetch_failed = not extra_urls
+                            for url in extra_urls:
+                                if url not in urls:
+                                    urls.append(url)
+                                if len(urls) >= limit:
+                                    break
+                        else:
+                            fetch_failed = True
+            except Exception:  # noqa: BLE001 - any failure falls back to the cache
+                # A second-page failure must not discard usable first-page art.
+                fetch_failed = True
+
+        if fetch_failed and cached_urls and len(cached_urls) > len(urls):
+            stale = _login_artwork_stale(cached_urls, fetched_at, now, limit)
+            if stale[0]:
+                if write_failure:
+                    write_failure(now)
+                return stale
+
+        if urls:
+            write_cache(urls, now)
+            if write_failure:
+                write_failure(0)  # clear the cooldown: it is answering again
+            return urls, "fresh"
+        if api_key and write_failure:
+            write_failure(now)
+        return _login_artwork_stale(cached_urls, fetched_at, now, limit)
 
 
 def search_cache_key(kind: str, language: str, query_key: str, year: int | None) -> str:
@@ -1399,8 +1592,8 @@ _EMPTY_HINTS: Mapping[str, dict] = {}
 
 # T15 design item 2: "unknown -> by hint imdb_type; tvSeries/tvMiniSeries ->
 # tv, movie/tvMovie -> movie" -- tvSpecial is also tv-shaped (the offline
-# matcher supports it too, see docs/metadata-enrichment.md, so it is mapped
-# the same way for completeness.
+# matcher supports it too, see docs/claude-imdb-tvmaze-matching-handoff
+# §2), so it is mapped the same way for completeness.
 _IMDB_TYPE_TO_KIND = {
     "movie": "movie", "tvMovie": "movie",
     "tvSeries": "tv", "tvMiniSeries": "tv", "tvSpecial": "tv",
@@ -1511,9 +1704,9 @@ def _judge_confirmed_hint(
 ) -> tuple[Judgement | None, str | None, dict | None] | None:
     """w5-confirm-enrich: the ``decision == "confirmed"`` pathway -- a
     sibling offline task (``codex_manual_confirmation``) writes an
-    already human-verified TMDB id straight into ``tmdb_hints`` after a
-    human confirmed a match, so one ``details()`` request settles it
-    instead of a search (docs/metadata-enrichment.md).
+    reviewed TMDB id into ``tmdb_hints``. Details must agree with the
+    known year; when an IMDb id is supplied, /find must independently
+    confirm the same typed TMDB identity before metadata is written.
 
     Returns ``None`` when the top candidate isn't a well-formed confirmed
     hint (no int ``tmdb_id``, or ``tmdb_type`` not in ``{"movie", "tv"}``),
@@ -1524,8 +1717,9 @@ def _judge_confirmed_hint(
     already known always wins over the hint's claimed kind, and a
     mismatch is reported as ``needs_review`` (the confirmed id as the
     visible candidate) rather than trusted -- before any request is made.
-    Otherwise: a successful, id-matching details fetch is written as
-    ``exact``; a hard failure (404/other permanent error, empty payload,
+    Otherwise: an identity-verified details fetch is written as
+    ``exact``; identity conflicts become ``needs_review``. A hard failure
+    (404/other permanent error, empty payload,
     or an id mismatch in the response) is "not found" -- the confirmed id
     is stale, so this falls through to a plain ``_judge_media`` search,
     annotated with ``confirmed_id_not_found``; a transient failure
@@ -1570,6 +1764,22 @@ def _judge_confirmed_hint(
             genre_ids=tuple(g["id"] for g in (detail.get("genres") or []) if "id" in g),
             vote_average=detail.get("vote_average"), vote_count=detail.get("vote_count"),
         )
+        conflict = None
+        if row["year"] and candidate.year and abs(int(row["year"]) - candidate.year) > 1:
+            conflict = "year"
+        elif top.get("imdb_id"):
+            # A manually confirmed pair can still be wrong. Check IMDb's
+            # typed TMDB mapping before mixing its rating with these images.
+            identity = _run_find(client, top["imdb_id"], stats)
+            if identity.status == "failed_retryable":
+                stats.confirmed_failed += 1
+                return None, identity.error_class, None
+            if not any(r.get("id") == tmdb_id and r.get("media_type") == kind for r in (identity.payload or [])):
+                conflict = "imdb_tmdb_identity"
+        if conflict:
+            stats.confirmed_conflicts += 1
+            conflict_explanation = dict(explanation, conflict=conflict)
+            return Judgement("needs_review", None, None, 0.0, (replace(candidate, score=0.0),)), None, conflict_explanation
         stats.confirmed_exact += 1
         return Judgement("exact", tmdb_id, kind, 1.0, (candidate,)), None, explanation
 
@@ -1914,6 +2124,7 @@ def _write_exact(
                 now, media_id,
             ),
         )
+        enqueue_index(conn, [media_id], now=now)
         conn.commit()
     finally:
         conn.close()
@@ -1934,6 +2145,7 @@ def _write_candidate(store: "LibraryStore", media_id: int, judgement: Judgement,
             """,
             (judgement.tmdb_id, judgement.score, _candidates_json_with_explanation(judgement.candidates, hint_explanation), now, media_id),
         )
+        enqueue_index(conn, [media_id], now=now)
         conn.commit()
     finally:
         conn.close()
@@ -1953,6 +2165,7 @@ def _write_needs_review(store: "LibraryStore", media_id: int, judgement: Judgeme
             """,
             (judgement.score, _candidates_json_with_explanation(judgement.candidates, hint_explanation), now, media_id),
         )
+        enqueue_index(conn, [media_id], now=now)
         conn.commit()
     finally:
         conn.close()
@@ -2755,6 +2968,8 @@ class BackgroundEnricher:
         leader_retry_seconds: float = 15.0,
         enabled_check: Callable[[], bool] = lambda: True,
         tvmaze_enabled_check: Callable[[], bool] = lambda: False,
+        extra_round: "Callable[[LibraryStore, TmdbClient], object] | None" = None,
+        local_round: "Callable[[LibraryStore], object] | None" = None,
         today: Callable[[], str] = lambda: datetime.now(timezone.utc).date().isoformat(),
     ) -> None:
         self._store_factory = store_factory
@@ -2769,6 +2984,8 @@ class BackgroundEnricher:
         self._leader_retry_seconds = leader_retry_seconds
         self._enabled_check = enabled_check
         self._tvmaze_enabled_check = tvmaze_enabled_check
+        self._extra_round = extra_round
+        self._local_round = local_round
         self._today = today
 
         self._thread: threading.Thread | None = None
@@ -2945,6 +3162,14 @@ class BackgroundEnricher:
         while not self._stop_flag.is_set():
             self._persist_heartbeat()
             wait_seconds = self._idle_seconds
+            local_work = False
+            if self._local_round is not None:
+                try:
+                    local_store = self._store_factory()
+                    if local_store is not None:
+                        local_work = bool(self._local_round(local_store))
+                except Exception as exc:  # noqa: BLE001 -- local work must not depend on TMDB
+                    LOG.warning("library local maintenance failed error=%s", type(exc).__name__)
             try:
                 store = self._store_factory() if self._enabled_check() else None
                 client = self._client_factory() if store is not None else None
@@ -2965,6 +3190,14 @@ class BackgroundEnricher:
                             stats = enrich_batch(store, client, limit=self._batch_size, tvmaze_enabled=self._tvmaze_enabled_check())
                             if stats.matched_exact > 0:
                                 merge_by_tmdb(store)
+                            if self._extra_round is not None:
+                                # RE0 projection metadata (re0_sync.enrich_projections):
+                                # same client/budget/run lock, its own failure never
+                                # affects the media round's outcome.
+                                try:
+                                    self._extra_round(store, client)
+                                except Exception as exc:  # noqa: BLE001
+                                    LOG.warning("tmdb background extra round failed error=%s", type(exc).__name__)
                         finally:
                             self._release_run_lock(run_lock_file)
                         # T14 fix wave 3: a round where every candidate this
@@ -3011,6 +3244,8 @@ class BackgroundEnricher:
 
             if self._stop_flag.is_set():
                 break
+            if local_work:
+                wait_seconds = min(wait_seconds, self._round_seconds)
             self._wait(wait_seconds)
 
 
@@ -3019,7 +3254,7 @@ class BackgroundEnricher:
 #
 # Anonymous, read-only probing of public share-info endpoints for phase-1
 # providers (tianyicloud/quark/alipan/115) to detect a dead share before the
-# user clicks it -- see docs/architecture.md
+# user clicks it -- see docs/claude-link-validity-check-design-20260906.md
 # and .superpowers/sdd/briefs/w6-contract.md (the binding API/storage
 # contract shared with the UI task).
 #
@@ -3047,7 +3282,7 @@ class BackgroundEnricher:
 #
 # ``calibrated`` in the registry records whether an adapter's request shape
 # and classify() mapping have been confirmed against real samples
-# (docs/architecture.md: Codex runs
+# (docs/codex-linkcheck-calibration-request-20260906.md: Codex runs
 # --library-check-links --dry-run per provider; rounds 1-2 on 2026-09-06).
 # Round 1: alipan confirmed (50/50 consistent); tianyicloud needed the JSON
 # Accept header (fixed below); quark's numeric placeholder codes were never

@@ -1,10 +1,10 @@
 """HiDrive-Lite: a small, self-hosted media-resource control surface.
 
-The 115 share-receive flow is isolated behind explicit provider checks.  The
-service exposes the personal media library, optional HDHive metadata, 115
-one-click saving, and read-only OpenList/STRM browsing.  Local development is
-the safe default; an operator can opt into a reverse proxy or Cloudflare
-Access in deployment configuration.
+The public TgtoDrive repository is used as the source reference for the 115
+share-receive flow.  This service deliberately exposes only the requested
+features: RE0 OpenAPI, 115 one-click saving, and read-only OpenList/STRM
+browsing.  It is intended to run behind Cloudflare Access and a dedicated
+Cloudflare Tunnel.
 """
 
 from __future__ import annotations
@@ -12,7 +12,9 @@ from __future__ import annotations
 import base64
 import binascii
 import dataclasses
+import contextlib
 import fcntl
+import functools
 import hashlib
 import hmac
 import json
@@ -31,21 +33,21 @@ from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
 import jwt
 import requests
+from dotenv import load_dotenv
 from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, Response, abort, g, jsonify, redirect, render_template, request
+from flask import Flask, Response, abort, g, has_request_context, jsonify, redirect, render_template, request
 
-# Load only the repository-local .env for clone-and-run installations. An
-# explicit path prevents a parent workspace's credentials or paths from being
-# inherited accidentally. Explicit process environment variables still win.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+import auth_service
 import library_normalize
 import library_search
 import library_store
 import library_tmdb
+import re0_sync
+import user_115
 
 # T4: integrate the TMDB cache/budget tables into every schema this process
 # creates. Registered here (not in library_store.py) so library_store.py's
@@ -57,7 +59,11 @@ library_store.EXTRA_SCHEMA_HOOKS.append(library_tmdb.ensure_tables)
 
 
 APP_NAME = "HiDrive-Lite"
-HDHIVE_BASE = "https://hdhive.com"
+DEFAULT_HDHIVE_BASE = "https://re0.me"
+# Keep the historical HDHIVE_* variable names and route/database identifiers
+# for backwards compatibility, while making RE0 the canonical upstream.  A
+# deployment may still override the endpoint explicitly for a private mirror.
+HDHIVE_BASE = (os.getenv("HDHIVE_BASE_URL", DEFAULT_HDHIVE_BASE).strip().rstrip("/") or DEFAULT_HDHIVE_BASE)
 HDHIVE_TOKEN_PATH = "/api/public/openapi/oauth/token"
 HDHIVE_REFRESH_PATH = "/api/public/openapi/oauth/refresh"
 HDHIVE_CHECKIN_PATH = os.getenv("HDHIVE_CHECKIN_PATH", "/api/open/checkin")
@@ -93,13 +99,20 @@ DATA_DIR = Path(os.getenv("HIDRIVE_DATA_DIR", "./data"))
 DB_PATH = DATA_DIR / "hidrive.db"
 LIBRARY_DB_PATH = DATA_DIR / "media-library.db"
 MASTER_KEY_FILE = Path(os.getenv("HIDRIVE_MASTER_KEY_FILE", "./secrets/master.key"))
+# Multi-user plan §5.2: the one Google identity allowed to be the
+# administrator. Checked server-side on top of Cloudflare's own policy --
+# never inferred from a request body.
+ADMIN_EMAIL = os.getenv("HIDRIVE_ADMIN_EMAIL", auth_service.ADMIN_EMAIL_DEFAULT).strip().casefold()
+# Plan §5.4: the __Host- prefix binds the cookie to this exact origin and
+# path, so no sibling host can set or read it.
+SESSION_COOKIE_NAME = "__Host-hidrive_session"
 STRM_ROOT = Path(os.getenv("STRM_ROOT", DEFAULT_STRM_ROOT)).resolve()
 OPENLIST_URL = os.getenv("OPENLIST_URL", DEFAULT_OPENLIST_URL).rstrip("/")
 OPENLIST_DB = Path(os.getenv("OPENLIST_DB", "./data/openlist.db"))
 OPENLIST_115PAN_PATH = os.getenv("OPENLIST_115PAN_PATH", DEFAULT_OPENLIST_115PAN_PATH).strip() or DEFAULT_OPENLIST_115PAN_PATH
 OPENLIST_115STRM_PATH = os.getenv("OPENLIST_115STRM_PATH", DEFAULT_OPENLIST_115STRM_PATH).strip() or DEFAULT_OPENLIST_115STRM_PATH
 OPEN115_API_BASE = "https://proapi.115.com"
-# 115's web-session QR login endpoints (see docs/115-integration.md --
+# 115's web-session QR login endpoints (see docs/115-reauth-adapter.md --
 # confirmed by reading p115client's source in a throwaway staging venv,
 # not guessed). Not part of the documented Open Platform API; same
 # stability/compliance caveat as the existing my.115.com/webapi.115.com
@@ -230,6 +243,22 @@ def init_db() -> None:
                 claimed_at INTEGER,
                 claimed_from TEXT
             );
+            CREATE TABLE IF NOT EXISTS cloud_download_task (
+                info_hash TEXT PRIMARY KEY,
+                link_public_id TEXT NOT NULL,
+                media_id INTEGER,
+                group_id INTEGER,
+                media_title TEXT,
+                link_label TEXT,
+                wp_path_id TEXT NOT NULL,
+                target_path TEXT,
+                submitted_at INTEGER NOT NULL,
+                submitted_by TEXT,
+                last_status INTEGER,
+                last_message TEXT,
+                last_seen_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_cloud_download_task_submitted ON cloud_download_task(submitted_at);
             """
         )
         # T19 wave 3 item 2: CREATE TABLE IF NOT EXISTS above only builds
@@ -243,6 +272,12 @@ def init_db() -> None:
             db.execute("ALTER TABLE reauth_challenges ADD COLUMN claimed_at INTEGER")
         if "claimed_from" not in existing_columns:
             db.execute("ALTER TABLE reauth_challenges ADD COLUMN claimed_from TEXT")
+        # Multi-user plan Phase 1: the auth tables and the two nullable
+        # `user_id` columns. Additive and idempotent -- it creates empty
+        # tables and moves no data. The administrator's existing credentials
+        # are copied only by `--auth-migrate`, never by this startup hook
+        # (plan §17).
+        auth_service.ensure_schema(db)
 
 
 def load_fernet() -> Fernet:
@@ -312,6 +347,17 @@ def audit(action: str, status: str, detail: str = "", actor: str = "", *, db: sq
 
 
 def actor_id() -> str:
+    """Who this request is attributed to.
+
+    Phase 4: a local session is identified by its user id, so a scan
+    challenge, an audit row and a CSRF subject all belong to that user
+    rather than to whatever Cloudflare called them. Without a session it is
+    the Access principal exactly as before -- which is what keeps the
+    administrator's existing rows readable across the compatibility window.
+    """
+    user = getattr(g, "current_user", None)
+    if user is not None:
+        return f"user:{user.id}"
     principal = getattr(g, "principal", None) or {}
     return str(principal.get("sub") or principal.get("email") or "local")
 
@@ -358,26 +404,394 @@ def verify_access_jwt(token: str) -> dict:
         raise PermissionError("invalid Cloudflare Access JWT") from exc
 
 
+# Plan §5.1's ladder. `access` is production today (Cloudflare guards
+# everything); `hybrid` accepts either an Access assertion or a local
+# session; `app` is the destination, where only /auth/google still goes
+# through Access and the session guards the rest. `local`/`disabled` are the
+# developer modes with no authentication at all.
+SESSION_AUTH_MODES = frozenset({"hybrid", "app"})
+# Modes where a principal that cleared Cloudflare Access *is* the
+# administrator without any further check, because Cloudflare's own policy
+# over the whole site is what admits them. `hybrid` is deliberately not here
+# (R12): once a session is an alternative way in, the site is no longer
+# wholly behind that policy, so the address is checked too.
+PRINCIPAL_IS_ADMIN_MODES = frozenset({"local", "disabled", "access"})
+
+
 def require_access() -> None:
     if AUTH_MODE in {"local", "disabled"}:
         g.principal = {"sub": "local", "email": "local"}
         return
     token = request.headers.get("Cf-Access-Jwt-Assertion", "")
     if not token:
+        if AUTH_MODE in SESSION_AUTH_MODES:
+            # No assertion is not an error here: a local session is the other
+            # way in, and authorize_request() decides whether there is one.
+            g.principal = None
+            return
         abort(401, description="Cloudflare Access authentication required")
     try:
+        # An assertion that was sent is always checked, in every mode: an
+        # invalid one is an attempt to authenticate, not an absent attempt.
         g.principal = verify_access_jwt(token)
     except PermissionError:
         abort(401, description="invalid Cloudflare Access authentication")
 
 
+def _load_auth_session() -> None:
+    """Resolve the session cookie into ``g.auth_session`` / ``g.current_user``.
+
+    Runs before ``check_csrf()`` because a token issued for a session is
+    bound to it. A cookie for a revoked, expired or no-longer-active user
+    resolves to nothing at all -- never to a partially trusted state.
+    """
+    g.auth_session = None
+    g.current_user = None
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if not token:
+        return
+    now = utc_now()
+    with connect_db() as db:
+        session = auth_service.load_session(db, token, now=now)
+        if session is None:
+            return
+        row = auth_service.find_user(db, session.user_id)
+    if row is None or row["status"] != "active":
+        return
+    g.auth_session = session
+    g.current_user = auth_service.CurrentUser(
+        id=int(row["id"]), email=row["email_display"], role=row["role"], status=row["status"]
+    )
+
+
+def _admin_user_row() -> auth_service.CurrentUser:
+    """The administrator as a ``CurrentUser``, creating the row on first use.
+
+    Creating it here is not a migration: it is one row with no password and
+    no credential, and ``ensure_admin_user`` is idempotent. It exists so the
+    administrator's own id can be recorded as the approver of an account
+    before ``--auth-migrate`` has ever been run.
+    """
+    if has_request_context():
+        cached = getattr(g, "_admin_current_user", None)
+        if cached is not None:
+            return cached
+    now = utc_now()
+    with connect_db() as db:
+        user_id = auth_service.ensure_admin_user(db, email=ADMIN_EMAIL, now=now)
+    resolved = auth_service.CurrentUser(id=user_id, email=ADMIN_EMAIL, role="admin", status="active")
+    if has_request_context():
+        # Resolved once per request: this is read on every authorisation
+        # check, every credential lookup and every audit row.
+        g._admin_current_user = resolved
+    return resolved
+
+
+def current_user() -> "auth_service.CurrentUser | None":
+    """Who is making this request, or None.
+
+    A local session wins. Failing that, the compatibility window of plan
+    §5.1's ``access`` mode applies: the whole site is still behind Cloudflare
+    Access, whose policy admits the administrator alone, so a principal that
+    cleared Access *is* the administrator -- exactly today's model, unchanged.
+    ``local``/``disabled`` are the developer modes where authentication is
+    off entirely and the principal is already synthetic.
+
+    The exact-email check the plan asks for (§5.2) belongs to the identity
+    bridge at ``/auth/google`` and to ``hybrid``/``app``, where a session --
+    not Cloudflare -- is what grants access. Those modes never fall back to
+    a principal here.
+    """
+    user = getattr(g, "current_user", None)
+    if user is not None:
+        return user
+    principal = getattr(g, "principal", None)
+    if not principal:
+        return None
+    if AUTH_MODE in PRINCIPAL_IS_ADMIN_MODES:
+        return _admin_user_row()
+    if AUTH_MODE == "hybrid" and _principal_is_admin(principal):
+        # Transitional mode: an Access assertion still works, but only for
+        # the one address, checked here as well as at the edge (R12).
+        return _admin_user_row()
+    return None
+
+
+def _principal_is_admin(principal) -> bool:
+    """Whether this Access principal is the administrator, by the same rule
+    the identity bridge applies: an address that matches exactly, and that
+    the IdP has not marked unverified."""
+    email = str((principal or {}).get("email") or "").strip().casefold()
+    if not email or email != ADMIN_EMAIL:
+        return False
+    return (principal or {}).get("email_verified") is not False
+
+
+# ---------------------------------------------------------------------------
+# Multi-user Phase 3: one table saying who may reach what.
+#
+# Every registered endpoint appears in exactly one set. A route added without
+# an entry is refused as if it were an administrator's (and fails the test
+# that pins this map) -- the decision has to be made, not defaulted into.
+# ---------------------------------------------------------------------------
+
+# Reachable with no session at all: the sign-in surface itself, the health
+# probe, and the static files.
+PUBLIC_ENDPOINTS = frozenset({
+    "static", "healthz", "login_page",
+    "api_auth_bootstrap", "api_auth_login", "api_auth_register", "api_auth_logout",
+    "api_csrf",
+    # The identity bridge is how the administrator gets a session in the
+    # first place; Cloudflare Access guards the path, and the route checks
+    # the address again itself.
+    "auth_google",
+})
+
+# Any signed-in user: the shared library, its local links, and the RE0
+# candidates already materialised here (plan §6).
+MEMBER_ENDPOINTS = frozenset({
+    "index", "api_me",
+    "api_library_search", "api_library_suggest", "api_library_filters",
+    "api_library_media", "api_library_resource", "api_library_recommendations",
+    "api_library_reveal", "api_library_search_re0", "api_library_re0_media",
+    "api_library_re0_file_preview", "api_library_re0_refresh",
+    # Phase 4: each user scans for their own 115 web session and transfers
+    # with it. A user who has not done so is refused by the transfer gate,
+    # never served somebody else's cookie.
+    "api_115_reauth_start", "api_115_reauth_qr", "api_115_reauth_status",
+    "api_115_reauth_cancel", "api_115_save", "api_library_transfer",
+    # Phase 6: each user's own folders, tasks and quota, resolved through
+    # their own step-B token. A user without one is guided to authorise it
+    # (R05) -- never shown the administrator's.
+    "api_115_folders", "api_cloud_download_submit", "api_cloud_download_tasks",
+    "api_cloud_download_status", "api_cloud_download_quota",
+    "api_cloud_download_delete", "api_cloud_download_clear",
+    # Phase 7: reachable by a member, but what they may do there is decided
+    # inside -- reuse of an already materialised link always, a new unlock
+    # only while `allow_member_re0_unlock` is on.
+    "api_library_re0_unlock_and_action", "api_library_re0_follow_unlock", "api_hdhive_unlock",
+    # Phase 5: each user's own step-B authorisation and its status. While the
+    # application is unapproved these answer "blocked" and write nothing.
+    "api_me_115_status", "api_me_115_open_start", "api_me_115_disconnect",
+    "api_me_115_open_status", "api_me_115_open_cancel",
+})
+
+# Administrator only. Three groups, and the middle one is temporary:
+#
+#  * the operator surface -- OpenList, STRM, global settings and status,
+#    TMDB, the link checker, RE0 sync, the RE0 OAuth dance, user approval;
+#  * 115 transfer/browse/cloud-download and the RE0 unlock paths, which the
+#    matrix in plan §6 gives members too -- but only once they have their own
+#    115 credentials (Phase 4-6) and the member unlock policy (Phase 7).
+#    Until then the honest answer to a member is "no", never "here is the
+#    administrator's cookie";
+#  * the legacy HDHive endpoints.
+ADMIN_ENDPOINTS = frozenset({
+    "api_openlist_list", "api_strm_list", "api_settings", "api_status",
+    "api_tmdb_search", "api_library_tmdb_check", "api_library_tmdb_enrich_now",
+    "api_library_tmdb_status", "api_library_linkcheck_status",
+    "api_library_resource_recheck",
+    "api_library_re0_status", "api_library_re0_run_small", "api_library_re0_discoveries",
+    "oauth_start", "oauth_callback",
+    "api_admin_users", "api_admin_user_approve", "api_admin_user_reject",
+    "api_admin_user_disable", "api_admin_policy_re0",
+    # Awaiting their own phase -- see the note above. Step A (the web cookie)
+    # and the transfer it enables moved to MEMBER_ENDPOINTS in Phase 4;
+    # folder browsing and cloud download wait for step B (Phase 5/6).
+
+    "api_library_re0_follow_query",
+    "api_hdhive_checkin", "api_hdhive_resources", "api_hdhive_search",
+})
+
+
+def _wants_html() -> bool:
+    """Whether an anonymous caller should be sent to the login page rather
+    than handed a JSON 401 -- a document navigation, not an API call."""
+    if request.path.startswith("/api/"):
+        return False
+    return "text/html" in (request.headers.get("Accept") or "")
+
+
+def authorize_request():
+    """The single authorisation gate, applied to every request.
+
+    Returns a response to send instead of the view, or None to continue.
+    Role decorators on individual routes stay as a second, local statement of
+    the same rule; this is the one that cannot be forgotten.
+    """
+    endpoint = request.endpoint or ""
+    if endpoint in PUBLIC_ENDPOINTS:
+        return None
+    user = current_user()
+    if user is None:
+        if _wants_html():
+            return redirect("/login")
+        return json_error("请先登录", 401, "LOGIN_REQUIRED")
+    if endpoint in MEMBER_ENDPOINTS:
+        return None
+    # Unlisted endpoints are treated as the administrator's: a new route is
+    # closed until someone decides otherwise.
+    if user.role != "admin":
+        return json_error("没有权限", 403, "FORBIDDEN")
+    return None
+
+
+def require_login(view):
+    @functools.wraps(view)
+    def wrapper(*args, **kwargs):
+        if current_user() is None:
+            return json_error("请先登录", 401, "LOGIN_REQUIRED")
+        return view(*args, **kwargs)
+    return wrapper
+
+
+def require_role(*roles: str):
+    """Server-side role gate. The front end's capabilities only decide what
+    to draw; this is the boundary (plan §6)."""
+    def decorator(view):
+        @functools.wraps(view)
+        def wrapper(*args, **kwargs):
+            user = current_user()
+            if user is None:
+                return json_error("请先登录", 401, "LOGIN_REQUIRED")
+            if user.role not in roles:
+                return json_error("没有权限", 403, "FORBIDDEN")
+            return view(*args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def _re0_lease_take(store, lease_key: str, *, holder: str, now: int) -> bool:
+    """Take the unlock lease for one thing. One statement, so two callers
+    cannot both believe they hold it (plan §10.2)."""
+    conn = store.connect()
+    try:
+        got = re0_sync.acquire_unlock_lease(conn, lease_key, holder=holder, now=now)
+        conn.commit()
+    finally:
+        conn.close()
+    return bool(got)
+
+
+@contextlib.contextmanager
+def _re0_lease_held(store, lease_key: str, *, holder: str):
+    """Give the lease back on every path out of the block.
+
+    F05: the follow-pack entry released it on exactly one branch, so an
+    upstream failure left it held for its whole TTL and the user's immediate
+    retry got 409 RE0_UNLOCK_IN_PROGRESS. Every consuming path now leaves
+    through the same finally, whether it succeeded, was refused upstream,
+    failed to parse, or raised.
+    """
+    try:
+        yield
+    finally:
+        conn = store.connect()
+        try:
+            re0_sync.release_unlock_lease(conn, lease_key, holder=holder)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _re0_resource_for_slug(store, slug: str):
+    """The candidate row this slug belongs to, if this deployment has one.
+
+    F05: the legacy endpoint only ever knew a slug, so it coordinated with
+    nothing. Resolving the slug to its ``re0_resource`` row is what lets it
+    take *the same* lease key the main entry uses for that resource.
+    """
+    conn = store.connect(readonly=True)
+    try:
+        salt = _re0_slug_salt(conn)
+        row = conn.execute("SELECT * FROM re0_resource WHERE slug_hash=?",
+                           (re0_sync.slug_hash(slug, salt),)).fetchone()
+        return (dict(row) if row is not None else None), re0_sync.slug_hash(slug, salt)
+    except sqlite3.DatabaseError:
+        return None, ""
+    finally:
+        conn.close()
+
+
+def _materialised_link_for_slug(slug: str) -> str | None:
+    """The local link this slug already produced, if any.
+
+    Looked up by the same salted hash the candidate rows are stored under,
+    so the legacy entry can answer "you already have this" without
+    decrypting anything or asking RE0 (R07).
+    """
+    try:
+        store, error = _library_store_or_error(False)
+    except Exception:  # noqa: BLE001 - a missing library is simply no link
+        return None
+    if error or store is None:
+        return None
+    conn = store.connect(readonly=True)
+    try:
+        salt = _re0_slug_salt(conn)
+        row = conn.execute(
+            "SELECT l.public_id AS public_id FROM re0_resource r "
+            "JOIN re0_resource_link rl ON rl.re0_resource_id = r.id "
+            "JOIN resource_link l ON l.id = rl.resource_link_id "
+            "WHERE r.slug_hash=? ORDER BY rl.linked_at DESC LIMIT 1",
+            (re0_sync.slug_hash(slug, salt),),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        conn.close()
+    return row["public_id"] if row else None
+
+
+def member_unlock_refused(what: str):
+    """Plan §10.1 step 5, applied to every path that can spend points.
+
+    Called only after the local reuse branches have had their turn, and
+    always before a slug is decrypted or an upstream request is made -- so a
+    refusal costs exactly zero RE0 calls and zero points. Returns a response
+    to send, or None to carry on.
+    """
+    user = current_user()
+    if user is None or user.role == "admin" or allow_member_re0_unlock():
+        return None
+    audit("re0.unlock", "refused", f"{what} reason=member_policy", actor_id())
+    return json_error("管理员尚未开放普通用户解锁权限", 403, "MEMBER_RE0_UNLOCK_DISABLED")
+
+
+def allow_member_re0_unlock() -> bool:
+    """Plan §10: members may spend the administrator's RE0 points only while
+    this is on. Default off."""
+    return (setting_get("allow_member_re0_unlock", "0") or "0").strip().lower() in {"1", "true"}
+
+
+def csrf_key() -> bytes:
+    """The HMAC key for CSRF tokens: a purpose-separated subkey of the master
+    key (2026-09-11 decision).
+
+    It used to be ``load_fernet()._signing_key`` -- a private attribute of a
+    third-party class, and the same key Fernet signs ciphertext with. One
+    purpose per key means a token can never be replayed against another use,
+    and nothing here depends on an API cryptography never promised.
+    """
+    return auth_service.derive_key("csrf/v1", MASTER_KEY_FILE.read_bytes())
+
+
+def csrf_subject() -> str:
+    """What a CSRF token is bound to.
+
+    A local session binds to that session's own secret, so rotating the
+    session (login, privilege change, approval) retires its tokens with it.
+    Before there is a session -- today's Access-only mode, and the login page
+    itself -- it binds to the Access principal exactly as before.
+    """
+    session = getattr(g, "auth_session", None)
+    if session is not None:
+        return "session:" + session.csrf_hash[:32]
+    return actor_id()
+
+
 def csrf_token() -> str:
-    subject = actor_id()
-    issued = utc_now()
-    secret = load_fernet()._signing_key  # deterministic, local-only HMAC key
-    payload = f"{subject}:{issued}".encode("utf-8")
-    digest = hmac.new(secret, payload, hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(payload + b":" + digest).decode("ascii").rstrip("=")
+    return auth_service.issue_csrf(csrf_key(), subject=csrf_subject(), now=utc_now())
 
 
 def check_csrf() -> None:
@@ -389,13 +803,7 @@ def check_csrf() -> None:
     if not supplied:
         abort(403, description="CSRF token required")
     try:
-        padded = supplied + "=" * (-len(supplied) % 4)
-        raw = base64.urlsafe_b64decode(padded)
-        subject, issued, signature = raw.split(b":", 2)
-        if int(issued) + CSRF_TTL_SECONDS < utc_now() or subject.decode() != actor_id():
-            raise ValueError
-        expected = hmac.new(load_fernet()._signing_key, raw[: len(subject) + 1 + len(issued)], hashlib.sha256).digest()
-        if not hmac.compare_digest(signature, expected):
+        if not auth_service.verify_csrf(csrf_key(), supplied, subject=csrf_subject(), now=utc_now()):
             raise ValueError
     except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
         abort(403, description="invalid CSRF token")
@@ -438,7 +846,7 @@ def save_tokens(data: dict, existing_refresh_token: str | None = None, existing_
     access = str(data.get("access_token") or "")
     refresh = data.get("refresh_token") or existing_refresh_token
     if not access:
-        raise RuntimeError("HDHive token response did not include access_token")
+        raise RuntimeError("RE0 token response did not include access_token")
     fernet = load_fernet()
     now = utc_now()
     expires_at = now + int(data.get("expires_in") or 0) if data.get("expires_in") else None
@@ -534,34 +942,34 @@ def hdhive_request_once(method: str, path: str, headers: dict[str, str], params:
     try:
         response = requests.request(method, HDHIVE_BASE + path, headers=headers, params=params, json=payload, timeout=20)
     except requests.RequestException as exc:
-        return {"success": False, "code": "UPSTREAM_UNAVAILABLE", "message": f"HDHive 请求失败：{type(exc).__name__}"}, 502
+        return {"success": False, "code": "UPSTREAM_UNAVAILABLE", "message": f"RE0 请求失败：{type(exc).__name__}"}, 502
     try:
         data = response.json() if response.content else {}
     except (ValueError, TypeError):
-        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "HDHive 返回了无法解析的响应"}, 502
+        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "RE0 返回了无法解析的响应"}, 502
     if not isinstance(data, dict):
-        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "HDHive 返回格式异常"}, 502
+        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "RE0 返回格式异常"}, 502
     return data, response.status_code
 
 
 def hdhive_request(method: str, path: str, *, params: dict | None = None, payload: dict | None = None, requires_user: bool = True) -> tuple[dict, int]:
     api_key = config_value("hdhive_app_secret", "HDHIVE_APP_SECRET")
     if not api_key:
-        return {"success": False, "code": "HDHIVE_APP_SECRET_MISSING", "message": "请先配置 HDHive 应用 Secret"}, 503
+        return {"success": False, "code": "HDHIVE_APP_SECRET_MISSING", "message": "请先配置 RE0 应用 Secret"}, 503
     token = valid_hdhive_access_token() if requires_user else None
     if requires_user and not token:
         row = get_tokens()
         if hdhive_refresh_is_available(row):
-            return {"success": False, "code": "HDHIVE_REFRESH_UNAVAILABLE", "message": "HDHive Token 刷新暂时失败，请稍后重试；若持续失败请重新授权"}, 503
-        return {"success": False, "code": "OPENAPI_REAUTH_REQUIRED", "message": "请先完成 HDHive OAuth 授权"}, 401
+            return {"success": False, "code": "HDHIVE_REFRESH_UNAVAILABLE", "message": "RE0 Token 刷新暂时失败，请稍后重试；若持续失败请重新授权"}, 503
+        return {"success": False, "code": "OPENAPI_REAUTH_REQUIRED", "message": "请先完成 RE0 OAuth 授权"}, 401
     data, status = hdhive_request_once(method, path, hdhive_headers(token), params, payload)
     if status in {401, 403} and requires_user and data.get("code") == "OPENAPI_REFRESH_REQUIRED":
         token = refresh_hdhive_token()
         if not token:
             row = get_tokens()
             if hdhive_refresh_is_available(row):
-                return {"success": False, "code": "HDHIVE_REFRESH_UNAVAILABLE", "message": "HDHive Token 刷新暂时失败，请稍后重试；若持续失败请重新授权"}, 503
-            return {"success": False, "code": "OPENAPI_REAUTH_REQUIRED", "message": "HDHive 授权已失效，请重新完成 OAuth 授权"}, 401
+                return {"success": False, "code": "HDHIVE_REFRESH_UNAVAILABLE", "message": "RE0 Token 刷新暂时失败，请稍后重试；若持续失败请重新授权"}, 503
+            return {"success": False, "code": "OPENAPI_REAUTH_REQUIRED", "message": "RE0 授权已失效，请重新完成 OAuth 授权"}, 401
         data, status = hdhive_request_once(method, path, hdhive_headers(token), params, payload)
     return data, status
 
@@ -849,9 +1257,48 @@ def _resolve_115_target_pid(body: dict, deadline: float | None = None) -> tuple[
     (only the stored-default check (a) above can still pass) when the
     setting is absent, rather than silently trusting that guessable
     default.
+
+    Personal step-B tokens: members, and administrators submitting a bare
+    CID from their personal folder picker, instead prove that folder with
+    their own token. The legacy allowlist above still governs administrators
+    without a personal token; explicit OpenList paths keep path resolution.
     """
     target_path = str(body.get("target_path") or "").strip()
     given_pid = str(body.get("target_pid") or "").strip()
+
+    # R03: identity and capability first, before any upstream work. A member
+    # never inherits the administrator's stored default folder, and refusing
+    # their folder choice must not first drag the administrator's OpenList
+    # into it.
+    user = _acting_user()
+    # The personal folder picker also serves administrators once their
+    # step-B token is stored. Its bare CID must use the same user's token,
+    # not the legacy OpenList root/default allowlist. Explicit OpenList
+    # paths and the administrator's stored default retain their old route.
+    if user is not None and (user.role != "admin" or (
+            given_pid and not target_path and _has_own_open_token(user))):
+        if not target_path and not given_pid:
+            # Step A alone: no cid at all, which sends the share to this
+            # member's own 115 default inbox (plan §4.2).
+            return "", None
+        _token, open_error = _require_open115(user)
+        if open_error is not None:
+            return "", open_error
+        # Step B is done: the cid is proved against *their* own 115 by
+        # listing it with their own token (R05). A path is display text and
+        # is never trusted on its own.
+        if target_path and not given_pid:
+            return "", (jsonify({
+                "success": False, "code": "TARGET_PID_INVALID",
+                "message": _TARGET_PID_INVALID_MESSAGE,
+            }), 400)
+        if not validate_user_target_cid(user, given_pid, deadline=deadline):
+            return "", (jsonify({
+                "success": False, "code": "TARGET_PID_INVALID",
+                "message": _TARGET_PID_INVALID_MESSAGE,
+            }), 400)
+        return given_pid, None
+
     default_pid = setting_get("115_target_pid", "") or ""
     pid = given_pid or default_pid
     if target_path:
@@ -889,16 +1336,26 @@ def _resolve_115_target_pid(body: dict, deadline: float | None = None) -> tuple[
 # _RECOMMENDATION_CACHE) and with its personal-use scale.
 _TRANSFER_DEDUPE_WINDOW_SECONDS = 10
 _TRANSFER_DEDUPE_LOCK = threading.Lock()
-_TRANSFER_DEDUPE_SEEN: dict[tuple[str, str], float] = {}
+_TRANSFER_DEDUPE_SEEN: dict[tuple[str, str, str], float] = {}
 
 
-def _transfer_dedupe_check(public_id: str, pid: str) -> bool:
+def _dedupe_user_key() -> str:
+    """Which account an attempt belongs to, for the de-duplication window."""
+    user = _acting_user()
+    return f"user:{user.id}" if user else "deployment"
+
+
+def _transfer_dedupe_check(public_id: str, pid: str, user_key: str = "") -> bool:
     """True (and records the attempt) the first time ``(public_id, pid)``
     is seen within the window; False for a duplicate seen again before the
     window elapses. Expired entries are pruned opportunistically on every
     call so the dict never grows past what's active within the window."""
     now = time.monotonic()
-    key = (public_id, pid)
+    # R19: two members saving the same share to their own default location
+    # within the window are two transfers, not a double-click. The user is
+    # part of the identity of the attempt; the upstream rate limits that
+    # protect 115 are a separate, still-global concern.
+    key = (user_key, public_id, pid)
     with _TRANSFER_DEDUPE_LOCK:
         for seen_key, seen_at in list(_TRANSFER_DEDUPE_SEEN.items()):
             if now - seen_at >= _TRANSFER_DEDUPE_WINDOW_SECONDS:
@@ -909,7 +1366,7 @@ def _transfer_dedupe_check(public_id: str, pid: str) -> bool:
         return True
 
 
-def _transfer_dedupe_clear(public_id: str, pid: str) -> None:
+def _transfer_dedupe_clear(public_id: str, pid: str, user_key: str = "") -> None:
     """T17 fix wave 1 item 3: undo ``_transfer_dedupe_check``'s record when
     the attempt it guarded never actually reached 115's share/receive
     endpoint (``TransferResult.receive_attempted`` is False) -- a failure
@@ -919,7 +1376,7 @@ def _transfer_dedupe_clear(public_id: str, pid: str) -> None:
     same ``(resource_link_id, pid)`` must not be blocked by the 10s window
     meant for double-submits of a REAL, receive-issuing attempt."""
     with _TRANSFER_DEDUPE_LOCK:
-        _TRANSFER_DEDUPE_SEEN.pop((public_id, pid), None)
+        _TRANSFER_DEDUPE_SEEN.pop((user_key, public_id, pid), None)
 
 
 GET_USER_AQ_URL = "https://my.115.com/?ct=ajax&ac=get_user_aq"
@@ -979,7 +1436,7 @@ def _capped_retry_after(raw: str | None, cap: int = 900) -> int:
 
 def _115_classify_user_aq(response, checked_at: int) -> tuple[dict, str | None]:
     """Classify a ``get_user_aq`` response into the explainable state
-    machine (docs/115-integration.md
+    machine (docs/claude-115-cookie-persistence-and-reauth-20260906.md
     §4.1). Returns ``(result, uid)`` -- ``uid`` is for this process's own
     immediate use building a ``share/receive`` payload and must never be
     logged, audited or returned to a caller outside this module."""
@@ -1034,7 +1491,9 @@ def _115_verify_with_uid(cookie: str | None = None, deadline: float | None = Non
     settings state) -- a slow target resolution eating the shared budget
     is not evidence 115 itself is failing."""
     checked_at = utc_now()
-    cookies = (cookie if cookie is not None else config_value("115_cookie", "ENV_115_COOKIES") or "").strip()
+    # A caller inside a request always passes the acting user's cookie; the
+    # fallback is for background work, which belongs to no user (R02).
+    cookies = (cookie if cookie is not None else _deployment_115("115_cookie", "ENV_115_COOKIES") or "").strip()
     if not cookies:
         return {"state": "unconfigured", "error_code": None, "checked_at": checked_at, "retry_after": 0}, None
     remaining = _115_UPSTREAM_TIMEOUT if deadline is None else deadline - time.monotonic()
@@ -1055,8 +1514,8 @@ def _115_verify_with_uid(cookie: str | None = None, deadline: float | None = Non
 
 def verify_115_session(cookie: str | None = None, deadline: float | None = None) -> dict:
     """Classify the 115 web session without ever returning cookie
-    material, the raw response, or the account uid (docs/115-integration.md).
-    Returns
+    material, the raw response, or the account uid (docs
+    claude-115-cookie-persistence-and-reauth-20260906.md §4.1). Returns
     ``{"state", "error_code", "checked_at", "retry_after"}``.
 
     w6-reauth-longpoll-fix: ``deadline`` (an absolute ``time.monotonic()``
@@ -1077,67 +1536,532 @@ def _115_next_check_interval(fail_streak: int) -> int:
     return min(300 * (2 ** min(fail_streak, 4)), 900)
 
 
-def _persist_115_verification(result: dict) -> None:
+def _acting_user() -> "auth_service.CurrentUser | None":
+    """Who this call is for, or None outside a request.
+
+    Background work (the enricher, the link checker, the RE0 timer) runs with
+    no request at all; it must not resolve to a user, and must not raise
+    trying.
+    """
+    if not has_request_context():
+        return None
+    return current_user()
+
+
+def _admin_user_id() -> int | None:
+    with connect_db() as db:
+        row = db.execute("SELECT id FROM auth_user WHERE role='admin' ORDER BY id LIMIT 1").fetchone()
+    return int(row["id"]) if row else None
+
+
+def _115_setting(name: str, user) -> str:
+    """This user's copy of a 115 state key (plan §9.3).
+
+    The administrator keeps the original keys so a rollback still finds its
+    state; everyone else gets their own row.
+    """
+    if user is None:
+        return name
+    return user_115.setting_key(name, user.id, admin_user_id=_admin_user_id() if user.role != "admin" else user.id)
+
+
+def user_115_cookie(user) -> str | None:
+    """The web-session cookie *this* user authorised (step A).
+
+    The administrator falls back to the legacy global value while the
+    migration window is open -- it is the same credential, and
+    ``--auth-migrate`` copies it into their own row. No other user has a
+    fallback: a member with no cookie of their own simply has none (plan
+    §9.1 forbids reaching for ``config_value('115_*')`` on their behalf).
+    """
+    if user is None:
+        return _deployment_115("115_cookie", "ENV_115_COOKIES")
+    with connect_db() as db:
+        own = user_115.secret_get(db, user.id, user_115.COOKIE_SECRET, fernet=load_fernet())
+        profile = user_115.profile(db, user.id)
+    if own:
+        return own
+    if user.role != "admin":
+        return None
+    if profile is not None and profile["cookie_state"] == user_115.STATE_DISCONNECTED:
+        # Asked to forget it. The legacy row stays for a rollback to read,
+        # but it is no longer this account's credential (R18).
+        return None
+    return config_value("115_cookie", "ENV_115_COOKIES")
+
+
+def _deployment_115(name: str, env_name: str) -> str | None:
+    """The deployment's own 115 credential, for work that belongs to nobody.
+
+    Background jobs -- the enricher, the link checker, the RE0 timer, the
+    CLI -- run with no request and no user, and legitimately act as the
+    deployment. An anonymous *request* is a different thing entirely and
+    gets nothing: inside a request, a caller with no user has already been
+    refused by authorize_request(), and must never be handed a credential.
+    """
+    if has_request_context():
+        return None
+    return config_value(name, env_name)
+
+
+def user_115_open_token(user) -> str | None:
+    """The OpenAPI access token *this* user authorised (step B).
+
+    Same rule as the cookie: the administrator falls back to the legacy
+    global value during the migration window because it is the same
+    credential, and nobody else has a fallback at all. A member who has not
+    completed step B has no token, and every caller must treat that as "not
+    authorised" rather than reaching for somebody else's (plan §9.1).
+    """
+    if user is None:
+        return _deployment_115("115_open_access_token", "115_open_access_token")
+    with connect_db() as db:
+        own = user_115.secret_get(db, user.id, user_115.OPEN_ACCESS_SECRET, fernet=load_fernet())
+        profile = user_115.profile(db, user.id)
+    if own:
+        return own
+    if user.role != "admin":
+        return None
+    if profile is not None and profile["open_state"] == user_115.STATE_DISCONNECTED:
+        return None
+    return config_value("115_open_access_token", "115_open_access_token")
+
+
+def _require_open115(user):
+    """``(token, error response)``. The error names step B rather than a
+    missing setting, so the page can send the user to the right button."""
+    token = user_115_open_token(user)
+    if token:
+        return token, None
+    blocked = _open115_config().blocked_reason()
+    message = ("115 开放平台授权尚未开通，目录与云下载暂不可用。"
+               if blocked else "请先在设置页完成「目录与云下载」授权。")
+    payload = {"success": False, "code": "OPEN115_NOT_AUTHORIZED", "message": message}
+    if blocked:
+        payload["blocked_reason"] = blocked
+    return None, (jsonify(payload), 409)
+
+
+def _has_own_open_token(user) -> bool:
+    """Whether this account holds a step-B token of its own, as opposed to
+    borrowing the deployment's during the migration window."""
+    if user is None:
+        return False
+    with connect_db() as db:
+        return user_115.secret_get(db, user.id, user_115.OPEN_ACCESS_SECRET,
+                                   fernet=load_fernet()) is not None
+
+
+def _open115_fence(user, lock_key: str, holder: str):
+    """The condition a recovery result must still satisfy to be committed.
+
+    G01.1: the version check at the start of a recovery says "this work is
+    still needed"; it does not say "this result is still the current one" when
+    the upstream call took longer than the lease. Evaluated inside the writing
+    transaction, so nothing can change between the check and the commit:
+
+    * the lease is still ours -- if it expired and somebody else took it, they
+      are the one whose result counts now;
+    * the user has not disconnected step B meanwhile, which is an explicit
+      decision a late success must not undo.
+    """
+    def check(db) -> bool:
+        if not auth_service.user_lock_held(db, lock_key, holder=holder):
+            return False
+        row = user_115.profile(db, user.id)
+        if row is not None and row["open_state"] == user_115.STATE_DISCONNECTED:
+            return False
+        return True
+    return check
+
+
+def _refresh_own_open_token(user, seen_version: int | None = None, fence=None) -> bool:
+    """Rotate a pair *this deployment's own 115 application* issued.
+
+    False when it cannot be done -- including while that application is
+    unapproved, which is where this stands today (B01). This is never the
+    path for the administrator's migrated credential: that one is OpenList's
+    to rotate (F02), and presenting its refresh token here would have two
+    systems rotating one value.
+    """
+    config = _open115_config()
+    if config.blocked_reason():
+        return False
+    adapter = user_115.Open115Adapter(config, session=requests.Session())
+    token = user_115.refresh_open_token(connect_db, user.id, adapter, fernet=load_fernet(),
+                                        now=utc_now(), seen_version=seen_version, fence=fence)
+    return token is not None
+
+
+def _open115_token_origin(user) -> str:
+    """Who rotates this user's stored pair (F02).
+
+    An administrator whose profile records nothing is the migration case: the
+    pair in their slot came from OpenList, which is still rotating it. A
+    member cannot be in that case -- nothing ever copies a credential into a
+    member's slot.
+    """
+    with connect_db() as db:
+        origin = user_115.open_token_origin(db, user.id)
+    if origin:
+        return origin
+    return user_115.ORIGIN_OPENLIST_LEGACY if user.role == "admin" else user_115.ORIGIN_OWN_APP
+
+
+def _legacy_open_pair() -> tuple[str | None, str | None]:
+    """The deployment's legacy step-B pair, read as one statement.
+
+    G01.1: reading the two halves with two calls could pick up an access token
+    from before an OpenList rotation beside a refresh token from after it --
+    a pair that is neither of the two real pairs. The environment fallback is
+    only reachable in the dev auth modes and is read after, never mixed in.
+    """
+    fernet = load_fernet()
+    with connect_db() as db:
+        row = db.execute(
+            "SELECT (SELECT value FROM secrets WHERE name='115_open_access_token') AS access_cipher, "
+            "       (SELECT value FROM secrets WHERE name='115_open_refresh_token') AS refresh_cipher"
+        ).fetchone()
+
+    def plain(value):
+        if value is None:
+            return None
+        try:
+            return fernet.decrypt(bytes(value)).decode("utf-8")
+        except (InvalidToken, ValueError, OSError):
+            return None
+
+    access, refresh = plain(row["access_cipher"]), plain(row["refresh_cipher"])
+    if access is None and AUTH_MODE != "access":
+        access = os.getenv("115_open_access_token") or None
+        refresh = refresh or os.getenv("115_open_refresh_token") or None
+    return access, refresh
+
+
+def _sync_openlist_for_recovery(stale_access: str | None) -> bool:
+    """Ask the owner to recover only when copying its saved pair is insufficient.
+
+    Called under the administrator's recovery lease. OpenList alone rotates
+    its refresh token; a forced listing bypasses its directory cache. The
+    page size only limits the response, not the driver's upstream enumeration.
+    The persisted cooldown bounds failed attempts across workers/restarts.
+    """
+    if not sync_openlist_credentials_from_source():
+        return False
+    access, refresh = _legacy_open_pair()
+    if access and refresh and access != stale_access:
+        return True
+    token = config_value("openlist_token", "OPENLIST_TOKEN")
+    if not token:
+        return False
+    now = utc_now()
+    try:
+        retry_after = int(setting_get("openlist_recovery_retry_after", "0"))
+    except (ValueError, TypeError):
+        retry_after = 0
+    if now < retry_after:
+        return False
+    setting_set("openlist_recovery_retry_after", str(now + 60))
+    try:
+        requests.post(
+            OPENLIST_URL + "/api/fs/list",
+            headers={"Authorization": token, "Content-Type": "application/json"},
+            json={"path": OPENLIST_115PAN_PATH, "password": "", "page": 1,
+                  "per_page": 1, "refresh": True},
+            timeout=(2, 4), allow_redirects=False,
+        )
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+    # OpenList persists the rotated pair before finishing the listing. Even
+    # if that listing times out/fails, adopt a changed pair from its database;
+    # the one business retry (not the directory response) verifies usability.
+    if not sync_openlist_credentials_from_source():
+        return False
+    access, refresh = _legacy_open_pair()
+    return bool(access and refresh and access != stale_access)
+
+
+def _adopt_legacy_open_token(user, *, expect_version: int, fence=None) -> bool:
+    """Re-sync the administrator's credential from OpenList and put the fresh
+    value back in their own slot.
+
+    F02: after ``--auth-migrate --apply`` the read path prefers the user slot,
+    so re-syncing the global setting alone fixed nothing -- the retry read the
+    same expired copy. OpenList stays the only rotator; this just follows it.
+
+    G01.1: the write is all-or-nothing and fenced. A pair missing its refresh
+    half is not a credential, so it is not written at all.
+    """
+    if user.role != "admin":
+        return False
+    stale_access, _version = _open115_credential(user)
+    if not _sync_openlist_for_recovery(stale_access):
+        return False
+    access, refresh = _legacy_open_pair()
+    if not access or not refresh:
+        return False
+    with connect_db() as db:
+        # Take the write lock before store_open_pair reads version/fence;
+        # sqlite's context manager alone does not start a transaction on SELECT.
+        db.execute("BEGIN IMMEDIATE")
+        return user_115.store_open_pair(
+            db, user.id, access, refresh, fernet=load_fernet(), now=utc_now(),
+            origin=user_115.ORIGIN_OPENLIST_LEGACY, expect_version=expect_version, fence=fence)
+
+
+_OPEN115_RECOVERY_WAIT_SECONDS = 8.0
+_OPEN115_RECOVERY_POLL_SECONDS = 0.25
+
+
+def _open115_credential(user) -> tuple[str | None, int]:
+    """This caller's step-B access token and the generation it belongs to.
+
+    The version travels with the token so that a 401 can be matched against
+    the credential that produced it (F03), and both come from **one** read
+    (G01.2): a token from before another worker's rotation beside the version
+    from after it would make the recovery think the new version had not been
+    tried, and rotate again.
+
+    Every 115 caller -- cloud download, the folder client, target-cid proof --
+    goes through here, so they all share that guarantee.
+    """
+    if user is None:
+        return _deployment_115("115_open_access_token", "115_open_access_token"), 0
+    with connect_db() as db:
+        snapshot = user_115.open_snapshot(db, user.id, fernet=load_fernet())
+    if snapshot.access_token:
+        return snapshot.access_token, snapshot.version
+    if user.role != "admin":
+        return None, snapshot.version
+    if snapshot.open_state == user_115.STATE_DISCONNECTED:
+        return None, snapshot.version
+    # The migration window: the administrator's own slot is empty, so the
+    # legacy global value is still theirs. Version 0 is correct -- there is no
+    # per-user generation yet.
+    return config_value("115_open_access_token", "115_open_access_token"), snapshot.version
+
+
+def _open115_recover(user, seen_version: int) -> bool:
+    """Restore this caller's step-B credential once, coordinated across workers.
+
+    The deployment runs several gunicorn workers, so the coordination is a
+    row in ``user_lock`` rather than a lock in one process's memory (F03):
+    overlapping requests that all noticed the same expiry produce exactly one
+    upstream rotation. Whoever holds the lease re-reads the stored version
+    first -- if it has already moved past what the caller used, the work is
+    done and this returns True without touching 115.
+    """
+    if user is None:
+        # No user at all: the deployment acting on its own behalf (timers,
+        # the enricher). Its credential is the legacy global one.
+        return bool(sync_openlist_credentials_from_source())
+    lock_key = f"115_open_refresh:{user.id}"
+    # G01.1: one identity per recovery *operation*, not per process or thread.
+    # A thread that recovers twice must not be able to release -- or commit
+    # under -- the lease its own earlier attempt took.
+    holder = f"{os.getpid()}:{threading.get_ident()}:{secrets.token_hex(8)}"
+    deadline = time.monotonic() + _OPEN115_RECOVERY_WAIT_SECONDS
+    while True:
+        with connect_db() as db:
+            taken = auth_service.acquire_user_lock(db, lock_key, holder=holder, now=utc_now())
+        if taken:
+            break
+        with connect_db() as db:
+            if user_115.secret_version(db, user.id, user_115.OPEN_ACCESS_SECRET) > seen_version:
+                # Another worker finished while we waited. Reuse its result.
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_OPEN115_RECOVERY_POLL_SECONDS)
+    fence = _open115_fence(user, lock_key, holder)
+    try:
+        with connect_db() as db:
+            snapshot = user_115.open_snapshot(db, user.id, fernet=load_fernet())
+        if snapshot.version > seen_version:
+            return True
+        if snapshot.open_state == user_115.STATE_DISCONNECTED:
+            # They disconnected step B. Recovering it would undo that.
+            return False
+        if snapshot.access_token is None:
+            # Nothing of their own yet: only the administrator has a legacy
+            # credential to fall back on, and a member was already refused.
+            # Adopt the recovered pair into the admin slot as well, so other
+            # workers observing this expiry can reuse the new generation.
+            return bool(user.role == "admin" and _adopt_legacy_open_token(
+                user, expect_version=snapshot.version, fence=fence))
+        origin = snapshot.origin or (user_115.ORIGIN_OPENLIST_LEGACY if user.role == "admin"
+                                     else user_115.ORIGIN_OWN_APP)
+        if origin == user_115.ORIGIN_OPENLIST_LEGACY:
+            return _adopt_legacy_open_token(user, expect_version=snapshot.version, fence=fence)
+        return _refresh_own_open_token(user, seen_version=snapshot.version, fence=fence)
+    finally:
+        with connect_db() as db:
+            auth_service.release_user_lock(db, lock_key, holder=holder)
+
+
+def user_115_folders(user, cid: str, *, deadline: float | None = None,
+                     allow_recovery: bool = True) -> tuple[list[dict], int, str]:
+    """One folder of *this user's own* 115, through their own step-B token.
+
+    Phase 6 (R05): a member browsing their 115 does not go through
+    OpenList -- that is the administrator's operator tooling and holds the
+    administrator's credential. The token scopes the call, so a cid this
+    token cannot list is simply not theirs.
+    """
+    # G01.2: one snapshot, shared with every other 115 caller.
+    token, token_version = _open115_credential(user)
+    if not token:
+        _unused, error = _require_open115(user)
+        return [], 409, "尚未完成「目录与云下载」授权"
+    remaining = _115_UPSTREAM_TIMEOUT if deadline is None else max(0.0, deadline - time.monotonic())
+    if remaining <= 0:
+        return [], 504, "目录读取超时"
+    try:
+        response = requests.get(
+            OPEN115_API_BASE + "/open/ufile/files",
+            headers={"Authorization": "Bearer " + token},
+            params={"cid": str(cid or "0"), "limit": 200, "offset": 0, "show_dir": 1, "count_folders": 1},
+            timeout=(min(_115_UPSTREAM_CONNECT_TIMEOUT, remaining), min(_115_UPSTREAM_TIMEOUT, remaining)),
+        )
+        payload = response.json() if response.content else {}
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return [], 502, f"115 目录读取失败：{type(exc).__name__}"
+    auth_error = response.status_code in {401, 403} or (
+        isinstance(payload, dict)
+        and str(payload.get("errno") or payload.get("code") or "") in _CLOUD_AUTH_ERRNOS
+    )
+    if auth_error:
+        # F03: the folder picker is often a user's first action after their
+        # token expired, so it recovers through the same path the
+        # cloud-download client uses -- including HTTP 200 business errors.
+        # Recover once, then the answer stands.
+        if allow_recovery and _open115_recover(user, token_version):
+            return user_115_folders(user, cid, deadline=deadline, allow_recovery=False)
+        return [], 401, "「目录与云下载」授权已过期，请重新授权"
+    if response.status_code >= 400 or not isinstance(payload, dict) or not payload.get("state", True):
+        return [], 502, _cloud_sanitize_message(payload.get("message") if isinstance(payload, dict) else "") or "115 目录读取失败"
+    items = []
+    for entry in (payload.get("data") or []):
+        if not isinstance(entry, dict):
+            continue
+        # Folders only, and only the two fields the picker needs: no size, no
+        # path, nothing that describes the user's own files beyond a name.
+        if str(entry.get("fc") or entry.get("file_category") or "") not in {"0", ""}:
+            continue
+        file_id = str(entry.get("fid") or entry.get("file_id") or entry.get("cid") or "")
+        name = str(entry.get("fn") or entry.get("file_name") or entry.get("n") or "")
+        if file_id and name:
+            items.append({"cid": file_id, "name": name})
+    return items, 200, ""
+
+
+def validate_user_target_cid(user, cid: str, *, deadline: float | None = None) -> bool:
+    """Whether ``cid`` is a folder in *this user's* own 115.
+
+    Proved by listing it with their token: a cid belonging to somebody else's
+    account cannot be listed with it. A client-supplied cid is a candidate
+    until this says otherwise -- it is never itself an authorisation
+    (plan §9.2).
+    """
+    if not str(cid or "").strip():
+        return False
+    _items, status, _message = user_115_folders(user, cid, deadline=deadline)
+    return status == 200
+
+
+def _cloud_cache_key(user, *parts) -> tuple:
+    """A cache key nobody else can hit. The whole point of Phase 6: two users
+    ask 115 with different tokens, so their answers must not share a slot
+    (plan §17's "do not filter the display and leave the query shared")."""
+    return (("user", user.id if user else 0), *parts)
+
+
+def _cloud_cache_forget(user) -> None:
+    """Drop this user's own cached quota and task pages.
+
+    Flushing the whole dictionary would make one user's delete or clear cost
+    every other user a fresh round of 115 requests -- and the cache is keyed
+    per user precisely so that cannot happen (F04).
+    """
+    prefix = ("user", user.id if user else 0)
+    for key in [k for k in _CLOUD_CACHE if isinstance(k, tuple) and k and k[0] == prefix]:
+        _CLOUD_CACHE.pop(key, None)
+
+
+def _persist_115_verification(result: dict, user=None) -> None:
     """Persist only sanitised state metadata (settings table) -- never the
     cookie, raw response or uid. Keeps writing legacy ``115_cookie_valid``
     for compatibility."""
     state = result["state"]
     checked_at = result["checked_at"]
-    setting_set("115_cookie_state", state)
-    setting_set("115_cookie_checked_at", str(checked_at))
-    setting_set("115_cookie_error_code", result.get("error_code") or "")
-    setting_set("115_cookie_valid", "1" if state == "valid" else "0")
+    user = user if user is not None else _acting_user()
+    key = lambda name: _115_setting(name, user)  # noqa: E731 - one short local alias
+    setting_set(key("115_cookie_state"), state)
+    setting_set(key("115_cookie_checked_at"), str(checked_at))
+    setting_set(key("115_cookie_error_code"), result.get("error_code") or "")
+    setting_set(key("115_cookie_valid"), "1" if state == "valid" else "0")
     if state == "valid":
-        setting_set("115_cookie_last_success_at", str(checked_at))
-        setting_set("115_cookie_fail_streak", "0")
+        setting_set(key("115_cookie_last_success_at"), str(checked_at))
+        setting_set(key("115_cookie_fail_streak"), "0")
     elif state != "unconfigured":
-        setting_set("115_cookie_error_at", str(checked_at))
-        streak = int(setting_get("115_cookie_fail_streak", "0") or "0") + 1
-        setting_set("115_cookie_fail_streak", str(streak))
+        setting_set(key("115_cookie_error_at"), str(checked_at))
+        streak = int(setting_get(key("115_cookie_fail_streak"), "0") or "0") + 1
+        setting_set(key("115_cookie_fail_streak"), str(streak))
+    if user is not None:
+        with connect_db() as db:
+            user_115.remember_cookie_state(
+                db, user.id,
+                state=user_115.STATE_CONNECTED if state == "valid" else (
+                    user_115.STATE_UNCONFIGURED if state == "unconfigured" else user_115.STATE_NEEDS_REAUTH),
+                error_code=result.get("error_code"), now=checked_at or utc_now(),
+            )
 
 
-def remember_115_cookie_check(cookie: str | None = None) -> tuple[bool, str]:
+def remember_115_cookie_check(cookie: str | None = None, user=None) -> tuple[bool, str]:
     """Used by /api/settings right after a new cookie value is saved: an
     immediate, uncached check (bypassing the interval/backoff, which only
     throttle the periodic /api/status poll and the transfer-flow gate)."""
-    result = verify_115_session(cookie)
-    _persist_115_verification(result)
+    user = user if user is not None else _acting_user()
+    result = verify_115_session(cookie if cookie is not None else user_115_cookie(user))
+    _persist_115_verification(result, user)
     return result["state"] == "valid", _115_STATE_LABEL.get(result["state"], "不可用")
 
 
-def _115_maybe_refresh() -> None:
-    checked_at = int(setting_get("115_cookie_checked_at", "0") or "0")
-    fail_streak = int(setting_get("115_cookie_fail_streak", "0") or "0")
+def _115_maybe_refresh(user=None) -> None:
+    user = user if user is not None else _acting_user()
+    checked_at = int(setting_get(_115_setting("115_cookie_checked_at", user), "0") or "0")
+    fail_streak = int(setting_get(_115_setting("115_cookie_fail_streak", user), "0") or "0")
     interval = _115_next_check_interval(fail_streak)
     if not checked_at or checked_at + interval <= utc_now():
-        _persist_115_verification(verify_115_session())
+        _persist_115_verification(verify_115_session(user_115_cookie(user)), user)
 
 
-def cookie_status(verify: bool = False) -> dict[str, object]:
-    configured = bool(config_value("115_cookie", "ENV_115_COOKIES"))
+def cookie_status(verify: bool = False, user=None) -> dict[str, object]:
+    user = user if user is not None else _acting_user()
+    configured = bool(user_115_cookie(user))
     if not configured:
         return {"configured": False, "valid": None, "state": "unconfigured", "checked_at": None, "last_success_at": None, "error_code": None, "retry_after": None}
     if verify:
-        _115_maybe_refresh()
-    checked_at_raw = setting_get("115_cookie_checked_at", "") or ""
+        _115_maybe_refresh(user)
+    checked_at_raw = setting_get(_115_setting("115_cookie_checked_at", user), "") or ""
     try:
         checked_at = int(checked_at_raw)
     except ValueError:
         checked_at = 0
-    last_success_raw = setting_get("115_cookie_last_success_at", "") or ""
+    last_success_raw = setting_get(_115_setting("115_cookie_last_success_at", user), "") or ""
     try:
         last_success_at = int(last_success_raw) or None
     except ValueError:
         last_success_at = None
-    valid_raw = setting_get("115_cookie_valid")
+    valid_raw = setting_get(_115_setting("115_cookie_valid", user))
     valid = None if valid_raw not in {"0", "1"} else valid_raw == "1"
-    state = setting_get("115_cookie_state", "") or ("valid" if valid else "unknown" if valid is None else "reauth_required")
+    state = setting_get(_115_setting("115_cookie_state", user), "") or ("valid" if valid else "unknown" if valid is None else "reauth_required")
     # Item 8: how long until the next scheduled check will retry, so the UI
     # can show a countdown instead of a bare "rate limited" -- same backoff
     # formula _115_transfer_gate() already uses for its own cached 429s.
     retry_after = None
     if state == "rate_limited" and checked_at:
-        fail_streak = int(setting_get("115_cookie_fail_streak", "0") or "0")
+        fail_streak = int(setting_get(_115_setting("115_cookie_fail_streak", user), "0") or "0")
         retry_after = max(0, checked_at + _115_next_check_interval(fail_streak) - utc_now())
     return {
         "configured": True,
@@ -1145,7 +2069,7 @@ def cookie_status(verify: bool = False) -> dict[str, object]:
         "state": state,
         "checked_at": checked_at or None,
         "last_success_at": last_success_at,
-        "error_code": setting_get("115_cookie_error_code") or None,
+        "error_code": setting_get(_115_setting("115_cookie_error_code", user)) or None,
         "retry_after": retry_after,
     }
 
@@ -1166,7 +2090,7 @@ class TransferResult:
     receive_attempted: bool = False
 
 
-# docs/115-integration.md §6.2: explicit,
+# docs/claude-115-cookie-persistence-and-reauth-20260906.md §6.2: explicit,
 # distinct failure codes so the frontend never has to guess from a generic
 # 502 whether a retry, a wait, or a QR re-auth is the right next step.
 # "unconfigured" is folded into the same REAUTH_REQUIRED code/message as
@@ -1209,20 +2133,29 @@ def _115_transfer_gate(deadline: float) -> tuple[TransferResult | None, str | No
     with the same fixed 504 ``TRANSFER_NOT_ATTEMPTED`` save_115_link uses
     when share/receive itself can't be attempted, and leaves cookie state
     completely unchanged."""
-    if not bool(config_value("115_cookie", "ENV_115_COOKIES")):
+    # Phase 4: whose transfer this is. There is no fallback to anybody
+    # else's cookie -- a user without one is refused here.
+    user = _acting_user()
+    # Resolved once and used for every call below -- the verification, the
+    # share preview and the receive all belong to one account (R02).
+    cookie = user_115_cookie(user)
+    if not cookie:
         return _115_transfer_error("unconfigured", None), None
-    checked_at = int(setting_get("115_cookie_checked_at", "0") or "0")
-    fail_streak = int(setting_get("115_cookie_fail_streak", "0") or "0")
-    cached_state = setting_get("115_cookie_state", "") or ""
+    checked_at = int(setting_get(_115_setting("115_cookie_checked_at", user), "0") or "0")
+    fail_streak = int(setting_get(_115_setting("115_cookie_fail_streak", user), "0") or "0")
+    cached_state = setting_get(_115_setting("115_cookie_state", user), "") or ""
     interval = _115_next_check_interval(fail_streak)
     still_fresh = bool(checked_at) and checked_at + interval > utc_now()
     if still_fresh and cached_state and cached_state != "valid":
         cached_retry = max(0, checked_at + interval - utc_now()) if cached_state == "rate_limited" else None
         return _115_transfer_error(cached_state, cached_retry), None
-    result, uid = _115_verify_with_uid(deadline=deadline)
+    # R02: verify the cookie this gate just resolved. Reading the global one
+    # here would check the administrator's session and hand back their UID,
+    # which the receive call would then use with a member's cookie.
+    result, uid = _115_verify_with_uid(cookie, deadline=deadline)
     if result["state"] == "budget_exhausted":
         return TransferResult(False, "转存耗时过长，请稍后重试", 504, "TRANSFER_NOT_ATTEMPTED"), None
-    _persist_115_verification(result)
+    _persist_115_verification(result, user)
     if result["state"] != "valid":
         return _115_transfer_error(result["state"], result.get("retry_after") or None), None
     return None, uid
@@ -1253,7 +2186,9 @@ def save_115_link(link: str, pid: str, deadline: float) -> TransferResult:
     if error is not None:
         return error
     share_code, receive_code = parsed
-    cookies = config_value("115_cookie", "ENV_115_COOKIES") or ""
+    # Whoever is asking, with their own step-A cookie: the gate above already
+    # refused a user who has none, and nobody is ever served another's.
+    cookies = user_115_cookie(_acting_user()) or ""
     headers = {
         "User-Agent": "Mozilla/5.0 HiDrive-Lite/1.0",
         "Content-Type": "application/x-www-form-urlencoded",
@@ -1336,7 +2271,8 @@ def _transfer_response(result: TransferResult):
 
 
 # ---------------------------------------------------------------------------
-# QR re-authorisation (docs/115-integration.md). Challenge state lives in
+# QR re-authorisation (docs/claude-115-cookie-persistence-and-reauth-
+# 20260906.md §5, docs/115-reauth-adapter.md). Challenge state lives in
 # ``reauth_challenges`` (not process memory) so start/status/cancel work
 # across gunicorn's sync workers. The browser only ever sees a random
 # ``challenge_id``; only its SHA-256 is persisted, and the 115 QR
@@ -1529,10 +2465,79 @@ def _reauth_complete(row, deadline: float) -> tuple[str, str | None]:
         return "failed", "EXCHANGE_FAILED"
     verification = verify_115_session(new_cookie, deadline)
     if verification["state"] != "valid":
+        # Nothing is written on any failure: the existing, still-working
+        # credential of whoever scanned stays exactly as it was.
         return "failed", "VERIFY_FAILED"
-    secret_set("115_cookie", new_cookie)
-    _persist_115_verification(verification)
+    _store_scanned_cookie(row, new_cookie, verification)
     return "authenticated", None
+
+
+def _challenge_owner(row) -> "auth_service.CurrentUser | None":
+    """The account that started this scan.
+
+    Taken from the challenge itself, never from whoever happens to be
+    polling: the row is what was created when the QR was issued, and it is
+    consumed once (R01).
+    """
+    keys = row.keys() if hasattr(row, "keys") else ()
+    owner_id = row["user_id"] if "user_id" in keys else None
+    if owner_id is None:
+        return None
+    with connect_db() as db:
+        found = auth_service.find_user(db, int(owner_id))
+    if found is None:
+        return None
+    return auth_service.CurrentUser(id=int(found["id"]), email=found["email_display"],
+                                    role=found["role"], status=found["status"])
+
+
+def _store_settings_cookie(cookie: str) -> None:
+    """A cookie the administrator pasted into the settings page.
+
+    The legacy global slot is already written by the caller. This puts the
+    same value in the administrator's own ``user_secret`` row -- which is
+    what ``user_115_cookie()`` reads first once a scan has ever filled it --
+    and clears an explicit step-A disconnect, because pasting a new cookie
+    is the opposite decision. Only the administrator reaches this route.
+    """
+    user = _acting_user()
+    if user is None or user.role != "admin":
+        return
+    now = utc_now()
+    with connect_db() as db:
+        with db:
+            user_115.secret_set(db, user.id, user_115.COOKIE_SECRET, cookie, fernet=load_fernet(), now=now)
+            row = user_115.profile(db, user.id)
+            if row is not None and row["cookie_state"] == user_115.STATE_DISCONNECTED:
+                user_115.remember_cookie_state(db, user.id, state="unconfigured", error_code=None, now=now)
+
+
+def _store_scanned_cookie(row, cookie: str, verification: dict) -> None:
+    """Save a freshly scanned 115 session to the account that scanned for it.
+
+    A member's scan lands in their own ``user_secret`` row and nowhere else:
+    it must never overwrite the administrator's global credential, and a
+    member must never end up using one (R01). The administrator also keeps
+    the legacy global slot written while the migration window is open,
+    because that is the same credential the previous release reads.
+
+    Step B is untouched here: reconnecting the web session must not cost
+    anybody their OpenAPI authorisation (plan §4.2).
+    """
+    now = utc_now()
+    owner = _challenge_owner(row)
+    if owner is None:
+        # A challenge from before the multi-user work, or a deployment with
+        # no user rows yet: that is the administrator's own scan, and the
+        # legacy slot is where it lives.
+        secret_set("115_cookie", cookie)
+        _persist_115_verification(verification, None)
+        return
+    with connect_db() as db:
+        user_115.secret_set(db, owner.id, user_115.COOKIE_SECRET, cookie, fernet=load_fernet(), now=now)
+    if owner.role == "admin":
+        secret_set("115_cookie", cookie)
+    _persist_115_verification(verification, owner)
 
 
 _REAUTH_AUDIT_ACTION = {"authenticated": "115.reauth.success", "failed": "115.reauth.failed", "expired": "115.reauth.expired"}
@@ -1576,9 +2581,7 @@ def _redact_hdhive_text(value: object) -> str:
     """Remove URLs and common access-code forms from provider text fields."""
     text = str(value)
     text = re.sub(r"https?://[^\s<>\"']+", "[redacted-url]", text, flags=re.I)
-    # Upstream descriptions sometimes omit the URL scheme.  Strip domain
-    # names with a path as well so a bare 115/115cdn/anxia/share URL cannot
-    # reach the browser through an otherwise harmless text field.
+    # Descriptions may omit the scheme; a bare provider URL is still private.
     text = re.sub(r"(?i)\b(?:[a-z0-9-]+\.)+(?:com|cn|net|org|io|me|cc|tv)(?:/[^\s<>\"']*)?", "[redacted-url]", text)
     text = re.sub(r"(?i)(password|access[\s_-]+code|cookie|token|secret)\s*[:=]\s*[^\s,;，；。]+", r"\1=[redacted]", text)
     text = re.sub(r"(访问码|提取码|密码|口令|密钥)\s*[:：=]\s*[^\s,;，；。]+", r"\1：[redacted]", text)
@@ -1586,16 +2589,13 @@ def _redact_hdhive_text(value: object) -> str:
 
 
 def _safe_hdhive_envelope(data: object) -> dict:
-    """Keep only the non-secret part of an HDHive response envelope.
+    """Keep diagnostics, never upstream credentials or share payloads.
 
-    HDHive resource and unlock responses may contain provider share URLs,
-    access codes, or opaque download tokens. Those values are useful to the
-    server-side adapter but must not be reflected into a browser response.
-    Error codes/messages remain available for diagnosis, while successful
-    payloads are normalized by the endpoint-specific helpers below.
+    The private payload is still available to server-side materialisation;
+    only the browser response and persisted diagnostic text use this view.
     """
     if not isinstance(data, dict):
-        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "HDHive 返回格式异常"}
+        return {"success": False, "code": "UPSTREAM_INVALID_JSON", "message": "RE0 返回格式异常"}
     result: dict[str, object] = {"success": bool(data.get("success", False))}
     for key in ("code", "message"):
         value = data.get(key)
@@ -1636,8 +2636,6 @@ def _safe_hdhive_resources_response(data: object) -> dict:
         result["data"] = [_safe_hdhive_resource_item(item) for item in raw]
         result["resource_count"] = len(raw)
     elif isinstance(raw, dict):
-        # Some deployments wrap resources in ``items``/``resources`` and add
-        # pagination metadata. Preserve only counters and normalized items.
         items = raw.get("items") if isinstance(raw.get("items"), list) else raw.get("resources")
         if isinstance(items, list):
             result["data"] = [_safe_hdhive_resource_item(item) for item in items]
@@ -1666,6 +2664,11 @@ def _safe_hdhive_unlock_response(data: object) -> dict:
             value = raw.get(key)
             if isinstance(value, list):
                 link_count = max(link_count, len(value))
+        # Current RE0 also returns one share directly, rather than an array.
+        # Count its presence without copying any part of the private value.
+        if any(isinstance(raw.get(key), str) and raw[key].strip()
+               for key in ("url", "full_url", "share_url")):
+            link_count = max(link_count, 1)
         summary = _safe_hdhive_resource_item(raw)
     elif isinstance(raw, list):
         link_count = len(raw)
@@ -1686,8 +2689,6 @@ def status_payload(verify_115: bool = False) -> dict:
     return {
         "app": APP_NAME,
         "auth_mode": AUTH_MODE,
-        # The browser already knows its origin from the current URL. Do not
-        # echo deployment URLs or filesystem paths through a diagnostics API.
         "public_origin_configured": bool(PUBLIC_ORIGIN),
         "hdhive": {
             "app_secret_configured": bool(config_value("hdhive_app_secret", "HDHIVE_APP_SECRET")),
@@ -2064,6 +3065,16 @@ def _library_store_factory() -> "library_store.LibraryStore | None":
         return None
 
 
+def _re0_extra_round(store, client) -> None:
+    """RE0 projection metadata, using the existing TMDB budget."""
+    re0_sync.enrich_projections(store, client, limit=5)
+
+
+def _library_index_round(store) -> bool:
+    """Pure local work: independent of TMDB configuration and availability."""
+    return re0_sync.rebuild_index_if_dirty(store, charmap=_library_charmap(store))
+
+
 def _library_enrich_enabled_check() -> bool:
     return setting_get("tmdb_enrich_enabled", "1") == "1"
 
@@ -2101,6 +3112,8 @@ def _build_library_enricher() -> "library_tmdb.BackgroundEnricher":
         conn_factory=_library_enricher_conn_factory,
         enabled_check=_library_enrich_enabled_check,
         tvmaze_enabled_check=_library_tvmaze_enabled_check,
+        extra_round=_re0_extra_round,
+        local_round=_library_index_round,
     )
 
 
@@ -2142,6 +3155,231 @@ def _linkcheck_leader_lock_path() -> Path:
     ``DATA_DIR``) but a distinct path -- the two background threads must
     never contend on the same fcntl lock."""
     return DATA_DIR / "linkcheck-leader.lock"
+
+
+# ---------------------------------------------------------------------------
+# 115 云下载 (spec docs/superpowers/specs/2026-09-09-115-cloud-download-design.md):
+# push ED2K/magnet links to 115's offline downloader through the open
+# platform, with the same access_token the directory listing already uses.
+# ---------------------------------------------------------------------------
+
+_CLOUD_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_CLOUD_PER_SUBMIT_CAP_DEFAULT = 30
+_CLOUD_PER_SUBMIT_CAP_MAX = 50
+_CLOUD_DAILY_CAP_MAX = 100000
+
+
+def _cloud_settings_dict() -> dict:
+    """``{"enabled", "daily_cap", "per_submit_cap"}`` from the settings
+    table; daily_cap 0 means unlimited (the user's own call: 115 has no
+    daily rule, only the monthly quota)."""
+    def _int(name: str, default: int, lo: int, hi: int) -> int:
+        raw = setting_get(name)
+        try:
+            value = int(raw) if raw is not None else default
+        except ValueError:
+            value = default
+        return min(max(value, lo), hi)
+    return {
+        "enabled": setting_get("cloud_download_enabled", "0") == "1",
+        "daily_cap": _int("cloud_download_daily_cap", 0, 0, _CLOUD_DAILY_CAP_MAX),
+        "per_submit_cap": _int("cloud_download_per_submit_cap", _CLOUD_PER_SUBMIT_CAP_DEFAULT, 1, _CLOUD_PER_SUBMIT_CAP_MAX),
+    }
+
+
+_CLOUD_CACHE: dict[object, tuple[float, object]] = {}
+_CLOUD_QUOTA_TTL_SECONDS = 60
+_CLOUD_TASKS_TTL_SECONDS = 10
+_CLOUD_LINK_RE = re.compile(r"(?:ed2k://|magnet:|https?://|ftp://|urn:btih:)\S*", re.I)
+_CLOUD_AUTH_ERRNOS = {"40140116", "40140125", "40140126", "40140127"}
+
+
+def _cloud_sanitize_message(text: object) -> str:
+    """115's own ``message`` is shown to the user verbatim -- minus any link
+    it might echo back (the same no-URL rule every other response keeps)."""
+    if not text:
+        return ""
+    return re.sub(r"\s{2,}", " ", _CLOUD_LINK_RE.sub("", str(text))).strip()
+
+
+def _open115_offline(
+    method: str, path: str, *, data: dict | None = None, params: dict | None = None,
+    deadline: float | None = None, allow_resync: bool = True,
+) -> tuple[dict | None, int, str]:
+    """One call to a 115 open-platform cloud-download endpoint under the
+    synced access_token. Returns ``(json, status, error)``: ``status`` 200
+    with ``error == ""`` only when 115 says ``state: true``; an auth
+    error re-syncs the token from OpenList once (like ``open115_list``)
+    and retries once; a missing token is 503 without any request."""
+    # Phase 6: whoever is asking, with their own step-B token. A user without
+    # one never falls through to another's -- the route refused them first.
+    # The version comes with it so a 401 can be attributed to this exact
+    # generation of the credential (F03).
+    acting = _acting_user()
+    access_token, token_version = _open115_credential(acting)
+    if not access_token:
+        return None, 503, "尚未完成「目录与云下载」授权"
+    remaining = _115_UPSTREAM_TIMEOUT if deadline is None else deadline - time.monotonic()
+    if remaining <= 0:
+        return None, 504, "请求预算已用尽"
+    timeout = (min(_115_UPSTREAM_CONNECT_TIMEOUT, remaining), min(_115_UPSTREAM_TIMEOUT, remaining))
+    headers = {"Authorization": "Bearer " + access_token}
+    try:
+        if method.upper() == "POST":
+            response = requests.post(OPEN115_API_BASE + path, headers=headers, data=data or {}, timeout=timeout)
+        else:
+            response = requests.get(OPEN115_API_BASE + path, headers=headers, params=params or {}, timeout=timeout)
+        payload = response.json() if response.content else {}
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return None, 502, f"115 开放平台请求失败：{type(exc).__name__}"
+    if not isinstance(payload, dict):
+        return None, 502, "115 开放平台返回格式异常"
+    auth_error = response.status_code in {401, 403} or str(payload.get("errno") or payload.get("code") or "") in _CLOUD_AUTH_ERRNOS
+    if auth_error and allow_resync:
+        # F02/F03: one shared recovery, whoever the caller is and wherever
+        # their credential came from, and exactly one business retry after
+        # it. `allow_resync=False` on the retry is what bounds this -- a
+        # credential that is genuinely revoked returns the re-authorisation
+        # answer instead of looping.
+        if _open115_recover(acting, token_version):
+            return _open115_offline(method, path, data=data, params=params,
+                                    deadline=deadline, allow_resync=False)
+        if acting is not None and _has_own_open_token(acting):
+            return payload, 401, "「目录与云下载」授权已过期，请重新授权"
+    if response.status_code >= 400 or not payload.get("state", True):
+        message = _cloud_sanitize_message(payload.get("message") or payload.get("error")) or "115 开放平台令牌可能已失效"
+        return payload, response.status_code if response.status_code >= 400 else 502, message
+    return payload, 200, ""
+
+
+def _cloud_cached(key: object, ttl: int, force: bool, fetch):
+    now = time.monotonic()
+    cached = _CLOUD_CACHE.get(key)
+    if cached is not None and not force and now - cached[0] < ttl:
+        return cached[1], ""
+    payload, error = fetch()
+    if payload is not None:
+        _CLOUD_CACHE[key] = (now, payload)
+    return payload, error
+
+
+def _cloud_quota(force: bool = False, deadline: float | None = None) -> tuple[dict | None, str]:
+    def fetch():
+        body, status, error = _open115_offline("GET", "/open/offline/get_quota_info", deadline=deadline)
+        data = body.get("data") if isinstance(body, dict) and status == 200 else None
+        return (data if isinstance(data, dict) else None), (error or ("" if isinstance(data, dict) else "115 配额返回格式异常"))
+    return _cloud_cached(_cloud_cache_key(_acting_user(), "quota"), _CLOUD_QUOTA_TTL_SECONDS, force, fetch)
+
+
+def _cloud_task_list(page: int, force: bool = False, deadline: float | None = None) -> tuple[dict | None, str]:
+    def fetch():
+        body, status, error = _open115_offline("GET", "/open/offline/get_task_list", params={"page": page}, deadline=deadline)
+        data = body.get("data") if isinstance(body, dict) and status == 200 else None
+        return (data if isinstance(data, dict) else None), (error or ("" if isinstance(data, dict) else "115 任务列表返回格式异常"))
+    return _cloud_cached(_cloud_cache_key(_acting_user(), "tasks", page), _CLOUD_TASKS_TTL_SECONDS, force, fetch)
+
+
+_CLOUD_DOWNLOAD_LOCK = threading.Lock()
+_CLOUD_DEDUPE_WINDOW_SECONDS = 60
+_CLOUD_DEDUPE_LOCK = threading.Lock()
+_CLOUD_DEDUPE_SEEN: dict[tuple[str, str], float] = {}
+_CLOUD_CHUNK_SIZE = 10
+_CLOUD_CHUNK_GAP_SECONDS = 1.5
+_cloud_sleep = time.sleep
+
+
+def _cloud_dedupe_check(public_ids: list[str], pid: str) -> bool:
+    """All-or-nothing: True (recording every id) unless any
+    ``(user, id, pid)`` was already submitted inside the window.
+
+    The user is part of the key (R19/R05): two people queueing the same
+    release to their own accounts are two submissions. The upstream rate
+    limits that protect 115 are a separate, still-global concern.
+    """
+    now = time.monotonic()
+    user_key = _dedupe_user_key()
+    with _CLOUD_DEDUPE_LOCK:
+        for key, seen_at in list(_CLOUD_DEDUPE_SEEN.items()):
+            if now - seen_at >= _CLOUD_DEDUPE_WINDOW_SECONDS:
+                del _CLOUD_DEDUPE_SEEN[key]
+        if any((user_key, public_id, pid) in _CLOUD_DEDUPE_SEEN for public_id in public_ids):
+            return False
+        for public_id in public_ids:
+            _CLOUD_DEDUPE_SEEN[(user_key, public_id, pid)] = now
+        return True
+
+
+def _cloud_dedupe_clear(public_ids: list[str], pid: str) -> None:
+    user_key = _dedupe_user_key()
+    with _CLOUD_DEDUPE_LOCK:
+        for public_id in public_ids:
+            _CLOUD_DEDUPE_SEEN.pop((user_key, public_id, pid), None)
+
+
+def _cloud_submit_chunks(items: list[dict], pid: str, deadline: float | None) -> tuple[list[dict], str]:
+    """Serially submit ``items`` (``{"link_id", "label", "url"}``) to 115 in
+    chunks of ``_CLOUD_CHUNK_SIZE`` with ``_CLOUD_CHUNK_GAP_SECONDS``
+    between chunks -- never concurrently. A chunk-level failure (HTTP
+    error, ``state: false``, rate limit) stops the whole batch: that
+    chunk's and every later item come back ``not_submitted`` and the 115
+    message is returned as the stop reason."""
+    results: list[dict] = []
+    chunks = [items[i:i + _CLOUD_CHUNK_SIZE] for i in range(0, len(items), _CLOUD_CHUNK_SIZE)]
+    for index, chunk in enumerate(chunks):
+        if index:
+            _cloud_sleep(_CLOUD_CHUNK_GAP_SECONDS)
+        body, status, error = _open115_offline(
+            "POST", "/open/offline/add_task_urls",
+            data={"urls": "\n".join(item["url"] for item in chunk), "wp_path_id": pid}, deadline=deadline,
+        )
+        if status != 200:
+            for item in chunk:
+                results.append({"link_id": item["link_id"], "label": item["label"], "state": "not_submitted"})
+            for later in chunks[index + 1:]:
+                for item in later:
+                    results.append({"link_id": item["link_id"], "label": item["label"], "state": "not_submitted"})
+            return results, error or "115 云下载接口失败"
+        entries = body.get("data") if isinstance(body.get("data"), list) else []
+        by_url = {str(e.get("url") or ""): e for e in entries if isinstance(e, dict)}
+        for position, item in enumerate(chunk):
+            entry = by_url.get(item["url"]) or (entries[position] if position < len(entries) and isinstance(entries[position], dict) else {})
+            if entry.get("state") and entry.get("info_hash"):
+                results.append({"link_id": item["link_id"], "label": item["label"], "state": "ok", "info_hash": str(entry["info_hash"])})
+            else:
+                results.append({
+                    "link_id": item["link_id"], "label": item["label"], "state": "failed",
+                    "message": _cloud_sanitize_message(entry.get("message")) or "115 未接受该链接",
+                })
+    return results, ""
+
+
+def _cloud_today_submitted() -> int:
+    """How many tasks *this* user submitted today. The daily cap is a
+    per-user budget, not a shared one.
+
+    For the administrator during the migration window the legacy
+    ``cloud_download_task`` table still counts: tasks submitted before this
+    release -- or before ``--auth-migrate --apply`` copies them -- exist only
+    there, and a cap that forgot them would let today's budget be spent
+    twice. Counted by info_hash across both tables, so a task the new code
+    wrote to both is one task.
+    """
+    day_start = int(datetime.now(_CLOUD_TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    user = _acting_user()
+    with connect_db() as db:
+        if _writes_legacy_cloud_task():
+            row = db.execute(
+                "SELECT COUNT(*) FROM ("
+                "  SELECT info_hash FROM user_cloud_download_task WHERE user_id=? AND submitted_at >= ?"
+                "  UNION SELECT info_hash FROM cloud_download_task WHERE submitted_at >= ?)",
+                (user.id if user else 0, day_start, day_start),
+            ).fetchone()
+        else:
+            row = db.execute(
+                "SELECT COUNT(*) FROM user_cloud_download_task WHERE user_id=? AND submitted_at >= ?",
+                (user.id if user else 0, day_start),
+            ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def _linkcheck_settings_dict() -> dict:
@@ -2212,8 +3450,22 @@ _library_linkchecker_started = False
 _library_linkchecker_lock = threading.Lock()
 
 
+def _read_only_cli() -> bool:
+    """Whether this process was started for a command that must not write.
+
+    `init_db()` runs at import and creates tables; a dry run that reports
+    "would create 8 tables" after creating them is not a dry run (R10). The
+    check is deliberately narrow: only `--auth-migrate` without `--apply`.
+    Every other entry point, gunicorn's worker import included, still
+    initialises as before.
+    """
+    argv = sys.argv[1:]
+    return bool(argv) and argv[0] == "--auth-migrate" and "--apply" not in argv
+
+
 app = Flask(__name__)
-init_db()
+if not _read_only_cli():
+    init_db()
 if __name__ != "__main__":
     # gunicorn imports this module as "app" at worker init, so this runs
     # once per worker before it ever serves a request -- the CLI (which
@@ -2236,12 +3488,24 @@ def before_request() -> None:
     if request.path == "/healthz":
         # A Tunnel connection commonly arrives from loopback, so remote_addr
         # alone cannot distinguish a public request from a local curl.
+        #
+        # What this means per mode, deliberately (R14): under `access` the
+        # probe must present an Access assertion, so an unauthenticated
+        # request -- loopback or not -- is 401. Under `hybrid`/`app` the site
+        # is no longer wholly behind that policy and the probe answers 200
+        # without one: a liveness endpoint that reveals nothing is the point
+        # of having it. It carries no user data in any mode.
         if AUTH_MODE in {"local", "disabled"}:
             g.principal = {"sub": "local", "email": "local"}
         else:
             require_access()
         return
     require_access()
+    # Before check_csrf() below: a token minted for a session is bound to it.
+    _load_auth_session()
+    denied = authorize_request()
+    if denied is not None:
+        return denied
     # Started only after a request has cleared authentication, so an
     # unauthenticated/rejected request never triggers this side effect.
     _ensure_library_enricher_started()
@@ -2275,12 +3539,883 @@ def healthz():
 
 @app.get("/")
 def index():
-    return render_template("index.html", asset_version=ASSET_VERSION, public_origin=PUBLIC_ORIGIN)
+    """The application shell, built for who is asking.
+
+    What a member may not use is not rendered at all -- not hidden with CSS,
+    not left in the DOM for a devtools toggle to reveal (plan §13). The
+    server-side gate in `authorize_request` is still the boundary; this is
+    what keeps the page honest about it.
+    """
+    user = current_user()
+    if user is None:
+        caps = auth_service.capabilities(role="member", allow_member_re0_unlock=False,
+                                         has_115_cookie=False, has_115_open=False)
+    else:
+        # R04: the real state, not a placeholder. A page built on "nobody has
+        # 115" renders no dialogs, and then the buttons that open them have
+        # nothing to open.
+        has_cookie, has_open = _user_115_state(user.id, user.role)
+        caps = auth_service.capabilities(
+            role=user.role, allow_member_re0_unlock=allow_member_re0_unlock(),
+            has_115_cookie=has_cookie, has_115_open=has_open)
+    return render_template("index.html", asset_version=ASSET_VERSION,
+                           public_origin=PUBLIC_ORIGIN, capabilities=caps)
+
+
+# The artwork's copy lives in two `settings` rows -- no new table, and no
+# dependency on the media-library bundle being installed.
+_LOGIN_ARTWORK_SETTING = "login_artwork_24_urls_json"
+_LOGIN_ARTWORK_AT_SETTING = "login_artwork_24_fetched_at"
+
+
+def _login_artwork_read():
+    raw = setting_get(_LOGIN_ARTWORK_SETTING, "") or ""
+    if not raw:
+        return None
+    try:
+        urls = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(urls, list):
+        return None
+    try:
+        fetched_at = int(setting_get(_LOGIN_ARTWORK_AT_SETTING, "0") or "0")
+    except ValueError:
+        return None
+    return urls, fetched_at
+
+
+def _login_artwork_write(urls, now: int) -> None:
+    setting_set(_LOGIN_ARTWORK_SETTING, json.dumps(list(urls)))
+    setting_set(_LOGIN_ARTWORK_AT_SETTING, str(int(now)))
+
+
+_LOGIN_ARTWORK_FAILED_SETTING = "login_artwork_failed_at"
+
+
+def _login_artwork_read_failure():
+    try:
+        failed_at = int(setting_get(_LOGIN_ARTWORK_FAILED_SETTING, "0") or "0")
+    except ValueError:
+        return None
+    return failed_at or None
+
+
+def _login_artwork_write_failure(now: int) -> None:
+    setting_set(_LOGIN_ARTWORK_FAILED_SETTING, str(int(now)))
+
+
+@app.get("/login")
+def login_page():
+    """The sign-in / apply page.
+
+    It renders in every mode. Today the whole site is still behind
+    Cloudflare Access, so only the administrator can reach it; it becomes the
+    public entrance when `HIDRIVE_AUTH_MODE` moves to `app` (plan §5.1), and
+    that switch is a separate, human step.
+    """
+    return render_template("login.html", asset_version=ASSET_VERSION, public_origin=PUBLIC_ORIGIN)
+
+
+# Plan §11.2: the exact wording TMDB asks for. Rendered on the page; the key
+# itself never leaves this process.
+TMDB_ATTRIBUTION = "This product uses the TMDB API but is not endorsed or certified by TMDB."
+
+
+@app.get("/api/auth/bootstrap")
+def api_auth_bootstrap():
+    """Everything the login page needs and nothing else.
+
+    A pre-auth CSRF token, whether applications are open, the administrator
+    hint, the attribution line, and cached poster URLs. No setting, no
+    credential, no TMDB key, and no reason for the artwork to be missing --
+    the page simply draws its own gradient when the list is empty.
+    """
+    urls, source = ([], "unavailable")
+    try:
+        urls, source = library_tmdb.login_artwork(
+            api_key=config_value("tmdb_api_key", "TMDB_API_KEY"),
+            session=_tmdb_session_factory(), now=utc_now(),
+            read_cache=_login_artwork_read, write_cache=_login_artwork_write,
+            read_failure=_login_artwork_read_failure, write_failure=_login_artwork_write_failure,
+        )
+    except Exception as exc:  # noqa: BLE001 - artwork must never block signing in
+        LOG.warning("login artwork unavailable: %s", type(exc).__name__)
+    return jsonify({
+        "success": True,
+        "csrf": csrf_token(),
+        "registration_open": True,
+        "admin_email_hint": "管理员请使用 Google 登录",
+        "artwork": urls,
+        "artwork_source": source,
+        "tmdb_attribution": TMDB_ATTRIBUTION,
+    })
 
 
 @app.get("/api/csrf")
 def api_csrf():
     return jsonify({"success": True, "token": csrf_token()})
+
+
+def _readonly_db() -> sqlite3.Connection:
+    """A connection that cannot write, for the dry run. Opening the file
+    read-only also means no directory is created and no WAL appears."""
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _auth_migration_plan(db) -> dict:
+    """What `ensure_schema()` would add, worked out by reading rather than
+    by adding it and counting afterwards."""
+    existing = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    tables = [name for name in auth_service.NEW_TABLES if name not in existing]
+    columns = []
+    for table, column, _column_type in auth_service.EXTENDED_TABLES:
+        if table not in existing:
+            continue
+        present = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            columns.append(f"{table}.{column}")
+    return {"tables_to_create": tables, "columns_to_add": columns}
+
+
+_PROFILE_MIGRATION_FIELDS = ("open_root_cid", "default_target_cid", "default_target_label")
+
+
+def _profile_migration_plan(db, admin_id: int | None) -> dict:
+    """Whether the administrator's ``user_115_profile`` row would be copied.
+
+    Read-only, and the *same* decision the apply makes, so "dry-run then
+    decide" is trustworthy (G05). It also has to work on a database the new
+    columns were only just added to (G04): every record in such a database has
+    ``migrated_at`` NULL, including rows an older branch's migration already
+    filled and the administrator has since edited. Treating "no marker" as "no
+    data" put the old global values back over their choices.
+
+    The order of evidence, most reliable first -- never a guess from whether a
+    value happens to equal a default:
+
+    1. ``migrated_at`` is set: this branch migrated it. Skip.
+    2. The row already carries any of the three fields this migration writes:
+       somebody -- an older migration, or the administrator -- put it there.
+       Skip and record the marker, so the answer is unambiguous next time.
+    3. The administrator already holds a migrated ``user_secret``: a previous
+       apply ran (the secrets and the profile are copied by the same command),
+       so the empty folder fields are a deliberate clearing. Skip and mark.
+    4. Otherwise: nothing has ever been migrated. Copy.
+    """
+    plan = {"exists": False, "marked": False, "has_fields": False, "secrets_migrated": False,
+            "would_copy": True, "reason": "first migration", "backfill_marker": False,
+            "readable": True}
+    tables = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if admin_id is None or "user_115_profile" not in tables:
+        return plan
+    columns = {row[1] for row in db.execute("PRAGMA table_info(user_115_profile)")}
+    present = [name for name in _PROFILE_MIGRATION_FIELDS if name in columns]
+    selected = ", ".join(present) if present else "user_id"
+    has_marker_column = "migrated_at" in columns
+    marker = ", migrated_at" if has_marker_column else ""
+    row = db.execute(f"SELECT {selected}{marker} FROM user_115_profile WHERE user_id=?", (admin_id,)).fetchone()
+    if row is None:
+        return plan
+    plan["exists"] = True
+    plan["marked"] = bool(has_marker_column and row["migrated_at"] is not None)
+    plan["has_fields"] = any(row[name] for name in present)
+    if "user_secret" in tables:
+        plan["secrets_migrated"] = db.execute(
+            "SELECT 1 FROM user_secret WHERE user_id=? LIMIT 1", (admin_id,)).fetchone() is not None
+    if plan["marked"]:
+        plan.update(would_copy=False, reason="already migrated by this branch")
+    elif plan["has_fields"]:
+        plan.update(would_copy=False, backfill_marker=True,
+                    reason="pre-existing configuration from an earlier migration or the administrator")
+    elif plan["secrets_migrated"]:
+        plan.update(would_copy=False, backfill_marker=True,
+                    reason="an earlier apply already ran; the empty folder fields are a deliberate clearing")
+    return plan
+
+
+def run_auth_migrate_dry_run() -> int:
+    """Report what an apply would do, touching nothing.
+
+    Reads through a read-only connection and reports presence only -- never
+    a value, never a ciphertext, never a hash of a plaintext.
+    """
+    report: dict = {"ok": True, "dry_run": True, "items": {}}
+    try:
+        db = _readonly_db()
+    except sqlite3.OperationalError:
+        report["items"]["database"] = {"present": False}
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
+    try:
+        report["items"]["schema"] = _auth_migration_plan(db)
+        tables = {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        admin_present = False
+        if "auth_user" in tables:
+            admin_present = db.execute(
+                "SELECT 1 FROM auth_user WHERE email_norm=?",
+                (auth_service.normalize_email(ADMIN_EMAIL),)).fetchone() is not None
+        report["items"]["admin_user"] = {"existed": admin_present, "would_create": not admin_present}
+
+        stored = set()
+        if "secrets" in tables:
+            stored = {row["name"] for row in db.execute("SELECT name FROM secrets")}
+        already: set = set()
+        if "user_secret" in tables and admin_present:
+            already = {row["name"] for row in db.execute(
+                "SELECT s.name AS name FROM user_secret s JOIN auth_user u ON u.id = s.user_id "
+                "WHERE u.email_norm=?", (auth_service.normalize_email(ADMIN_EMAIL),))}
+        for legacy, target in (("115_cookie", user_115.COOKIE_SECRET),
+                               ("115_open_access_token", user_115.OPEN_ACCESS_SECRET),
+                               ("115_open_refresh_token", user_115.OPEN_REFRESH_SECRET)):
+            report["items"][target] = {
+                "present": legacy in stored,
+                "already_migrated": target in already,
+                "would_copy": legacy in stored and target not in already,
+            }
+
+        # F08: per task and per administrator. Subtracting one table's total
+        # row count from another's counted every *other* user's tasks as
+        # already-migrated work, so one outstanding legacy task beside one
+        # unrelated member task reported would_copy=0 while the apply copied 1.
+        legacy_hashes: set[str] = set()
+        if "cloud_download_task" in tables:
+            legacy_hashes = {row["info_hash"] for row in db.execute("SELECT info_hash FROM cloud_download_task")}
+        admin_hashes: set[str] = set()
+        if "user_cloud_download_task" in tables and admin_present:
+            admin_hashes = {row["info_hash"] for row in db.execute(
+                "SELECT t.info_hash AS info_hash FROM user_cloud_download_task t "
+                "JOIN auth_user u ON u.id = t.user_id WHERE u.email_norm=?",
+                (auth_service.normalize_email(ADMIN_EMAIL),))}
+        outstanding = legacy_hashes - admin_hashes
+        report["items"]["cloud_download_task"] = {
+            "source_rows": len(legacy_hashes),
+            "already_migrated": len(legacy_hashes & admin_hashes),
+            "would_copy": len(outstanding),
+        }
+        # F07: the same marker the apply reads, so dry-run and apply agree on
+        # whether the profile would be copied or skipped.
+        # G05: never SELECT a column without checking the structure first --
+        # an old database has the table and not the column, and the point of a
+        # dry run is that it works *before* the apply.
+        admin_row = None
+        if "auth_user" in tables:
+            admin_row = db.execute("SELECT id FROM auth_user WHERE email_norm=?",
+                                   (auth_service.normalize_email(ADMIN_EMAIL),)).fetchone()
+        try:
+            profile_plan = _profile_migration_plan(db, int(admin_row["id"]) if admin_row else None)
+        except sqlite3.DatabaseError as exc:
+            # An unknown structure gets a structured answer, not a bare SQL
+            # traceback, and the run still writes nothing.
+            profile_plan = {"readable": False, "would_copy": None,
+                            "reason": f"cannot be read on this schema: {type(exc).__name__}"}
+        report["items"]["user_115_profile"] = {
+            "already_migrated": (profile_plan.get("marked") or profile_plan.get("has_fields")
+                                 or profile_plan.get("secrets_migrated") or False),
+            "would_copy": profile_plan["would_copy"],
+            "reason": profile_plan["reason"],
+            "readable": profile_plan.get("readable", True),
+        }
+        report["items"]["left_global"] = ["oauth_tokens", "tmdb", "openlist", "media-library.db"]
+    finally:
+        db.close()
+    print(json.dumps(report, ensure_ascii=False))
+    return 0
+
+
+def run_auth_migrate(*, apply: bool) -> int:
+    """Copy the administrator's existing configuration into the per-user
+    tables (plan §8). Explicit, idempotent, and a copy -- never a move.
+
+    What it reports per item is "present/missing, rows copied, and whether the
+    value decrypted back equal in this process". It never prints a plaintext,
+    a ciphertext, or a hash of a plaintext: re-encryption uses a fresh nonce,
+    so identical ciphertext is not a success criterion and identical hashes
+    would themselves leak.
+
+    Nothing here runs at startup, and nothing here deletes or rewrites the
+    old global rows: a rollback to the previous release still reads them.
+    """
+    now = utc_now()
+    report: dict = {"ok": True, "dry_run": not apply, "items": {}}
+    fernet = load_fernet()
+
+    with connect_db() as db:
+        auth_service.ensure_schema(db)
+        admin_row = db.execute("SELECT id FROM auth_user WHERE email_norm=?",
+                               (auth_service.normalize_email(ADMIN_EMAIL),)).fetchone()
+        admin_id = int(admin_row["id"]) if admin_row else None
+        if admin_id is None and apply:
+            admin_id = auth_service.ensure_admin_user(db, email=ADMIN_EMAIL, now=now)
+        report["items"]["admin_user"] = {"existed": admin_row is not None, "created": apply and admin_row is None}
+
+        # G04/G05: decided before this run copies anything. One of the pieces
+        # of evidence is "the administrator already has migrated secrets", and
+        # the secret copy below is part of *this* run -- reading it afterwards
+        # would let a run conclude that it had already happened. Computing it
+        # here is also what makes the dry run's answer the apply's answer.
+        profile_plan = _profile_migration_plan(db, admin_id)
+
+        # Step A + step B credentials, re-encrypted under the same master key.
+        secret_map = (
+            ("115_web_cookie", config_value("115_cookie", "ENV_115_COOKIES")),
+            ("115_open_access_token", config_value("115_open_access_token", "115_open_access_token")),
+            ("115_open_refresh_token", config_value("115_open_refresh_token", "115_open_refresh_token")),
+        )
+        for name, value in secret_map:
+            entry = {"present": bool(value), "copied": 0, "skipped": 0, "verified": None}
+            if value and apply and admin_id is not None:
+                # R11: a first copy, never an overwrite. By the time this runs
+                # again the administrator may have re-scanned or refreshed;
+                # putting the old global value back over it would undo that
+                # silently. The legacy row stays where it is either way, so a
+                # rollback still finds it.
+                existing = db.execute("SELECT 1 FROM user_secret WHERE user_id=? AND name=?",
+                                      (admin_id, name)).fetchone()
+                if existing is not None:
+                    entry["skipped"] = 1
+                    entry["reason"] = "already migrated; refusing to overwrite a newer value"
+                else:
+                    db.execute(
+                        "INSERT INTO user_secret(user_id, name, ciphertext, updated_at) VALUES(?,?,?,?)",
+                        (admin_id, name, fernet.encrypt(value.encode("utf-8")), now),
+                    )
+                    stored = db.execute("SELECT ciphertext FROM user_secret WHERE user_id=? AND name=?",
+                                        (admin_id, name)).fetchone()
+                    entry["copied"] = 1
+                    entry["verified"] = fernet.decrypt(bytes(stored["ciphertext"])).decode("utf-8") == value
+                    if name == user_115.OPEN_ACCESS_SECRET:
+                        # F02: this pair came from OpenList and OpenList still
+                        # rotates it. Recording that is what lets the recovery
+                        # path re-sync from there instead of presenting the
+                        # refresh token to 115 itself -- two systems rotating
+                        # one credential is how you lose it.
+                        user_115.remember_open_origin(db, admin_id, user_115.ORIGIN_OPENLIST_LEGACY, now=now)
+            report["items"][name] = entry
+
+        root_cid = setting_get("115_open_root_cid", None)
+        # R17: the stored default is `115_target_pid` -- the name the rest of
+        # the app reads and writes. Looking for `115_target_cid` found
+        # nothing, so the administrator's default folder was silently lost.
+        target_cid = setting_get("115_target_pid", None)
+        target_label = setting_get("115_target_path", None) or setting_get("cloud_download_target_path", None)
+        entry = {"root_cid_present": bool(root_cid), "target_present": bool(target_cid),
+                 "copied": 0, "skipped": 0}
+        if apply and admin_id is not None:
+            if not profile_plan["would_copy"]:
+                # R11 + F07 + G04: migrated before -- by this branch, by an
+                # older one, or evidenced by the secrets an earlier apply
+                # copied. Whether the administrator has since chosen a
+                # different folder or cleared it, both are their decision.
+                entry["skipped"] = 1
+                entry["reason"] = profile_plan["reason"]
+                if profile_plan["backfill_marker"]:
+                    # Make the answer unambiguous from now on, without
+                    # touching any of their values.
+                    db.execute("UPDATE user_115_profile SET migrated_at=?, updated_at=? WHERE user_id=?",
+                               (now, now, admin_id))
+                    entry["marker_backfilled"] = 1
+            else:
+                db.execute(
+                    "INSERT INTO user_115_profile(user_id, open_root_cid, default_target_cid, "
+                    "default_target_label, migrated_at, updated_at) VALUES(?,?,?,?,?,?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET open_root_cid=excluded.open_root_cid, "
+                    "default_target_cid=excluded.default_target_cid, "
+                    "default_target_label=excluded.default_target_label, "
+                    "migrated_at=excluded.migrated_at, updated_at=excluded.updated_at",
+                    (admin_id, root_cid, target_cid, target_label, now, now),
+                )
+                entry["copied"] = 1
+        report["items"]["user_115_profile"] = entry
+
+        legacy_tasks = db.execute("SELECT * FROM cloud_download_task").fetchall()
+        entry = {"source_rows": len(legacy_tasks), "copied": 0}
+        if apply and admin_id is not None:
+            copied = 0
+            for task in legacy_tasks:
+                # R17: carry the origin annotation across too -- the list
+                # shows which release and which link a task came from, and a
+                # migration that drops them loses it for every old task.
+                cursor = db.execute(
+                    "INSERT INTO user_cloud_download_task(user_id, info_hash, source_kind, media_id, display_title, "
+                    "group_id, link_label, submitted_at, last_seen_at, state) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(user_id, info_hash) DO NOTHING",
+                    (admin_id, task["info_hash"], "legacy", task["media_id"], task["media_title"],
+                     task["group_id"], task["link_label"],
+                     task["submitted_at"], task["last_seen_at"], str(task["last_status"] or "")),
+                )
+                copied += cursor.rowcount or 0
+            # R17: what this run actually copied, not how many rows the table
+            # happens to hold.
+            entry["copied"] = copied
+            entry["skipped"] = len(legacy_tasks) - copied
+        report["items"]["cloud_download_task"] = entry
+
+        # Left global on purpose (plan §8.6): RE0 OAuth, TMDB, OpenList, the
+        # media library. They are not per-user data.
+        report["items"]["left_global"] = ["oauth_tokens", "tmdb", "openlist", "media-library.db"]
+        if not apply:
+            db.rollback()
+
+    report["ok"] = all(
+        item.get("verified") is not False for item in report["items"].values() if isinstance(item, dict)
+    )
+    print(json.dumps(report, ensure_ascii=False))
+    return 0 if report["ok"] else 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-user Phase 1: applications, approval, sessions and the member policy.
+# Every write here goes through before_request's CSRF check like any other.
+# ---------------------------------------------------------------------------
+
+
+def _user_115_state(user_id: int, role: str) -> tuple[bool, bool]:
+    """Whether this user has finished step A (web cookie) and step B (OpenAPI
+    token). Read from that user's own rows -- never from another user's.
+
+    The administrator may reuse legacy credentials independently for each
+    step, unless that step was explicitly disconnected. A member never takes
+    that compatibility path (plan §9.1).
+    """
+    if role == "admin":
+        # A Cookie-only user slot must not hide the administrator's existing
+        # OpenList pair. Resolve the two steps independently, including disconnects.
+        user = auth_service.CurrentUser(id=user_id, email="", role=role, status="active")
+        status = _open115_status(user)
+        return status["transfer"]["state"] == "connected", status["browse"]["state"] == "connected"
+    with connect_db() as db:
+        names = {row["name"] for row in db.execute("SELECT name FROM user_secret WHERE user_id=?", (user_id,))}
+    if names:
+        return "115_web_cookie" in names, "115_open_access_token" in names
+    return False, False
+
+
+def _me_payload(user) -> dict:
+    has_cookie, has_open = _user_115_state(user.id, user.role)
+    payload = {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role,
+        "capabilities": auth_service.capabilities(
+            role=user.role,
+            allow_member_re0_unlock=allow_member_re0_unlock(),
+            has_115_cookie=has_cookie,
+            has_115_open=has_open,
+        ),
+    }
+    if user.role == "admin":
+        # R09: the policy's own value, distinct from "may I unlock" -- the
+        # administrator always may, which is why their capability could not
+        # stand in for the switch.
+        payload["allow_member_re0_unlock"] = allow_member_re0_unlock()
+    return payload
+
+
+def _session_cookie(response, token: str):
+    response.set_cookie(
+        SESSION_COOKIE_NAME, token, max_age=auth_service.SESSION_MAX_SECONDS,
+        secure=True, httponly=True, samesite="Lax", path="/",
+    )
+    return response
+
+
+def _request_ip_hash() -> str:
+    return hashlib.sha256((request.headers.get("Cf-Connecting-Ip") or request.remote_addr or "").encode()).hexdigest()
+
+
+def _open115_config() -> "user_115.OpenAppConfig":
+    """HiDrive-Lite's own 115 application, if it has one.
+
+    Deployment configuration, not a user's: the client id may be read by the
+    server, the secret only ever leaves it towards 115, and neither reaches a
+    browser (plan §9.1). With nothing configured, step B reports itself
+    blocked rather than pretending to be one click away.
+    """
+    return user_115.OpenAppConfig(
+        client_id=config_value("115_open_client_id", "HIDRIVE_115_OPEN_CLIENT_ID"),
+        client_secret=config_value("115_open_client_secret", "HIDRIVE_115_OPEN_CLIENT_SECRET"),
+        redirect_uri=(setting_get("115_open_redirect_uri", "") or "").strip() or None,
+        device_flow_verified=(setting_get("115_open_device_flow_verified", "0") or "0").strip() in {"1", "true"},
+    )
+
+
+def _open115_device_blocked(config):
+    # The settings UI promises an APP-scanned device flow. An OAuth-code
+    # configuration alone does not provide that end-to-end flow.
+    return config.blocked_reason() or (
+        user_115.BLOCKED_NO_VERIFICATION if config.flow() != user_115.FLOW_DEVICE_PKCE else None)
+
+
+def _open115_status(user) -> dict:
+    """Step A and step B as the settings page words them: by capability, with
+    no hint of what is stored (plan §4.2)."""
+    with connect_db() as db:
+        credentials = user_115.credentials_for(db, user.id, fernet=load_fernet())
+        row = user_115.profile(db, user.id)
+    # The administrator's legacy global cookie counts as their step A until
+    # --auth-migrate copies it across.
+    has_cookie = credentials.has_cookie or bool(user_115_cookie(user))
+    has_open = credentials.has_open_token
+    origin = (row["open_token_origin"] if row is not None else None) or (
+        user_115.ORIGIN_OPENLIST_LEGACY if user.role == "admin" else user_115.ORIGIN_OWN_APP)
+    source = ("openlist" if origin == user_115.ORIGIN_OPENLIST_LEGACY else "scan") if has_open else None
+    if (user.role == "admin" and not credentials.access_token
+            and (row is None or row["open_state"] != user_115.STATE_DISCONNECTED)):
+        access, refresh = _legacy_open_pair()
+        has_open = bool(access and refresh)
+        source = "openlist" if has_open else None
+    blocked = _open115_device_blocked(_open115_config())
+    return {
+        "transfer": {
+            "state": "connected" if has_cookie else "unconfigured",
+            "label": "已连接" if has_cookie else "待连接",
+            "checked_at": iso(row["cookie_checked_at"]) if row else None,
+            "error_code": (row["cookie_error_code"] if row else None),
+        },
+        "browse": {
+            "state": "connected" if has_open else ("blocked" if blocked else "unconfigured"),
+            "label": "已连接" if has_open else "待连接",
+            "source": source,
+            "blocked_reason": blocked,
+            "expires_at": iso(row["open_expires_at"]) if row else None,
+            "error_code": (row["open_error_code"] if row else None),
+        },
+        "summary": "全部可用" if has_cookie and has_open else "基础可用" if has_cookie else "待连接",
+        "flow": _open115_config().flow(),
+    }
+
+
+@app.get("/api/me/115/status")
+@require_login
+def api_me_115_status():
+    return jsonify({"success": True, **_open115_status(current_user())})
+
+
+@app.post("/api/me/115/open/start")
+@require_login
+def api_me_115_open_start():
+    """Begin step B -- or say plainly why it cannot begin.
+
+    While the application is unapproved this is the whole of step B: it
+    refuses with the blocking reason and writes nothing. It never falls back
+    to OpenList's web-login QR, to a public token broker, or to the
+    administrator's token (plan §17).
+    """
+    config = _open115_config()
+    blocked = _open115_device_blocked(config)
+    if blocked:
+        return jsonify({
+            "success": False, "code": blocked.upper(), "blocked_reason": blocked,
+            "message": "115 开放平台授权尚未开通，暂时无法授权目录与云下载。",
+        }), 409
+    user = current_user()
+    fernet = load_fernet()
+    try:
+        with requests.Session() as session:
+            flow = user_115.DeviceAuthorization(connect_db, fernet=fernet,
+                adapter=user_115.Open115Adapter(config, session=session), config=config, clock=utc_now)
+            started = flow.start(user.id)
+    except user_115.Open115Error as exc:
+        return _open115_flow_error(exc)
+    with connect_db() as db:
+        audit("115.open.start", "ok", f"user {user.id} flow {config.flow()}", actor_id(), db=db)
+    return jsonify({"success": True, "flow": user_115.FLOW_DEVICE_PKCE, **started})
+
+
+def _open115_flow_error(exc):
+    status = {"invalid_challenge": 404, "invalid_user": 403,
+              "rate_limited": 429, "flow_not_available": 409}.get(exc.error_class, 502)
+    response = json_error("115 授权未完成，请稍后重新扫码。", status, "OPEN115_" + exc.error_class.upper())
+    if status == 429:
+        response = app.make_response(response)
+        response.headers["Retry-After"] = "10"
+    return response
+
+
+@app.post("/api/me/115/open/status")
+@require_login
+def api_me_115_open_status():
+    # This may consume a device code and save credentials: POST + the common
+    # CSRF guard, never a GET that a cross-site image could trigger.
+    body = request_json()
+    config = _open115_config()
+    try:
+        with requests.Session() as session:
+            flow = user_115.DeviceAuthorization(connect_db, fernet=load_fernet(),
+                adapter=user_115.Open115Adapter(config, session=session), config=config, clock=utc_now)
+            status = flow.poll(current_user().id, body.get("challenge_id"))
+    except user_115.Open115Error as exc:
+        return _open115_flow_error(exc)
+    return jsonify({"success": True, "status": status, "retry_after": 2})
+
+
+@app.post("/api/me/115/open/cancel")
+@require_login
+def api_me_115_open_cancel():
+    body = request_json()
+    config = _open115_config()
+    flow = user_115.DeviceAuthorization(connect_db, fernet=load_fernet(),
+        adapter=None, config=config, clock=utc_now)
+    try:
+        status = flow.cancel(current_user().id, body.get("challenge_id"))
+    except user_115.Open115Error as exc:
+        return _open115_flow_error(exc)
+    return jsonify({"success": True, "status": status})
+
+
+@app.post("/api/me/115/disconnect")
+@require_login
+def api_me_115_disconnect():
+    """Forget one step's credentials. Naming one never touches the other
+    (plan §4.2): disconnecting the cookie must not cost somebody their
+    OpenAPI authorisation."""
+    body = request_json()
+    step = str(body.get("step") or "").strip()
+    if step not in {"transfer", "browse"}:
+        return json_error("step 必须是 transfer 或 browse", 400, "BAD_REQUEST")
+    user = current_user()
+    names = ((user_115.COOKIE_SECRET,) if step == "transfer"
+             else (user_115.OPEN_ACCESS_SECRET, user_115.OPEN_REFRESH_SECRET))
+    now = utc_now()
+    with connect_db() as db:
+        removed = user_115.secret_clear(db, user.id, *names)
+        if step == "transfer":
+            user_115.remember_cookie_state(db, user.id, state=user_115.STATE_DISCONNECTED,
+                                           error_code=None, now=now)
+        else:
+            user_115.remember_open_state(db, user.id, state=user_115.STATE_DISCONNECTED,
+                                         expires_at=None, error_code=None, now=now)
+        audit("115.disconnect", "ok", f"user {user.id} step {step} removed {removed}", actor_id(), db=db)
+    return jsonify({"success": True, "step": step, "removed": removed})
+
+
+@app.get("/api/me")
+@require_login
+def api_me():
+    return jsonify({"success": True, **_me_payload(current_user())})
+
+
+@app.post("/api/auth/register")
+def api_auth_register():
+    """An application, nothing more: it creates a pending member and no
+    session. Role and status are never read from the body (plan §17)."""
+    body = request_json()
+    email = str(body.get("email") or "")
+    password = str(body.get("password") or "")
+    confirm = str(body.get("confirm_password") or password)
+    display_name = (str(body.get("display_name") or "").strip() or None)
+    if password != confirm:
+        return json_error("两次输入的密码不一致", 400, "PASSWORD_MISMATCH")
+    now = utc_now()
+    # Counted and closed before anything expensive happens: hashing a
+    # password while holding this write lock would let a flood of attempts
+    # serialise behind it (R13).
+    with connect_db() as db:
+        allowed = auth_service.within_attempt_limits(
+            db, "register", ip=_request_ip_hash(),
+            email_norm=auth_service.normalize_email(email), now=now)
+    if not allowed:
+        return json_error("申请过于频繁，请稍后再试", 429, "RATE_LIMITED")
+    with connect_db() as db:
+        try:
+            user_id = auth_service.create_pending_user(
+                db, email=email, password=password, display_name=display_name, now=now, admin_email=ADMIN_EMAIL
+            )
+        except auth_service.PasswordRejected as exc:
+            return json_error(_PASSWORD_MESSAGES.get(exc.reason, "密码不符合要求"), 400, "PASSWORD_REJECTED")
+        except (auth_service.EmailTaken, auth_service.EmailReserved):
+            # One answer either way: whether an address is already registered
+            # is not something an anonymous caller may enumerate.
+            audit("auth.register", "rejected", "email unavailable", "", db=db)
+            return jsonify({"success": True, "status": "pending"}), 202
+        audit("auth.register", "ok", f"user {user_id}", "", db=db)
+    return jsonify({"success": True, "status": "pending"}), 202
+
+
+_PASSWORD_MESSAGES = {
+    "too_short": "密码至少 8 位",
+    "too_long": "密码最多 128 位",
+    "needs_upper": "密码需要至少一个大写字母",
+    "needs_lower": "密码需要至少一个小写字母",
+    "needs_digit": "密码需要至少一个数字",
+    "bad_email": "邮箱格式不正确",
+}
+
+
+@app.post("/api/auth/login")
+def api_auth_login():
+    body = request_json()
+    email = str(body.get("email") or "")
+    password = str(body.get("password") or "")
+    email_norm = auth_service.normalize_email(email)
+    now = utc_now()
+    with connect_db() as db:
+        allowed = auth_service.within_attempt_limits(
+            db, "login", ip=_request_ip_hash(), email_norm=email_norm, now=now)
+    if not allowed:
+        # Refused before the scrypt comparison: the cost of an attempt is
+        # exactly what the limit exists to bound.
+        return json_error("尝试过于频繁，请稍后再试", 429, "RATE_LIMITED")
+    with connect_db() as db:
+        result = auth_service.authenticate(db, email=email, password=password, now=now)
+        if not result.ok:
+            # The precise reason goes to the audit trail only.
+            audit("auth.login", "rejected", result.audit_reason, "", db=db)
+            return json_error(result.message, 401, "LOGIN_FAILED")
+        issued = auth_service.issue_session(db, result.user_id, now=now, ip_hash=_request_ip_hash())
+        row = auth_service.find_user(db, result.user_id)
+        audit("auth.login", "ok", f"user {result.user_id}", str(result.user_id), db=db)
+    user = auth_service.CurrentUser(id=int(row["id"]), email=row["email_display"],
+                                    role=row["role"], status=row["status"])
+    response = jsonify({"success": True, **_me_payload(user)})
+    return _session_cookie(response, issued.token)
+
+
+def _safe_next(raw: str | None) -> str:
+    """A site-relative path, or the home page.
+
+    Anything else -- an absolute URL, a protocol-relative ``//host``, a
+    scheme, a backslash -- is discarded rather than corrected. This is the
+    only place a redirect target comes from user input (plan §5.2's
+    open-redirect rule).
+    """
+    candidate = (raw or "").strip()
+    if not candidate.startswith("/"):
+        return "/"
+    # `//host` is protocol-relative and `/\host` is treated the same way by
+    # several browsers; a backslash or a control character has no business in
+    # a path we are about to send someone to.
+    if candidate.startswith("//") or "\\" in candidate:
+        return "/"
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in candidate):
+        return "/"
+    return candidate
+
+
+@app.get("/auth/google")
+def auth_google():
+    """The administrator's way in, bridged from Cloudflare Access.
+
+    Access guards this path and its policy admits one address. The same
+    address is checked again here, because an edge policy is configuration
+    and configuration changes (plan §5.2). Both must agree.
+
+    The stable identity is Cloudflare's ``sub``; the email is used to
+    authorise and to display, never as a key -- an address can be reassigned,
+    a subject cannot.
+    """
+    principal = getattr(g, "principal", None) or {}
+    email = str(principal.get("email") or "").strip().casefold()
+    subject = str(principal.get("sub") or "").strip()
+    verified = principal.get("email_verified")
+    next_path = _safe_next(request.args.get("next"))
+
+    if not subject or not email:
+        audit("auth.google", "rejected", "no verified principal", "")
+        return json_error("需要通过 Cloudflare Access 登录", 401, "ACCESS_REQUIRED")
+    if verified is False:
+        # Google says this address is unverified; an unverified address is
+        # not an identity.
+        audit("auth.google", "rejected", "email not verified", "")
+        return json_error("该 Google 账号邮箱未验证", 403, "EMAIL_NOT_VERIFIED")
+    if email != ADMIN_EMAIL:
+        audit("auth.google", "rejected", "not the administrator address", "")
+        return json_error("该账号无权使用管理员入口", 403, "FORBIDDEN")
+
+    now = utc_now()
+    with connect_db() as db:
+        user_id = auth_service.ensure_admin_user(db, email=ADMIN_EMAIL, now=now)
+        auth_service.bind_identity(db, user_id=user_id, provider="cloudflare_google",
+                                   subject=subject, email=email, now=now)
+        # Plan §5.4 asks for the session to rotate on sign-in: the session
+        # this browser arrived with is replaced. Other devices keep theirs --
+        # signing in on a phone is not a reason to sign a desktop out (R21).
+        # Revoking everything is what disabling an account does.
+        previous = request.cookies.get(SESSION_COOKIE_NAME, "")
+        if previous:
+            auth_service.revoke_session(db, previous, now=now)
+        issued = auth_service.issue_session(db, user_id, now=now, ip_hash=_request_ip_hash())
+        audit("auth.google", "ok", f"user {user_id}", str(user_id), db=db)
+    response = redirect(next_path)
+    return _session_cookie(response, issued.token)
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    if token:
+        with connect_db() as db:
+            auth_service.revoke_session(db, token, now=utc_now())
+    response = jsonify({"success": True})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return response
+
+
+@app.get("/api/admin/users")
+@require_role("admin")
+def api_admin_users():
+    with connect_db() as db:
+        pending_count = db.execute("SELECT COUNT(*) FROM auth_user WHERE status='pending'").fetchone()[0]
+        if request.args.get("summary") == "1":
+            return jsonify({"success": True, "pending_count": pending_count})
+        rows = db.execute(
+            "SELECT id, email_display, display_name, role, status, created_at, approved_at, last_login_at "
+            "FROM auth_user ORDER BY (status='pending') DESC, created_at DESC LIMIT 500"
+        ).fetchall()
+    return jsonify({"success": True, "users": [dict(row) for row in rows], "pending_count": pending_count})
+
+
+def _admin_user_action(user_id: int, action: str):
+    admin = current_user()
+    now = utc_now()
+    with connect_db() as db:
+        row = auth_service.find_user(db, user_id)
+        if row is None:
+            return json_error("用户不存在", 404, "USER_NOT_FOUND")
+        if row["role"] == "admin":
+            return json_error("不能对管理员执行该操作", 400, "ADMIN_IMMUTABLE")
+        {"approve": auth_service.approve_user,
+         "reject": auth_service.reject_user,
+         "disable": auth_service.disable_user}[action](db, user_id, approver_id=admin.id, now=now)
+        audit(f"auth.{action}", "ok", f"user {user_id}", str(admin.id), db=db)
+        pending_count = db.execute("SELECT COUNT(*) FROM auth_user WHERE status='pending'").fetchone()[0]
+    return jsonify({"success": True, "id": user_id, "action": action, "pending_count": pending_count})
+
+
+@app.post("/api/admin/users/<int:user_id>/approve")
+@require_role("admin")
+def api_admin_user_approve(user_id: int):
+    return _admin_user_action(user_id, "approve")
+
+
+@app.post("/api/admin/users/<int:user_id>/reject")
+@require_role("admin")
+def api_admin_user_reject(user_id: int):
+    return _admin_user_action(user_id, "reject")
+
+
+@app.post("/api/admin/users/<int:user_id>/disable")
+@require_role("admin")
+def api_admin_user_disable(user_id: int):
+    return _admin_user_action(user_id, "disable")
+
+
+@app.patch("/api/admin/policies/re0")
+@require_role("admin")
+def api_admin_policy_re0():
+    """The one switch that lets members spend RE0 points. Default off; the
+    audit row keeps who changed it and from what (plan §10.2)."""
+    body = request_json()
+    value = body.get("allow_member_re0_unlock")
+    if not isinstance(value, bool):
+        return json_error("allow_member_re0_unlock 必须为布尔值", 400, "BAD_REQUEST")
+    before = allow_member_re0_unlock()
+    setting_set("allow_member_re0_unlock", "1" if value else "0")
+    audit("auth.policy.re0", "ok", f"{before} -> {value}", str(current_user().id))
+    return jsonify({"success": True, "allow_member_re0_unlock": value})
 
 
 @app.get("/api/status")
@@ -2312,6 +4447,12 @@ def api_settings():
         if isinstance(value, str) and value.strip():
             secret_set(key, value.strip())
             if key == "115_cookie":
+                # The read path prefers the administrator's *own* slot once a
+                # scan has filled it, so a cookie pasted here must land there
+                # too -- the same two-slot rule a scan follows -- or the page
+                # reports "saved, valid" while every transfer keeps using the
+                # older scanned value.
+                _store_settings_cookie(value.strip())
                 valid, label = remember_115_cookie_check(value.strip())
                 cookie_check = {"valid": valid, "label": label}
     if isinstance(body.get("115_target_pid"), str):
@@ -2411,9 +4552,34 @@ def api_settings():
                 setting_set(f"linkcheck_{code}_enabled", "1" if provider_enabled else "0")
             if cap_value is not None:
                 setting_set(f"linkcheck_{code}_daily_cap", str(cap_value))
+    if "cloud_download_enabled" in body:
+        cloud_enabled = _parse_bool_setting(body["cloud_download_enabled"])
+        if cloud_enabled is None:
+            return json_error("cloud_download_enabled 必须是布尔值或 0/1/true/false", 400, "BAD_REQUEST")
+        setting_set("cloud_download_enabled", "1" if cloud_enabled else "0")
+    for key, lo, hi in (("cloud_download_daily_cap", 0, _CLOUD_DAILY_CAP_MAX), ("cloud_download_per_submit_cap", 1, _CLOUD_PER_SUBMIT_CAP_MAX)):
+        if key in body:
+            value = body[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not (lo <= value <= hi):
+                return json_error(f"{key} 必须是 {lo}-{hi} 的整数", 400, "CLOUD_DOWNLOAD_SETTING_INVALID")
+            setting_set(key, str(value))
+    if "re0_streaming_top_sources" in body:
+        raw_sources = body["re0_streaming_top_sources"]
+        if not isinstance(raw_sources, str) or len(raw_sources) > 200:
+            return json_error("re0_streaming_top_sources 必须是不超过 200 字符的字符串", 400, "RE0_SETTING_INVALID")
+        setting_set("re0_streaming_top_sources", ",".join(":".join(t) for t in re0_sync.parse_top_sources(raw_sources)))
+    for key, lo, hi in (("re0_daily_request_cap", 1, re0_sync.SAFE_DAILY_CAP_MAX), ("re0_min_interval_ms", re0_sync.SAFE_MIN_INTERVAL_MS, 60000)):
+        if key in body:
+            value = body[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not (lo <= value <= hi):
+                return json_error(f"{key} 必须是 {lo}-{hi} 的整数", 400, "RE0_SETTING_INVALID")
+            setting_set(key, str(value))
+            _re0_client_reset()
     library_keys = {
         "115_target_pid", "tmdb_daily_budget", "tmdb_enrich_enabled", "tvmaze_hint_enabled",
         "linkcheck_enabled", "linkcheck_providers",
+        "cloud_download_enabled", "cloud_download_daily_cap", "cloud_download_per_submit_cap",
+        "re0_daily_request_cap", "re0_min_interval_ms", "re0_streaming_top_sources",
     }
     audit("settings.update", "success", ",".join(sorted(k for k in body if k in allowed or k in library_keys)), actor_id())
     payload: dict[str, object] = {"success": True, "message": "设置已保存"}
@@ -2427,6 +4593,312 @@ def api_settings():
 _LIBRARY_SORTS = {"relevance", "year_desc", "year_asc", "links_desc"}
 _LIBRARY_TYPES = {"all", "movie", "tv", "unknown"}
 _LIBRARY_YEAR_RE = re.compile(r"^(\d{4})(?:-(\d{4}))?$")
+
+
+# ---------------------------------------------------------------------------
+# RE0 federated search (spec docs/claude-re0-resource-sync-and-tv-follow-handoff-20260909.md §10.4)
+# ---------------------------------------------------------------------------
+
+_RE0_CLIENTS: dict[str, "re0_sync.Re0Client"] = {}
+_RE0_CLIENT_LOCK = threading.Lock()
+_RE0_DIRECT_PATH_RE = re.compile(r"^/api/open/[A-Za-z0-9_/\-]{1,80}$")
+
+
+def _re0_settings() -> dict:
+    def _int(name: str, env: str, default: int, lo: int, hi: int) -> int:
+        raw = setting_get(name) or os.getenv(env) or ""
+        try:
+            value = int(raw) if raw else default
+        except ValueError:
+            value = default
+        return min(max(value, lo), hi)
+    direct = (setting_get("re0_direct_search_path") or os.getenv("RE0_DIRECT_SEARCH_PATH") or "").strip()
+    if direct and not _RE0_DIRECT_PATH_RE.match(direct):
+        direct = ""
+    return {
+        "daily_cap": _int("re0_daily_request_cap", "RE0_SYNC_DAILY_REQUEST_CAP", re0_sync.DEFAULT_DAILY_CAP, 1, re0_sync.SAFE_DAILY_CAP_MAX),
+        "min_interval_ms": _int("re0_min_interval_ms", "RE0_SYNC_MIN_INTERVAL_MS", re0_sync.DEFAULT_MIN_INTERVAL_MS, re0_sync.SAFE_MIN_INTERVAL_MS, 60000),
+        "direct_search_path": direct,
+    }
+
+
+def _re0_conn_factory() -> sqlite3.Connection:
+    conn = sqlite3.connect(LIBRARY_DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _re0_client() -> "re0_sync.Re0Client":
+    """One paced/budgeted client per library path (so a per-test library
+    never inherits another's blocked state). Credential callables are
+    late-bound to the module's own helpers -- never copied."""
+    key = str(LIBRARY_DB_PATH)
+    with _RE0_CLIENT_LOCK:
+        client = _RE0_CLIENTS.get(key)
+        if client is None:
+            settings = _re0_settings()
+            client = re0_sync.Re0Client(
+                request=lambda *a, **k: requests.request(*a, **k),
+                api_key_provider=lambda: config_value("hdhive_app_secret", "HDHIVE_APP_SECRET"),
+                token_provider=lambda: valid_hdhive_access_token(),
+                refresh_token=lambda: refresh_hdhive_token(),
+                conn_factory=_re0_conn_factory,
+                min_interval_ms=settings["min_interval_ms"],
+                daily_cap=settings["daily_cap"],
+                base=HDHIVE_BASE,
+            )
+            _RE0_CLIENTS[key] = client
+        return client
+
+
+def _re0_client_reset() -> None:
+    with _RE0_CLIENT_LOCK:
+        _RE0_CLIENTS.clear()
+
+
+def _re0_slug_salt(conn: sqlite3.Connection) -> str:
+    salt = re0_sync.state_get(conn, "slug_salt")
+    if not salt:
+        salt = secrets.token_hex(16)
+        re0_sync.state_set(conn, "slug_salt", salt, utc_now())
+        conn.commit()
+    return salt
+
+
+def _re0_image_url(path: str | None, kind: str) -> str | None:
+    return _tmdb_image_url(path, LIBRARY_BACKDROP_SIZE if kind == "backdrop" else LIBRARY_POSTER_SIZE)
+
+
+_RE0_STOP_CLASSES = {"rate_limited", "reauth_required", "refresh_unavailable", "scope_denied", "user_level_denied", "quota_exhausted",
+                     "missing_credentials", "network_error", "upstream_5xx", "invalid_json"}
+
+
+def _re0_tmdb_candidates(q: str, kinds: list[str], year: int | None) -> tuple[list[dict], str | None]:
+    """Title -> TMDB ids through the app's own TmdbClient (cache + budget +
+    shared rate limiter). Returns ``(candidates, error_status)``."""
+    client = _library_client_factory(fast=True)
+    if client is None:
+        return [], "tmdb_unavailable"
+    candidates: list[dict] = []
+    for kind in kinds:
+        try:
+            entry = client.search(kind, q, year=year, language="zh-CN")
+            if entry.status == "empty" or (entry.status != "ok" and not entry.payload):
+                fallback = client.search(kind, q, year=year, language="en-US")
+                if fallback.status == "ok" and fallback.payload:
+                    entry = fallback
+        except library_tmdb.BudgetExhausted:
+            return candidates, "tmdb_budget_exhausted"
+        except Exception as exc:  # noqa: BLE001 -- never leak the key/URL; class name only
+            LOG.warning("re0 search tmdb lookup failed error=%s", type(exc).__name__)
+            return candidates, "tmdb_unavailable"
+        if entry.status != "ok":
+            if entry.error_class and entry.status != "empty":
+                return candidates, "tmdb_unavailable"
+            continue
+        for row in entry.payload or []:
+            cand = re0_sync.tmdb_result_to_candidate(kind, row)
+            if cand is not None:
+                candidates.append(cand)
+    return candidates, None
+
+
+@app.get("/api/library/search/re0")
+def api_library_search_re0():
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    q = (request.args.get("q") or "").strip()
+    if not q or len(q) > 120:
+        return json_error("q 必须为 1-120 字符", 400, "LIBRARY_SEARCH_Q_INVALID")
+    media_type = request.args.get("type", "all")
+    if media_type not in _LIBRARY_TYPES:
+        return json_error("type 参数不正确", 400, "LIBRARY_SEARCH_TYPE_INVALID")
+    year_raw = request.args.get("year", "")
+    year = None
+    if year_raw:
+        if not _LIBRARY_YEAR_RE.fullmatch(year_raw):
+            return json_error("year 参数格式不正确", 400, "LIBRARY_SEARCH_YEAR_INVALID")
+        year = int(year_raw) if "-" not in year_raw else None
+    provider_raw = request.args.get("provider", "")
+    providers = tuple(p for p in provider_raw.split(",") if p) if provider_raw else ()
+    if any(code not in library_normalize.PROVIDERS for code in providers):
+        return json_error("provider 参数不正确", 400, "LIBRARY_PROVIDER_INVALID")
+
+    settings = _re0_settings()
+    mode = "direct" if settings["direct_search_path"] else "tmdb"
+    shortcut = re.fullmatch(r"tmdb:(\d{1,10})", q.strip().lower())
+    now = utc_now()
+    qhash = re0_sync.query_hash(q, media_type, year)
+    cache_key = f"{mode}:{qhash}"
+    if request.args.get("catalog") == "1":
+        cache_key = "catalog-v1:" + cache_key
+    filters = {"provider": list(providers)}
+    kinds = ["movie", "tv"] if media_type == "all" else [media_type]
+
+    conn = store.connect()
+    try:
+        salt = _re0_slug_salt(conn)
+        cached = re0_sync.cache_get(conn, cache_key)
+    finally:
+        conn.close()
+
+    def _respond(status: str, refs: list, *, cached_at: int | None, message: str | None = None, retry_after: int | None = None,
+                 origin: str | None = None, reason: str | None = None):
+        re0_sync.catalog_projections(store, refs, charmap=_library_charmap(store))
+        conn = store.connect(readonly=True)
+        try:
+            items = re0_sync.projection_items(conn, refs, providers, _re0_image_url)
+        finally:
+            conn.close()
+        payload = {
+            "success": True,
+            "remote": {
+                "mode": mode, "status": status, "origin": origin, "reason": reason, "cached_at": iso(cached_at), "message": message,
+                "retry_after": retry_after, "budget": _re0_client().budget_status(), "items": items,
+            },
+        }
+        if request.args.get("catalog") == "1":
+            # Both lanes finish in the SAME local name index, with one set of
+            # filters, relevance tiers, deduplication and pagination.
+            response = app.make_response(api_library_search())
+            if response.status_code != 200:
+                return response
+            payload["catalog"] = response.get_json()
+        return jsonify(payload)
+
+    if cached is not None:
+        refs = [tuple(r) for r in json.loads(cached["candidate_ids_json"] or "[]")]
+        try:
+            cached_origin = (json.loads(cached["filter_json"] or "{}") or {}).get("origin")
+        except ValueError:
+            cached_origin = None
+        if cached["retry_after_until"] and int(cached["retry_after_until"]) > now:
+            return _respond(cached["error_class"] or "rate_limited", refs, cached_at=cached["fetched_at"],
+                            message="RE0 限流冷却中", retry_after=int(cached["retry_after_until"]) - now, origin=cached_origin)
+        if cached["expires_at"] and int(cached["expires_at"]) > now and cached["status"] in ("fresh", "no_candidates"):
+            return _respond("cached" if cached["status"] == "fresh" else "no_candidates", refs, cached_at=cached["fetched_at"], origin=cached_origin)
+
+    re0 = _re0_client()
+    local_candidates: list[dict] = []
+    raw_candidates: list[dict] = []
+    source_error = message = None
+    if shortcut:
+        # Explicit TMDB id (spec §10.4.2 item 4): no TMDB search at all; the
+        # projection worker fills the title/metadata later.
+        origin = "tmdb_id"
+        conn = store.connect(readonly=True)
+        try:
+            for kind in kinds:
+                existing = re0_sync.projection_row(conn, kind, int(shortcut.group(1)))
+                raw_candidates.append({"media_type": kind, "tmdb_id": int(shortcut.group(1)), "title": existing["title"] if existing else f"TMDB {shortcut.group(1)}",
+                                       "original_title": None, "year": None, "poster_path": None, "backdrop_path": None, "overview": None, "ratings": {}, "votes": 0})
+        finally:
+            conn.close()
+    else:
+        # Round 23: a library media that is already matched (exact + tmdb_id)
+        # is the candidate -- no TMDB title search for it, so an exhausted
+        # TMDB budget cannot hide what the library already knows.
+        charmap = _library_charmap(store)
+        conn = store.connect(readonly=True)
+        try:
+            local_candidates = re0_sync.local_exact_candidates(conn, q, kinds=kinds, year=year, charmap=charmap)
+        finally:
+            conn.close()
+        origin = "local" if local_candidates else mode
+        if mode == "direct":
+            result = re0.get(settings["direct_search_path"], params={"q": q, "type": media_type})
+            if result.ok:
+                rows = result.data.get("items") if isinstance(result.data, dict) else result.data
+                raw_candidates = [c for c in (re0_sync.direct_result_to_candidate(r) for r in (rows or [])) if c and c["media_type"] in kinds]
+            elif local_candidates:
+                source_error, message = result.error_class or "upstream_4xx", result.message
+            else:
+                return _respond(result.error_class or "upstream_4xx", [], cached_at=None, message=result.message, retry_after=result.retry_after, origin=origin)
+        elif not local_candidates or request.args.get("catalog") == "1":
+            raw_candidates, source_error = _re0_tmdb_candidates(q, kinds, year)
+    candidates = re0_sync.merge_candidates(local_candidates, re0_sync.select_candidates(raw_candidates, q, year))
+    if not candidates:
+        if source_error:
+            # A TMDB budget/outage answer is not "no results": nothing is
+            # cached, so the next search retries once TMDB is back.
+            return _respond(source_error, [], cached_at=None, origin=origin)
+        conn = store.connect()
+        try:
+            re0_sync.cache_put(conn, cache_key, qhash, media_type, filters=dict(filters, origin=origin), candidate_refs=[],
+                               status="no_candidates", now=now, ttl=re0_sync.NEGATIVE_TTL_SECONDS)
+            conn.commit()
+        finally:
+            conn.close()
+        return _respond("no_candidates", [], cached_at=now, origin=origin)
+
+    refs = []
+    conn = store.connect()
+    try:
+        for cand in candidates:
+            if cand.get("local_media_id") is None:
+                cand["local_media_id"] = re0_sync.local_media_id_for(conn, cand["media_type"], cand["tmdb_id"])
+            refs.append((cand["media_type"], cand["tmdb_id"]))
+    finally:
+        conn.close()
+    # Local media first (spec §10.4.2 item 5), then the rest in rank order.
+    candidates.sort(key=lambda c: 0 if c["local_media_id"] else 1)
+    for cand in candidates:
+        re0_sync.upsert_projection(
+            store, cand["media_type"], cand["tmdb_id"], title=cand["title"], original_title=cand.get("original_title"), year=cand["year"],
+            overview=cand["overview"], poster_path=cand["poster_path"], backdrop_path=cand["backdrop_path"], ratings=cand["ratings"], now=now,
+            local_media_id=cand["local_media_id"],
+        )
+
+    status, retry_after, stop_class, reason = "fresh", None, None, None
+    for cand in candidates:
+        conn = store.connect(readonly=True)
+        try:
+            row = conn.execute("SELECT last_fetched_at, title FROM re0_media_projection WHERE media_type=? AND tmdb_id=?",
+                               (cand["media_type"], cand["tmdb_id"])).fetchone()
+        finally:
+            conn.close()
+        if row and row["last_fetched_at"] and now - int(row["last_fetched_at"]) < re0_sync.RESOURCES_TTL_SECONDS:
+            continue
+        result = re0.get(f"/api/open/resources/{cand['media_type']}/{cand['tmdb_id']}")
+        if result.ok:
+            raw_items = result.data if isinstance(result.data, list) else ((result.data or {}).get("items") if isinstance(result.data, dict) else [])
+            report = re0_sync.record_items(store, cand["media_type"], cand["tmdb_id"], raw_items or [], media_id=cand["local_media_id"],
+                                           media_title=cand["title"], salt=salt, now=now)
+            LOG.info("re0 search tmdb_id=%s type=%s items=%s new=%s materialized=%s", cand["tmdb_id"], cand["media_type"],
+                     report["remote_items"], report["new"], report["materialized"])
+        elif result.error_class == "upstream_4xx":
+            LOG.info("re0 search tmdb_id=%s type=%s status=%s code=%s", cand["tmdb_id"], cand["media_type"], result.status, result.code)
+        else:
+            stop_class, message, retry_after = result.error_class, result.message, result.retry_after
+            LOG.warning("re0 search stopped error=%s status=%s", stop_class, result.status)
+            break
+        conn = store.connect()
+        try:
+            conn.execute("UPDATE re0_media_projection SET last_fetched_at=?, last_error_class=NULL, updated_at=? WHERE media_type=? AND tmdb_id=?",
+                         (now, now, cand["media_type"], cand["tmdb_id"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+    conn = store.connect()
+    try:
+        if stop_class:
+            until = now + retry_after if stop_class == "rate_limited" and retry_after else None
+            re0_sync.cache_put(conn, cache_key, qhash, media_type, filters=dict(filters, origin=origin), candidate_refs=refs, status="error", now=now,
+                               ttl=re0_sync.NEGATIVE_TTL_SECONDS if not until else max(retry_after or 0, 1), retry_after_until=until, error_class=stop_class)
+            status = stop_class
+        elif source_error:
+            # Local matches answered, the remote candidate source did not:
+            # say so, and do not cache -- the next search retries the source.
+            status, reason = "partial", source_error
+        else:
+            re0_sync.cache_put(conn, cache_key, qhash, media_type, filters=dict(filters, origin=origin), candidate_refs=refs, status="fresh", now=now,
+                               ttl=re0_sync.SEARCH_TTL_SECONDS)
+        conn.commit()
+    finally:
+        conn.close()
+    return _respond(status, refs, cached_at=now, message=message, retry_after=retry_after, origin=origin, reason=reason)
 
 
 @app.get("/api/library/search")
@@ -2499,10 +4971,10 @@ def api_library_search():
 
     try:
         page = int(request.args.get("page", "1"))
-        page_size = int(request.args.get("page_size", "24"))
+        page_size = int(request.args.get("page_size", "25"))
     except ValueError:
         return json_error("page/page_size 必须为整数", 400, "LIBRARY_SEARCH_PAGE_INVALID")
-    if not (1 <= page <= 200):
+    if page < 1:
         return json_error("page 超出范围", 400, "LIBRARY_SEARCH_PAGE_INVALID")
     if not (1 <= page_size <= 50):
         return json_error("page_size 超出范围", 400, "LIBRARY_SEARCH_PAGE_SIZE_INVALID")
@@ -2520,6 +4992,7 @@ def api_library_search():
         source=source,
         has_backdrop=has_backdrop,
         complete_season=complete_season,
+        include_re0=bool(q.strip()),
     )
     if q:
         page_result = library_search.search(
@@ -2561,6 +5034,11 @@ def api_library_search():
 
 _RECOMMENDATION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _RECOMMENDATION_ALGO_VERSION = "1"
+# Round 17: the home banner (`placement=hero`) ranks its own, stricter pool
+# (library_store.eligible_hero_media_ids) under its own version string, so
+# its tie-break and cache entries never collide with the rail's.
+_HERO_ALGO_VERSION = "hero-rated-2day-1"
+_RECOMMENDATION_PLACEMENTS = {"": "today_recommendations", "hero": "today_hero"}
 _RECOMMENDATION_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RECOMMENDATION_DEFAULT_LIMIT = 12
 _RECOMMENDATION_MAX_LIMIT = 24
@@ -2569,30 +5047,405 @@ _RECOMMENDATION_MAX_LIMIT = 24
 _RECOMMENDATION_CACHE: dict[tuple, dict] = {}
 
 
-def _recommendation_tie(day: str, media_id: int) -> str:
-    payload = f"{day}|{_RECOMMENDATION_ALGO_VERSION}|{media_id}".encode("utf-8")
+def _recommendation_tie(day: str, media_id: int, version: str = _RECOMMENDATION_ALGO_VERSION) -> str:
+    payload = f"{day}|{version}|{media_id}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 
-def _recommendation_selection(store: "library_store.LibraryStore", day: str, limit: int) -> dict:
+def _recommendation_selection(
+    store: "library_store.LibraryStore", day: str, limit: int, placement: str = "",
+) -> dict:
     # The cache key includes the installed index's own identity (path +
     # install timestamp) so a later ``--library-install``/rollback that
     # replaces the index -- same day, same limit -- can never keep serving
     # a stale selection computed against the previous index's media ids.
-    cache_key = (str(store.db_path), store.meta_get("installed_at"), day, _RECOMMENDATION_ALGO_VERSION, limit)
+    # The algorithm version (distinct per placement) is part of the key too,
+    # so bumping it invalidates every cached selection of that placement.
+    version = _HERO_ALGO_VERSION if placement == "hero" else _RECOMMENDATION_ALGO_VERSION
+    if placement == "hero":
+        day = _hero_rotation_date(day)
+    cache_key = (str(store.db_path), store.meta_get("installed_at"), day, version, limit)
     cached = _RECOMMENDATION_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        if placement != "hero" or (cached["ids"] and
+                set(store.eligible_hero_media_ids(cached["ids"])) == set(cached["ids"])):
+            return cached
+        # Only re-read the cached IDs normally. Rebuild the pool when a
+        # featured title loses its link/score/match, or an empty pool grows.
+        _RECOMMENDATION_CACHE.pop(cache_key, None)
 
-    eligible_ids = store.eligible_recommendation_media_ids()
+    if placement == "hero":
+        eligible_ids = store.eligible_hero_media_ids()
+    else:
+        eligible_ids = store.eligible_recommendation_media_ids()
     if eligible_ids:
-        ranked = sorted(eligible_ids, key=lambda media_id: _recommendation_tie(day, media_id))
+        ranked = sorted(eligible_ids, key=lambda media_id: _recommendation_tie(day, media_id, version))
         selection = {"ids": ranked[:limit], "fallback": False}
+    elif placement == "hero":
+        # The banner needs a backdrop and an overview; nothing outside the
+        # strict pool can render there, so the fallback is "no banner".
+        selection = {"ids": [], "fallback": True}
     else:
         selection = {"ids": store.fallback_recommendation_media_ids(limit), "fallback": True}
 
     _RECOMMENDATION_CACHE[cache_key] = selection
     return selection
+
+
+def _hero_rotation_date(day: str) -> str:
+    """Stable two-calendar-day editions, aligned to Asia/Shanghai dates."""
+    ordinal = datetime.strptime(day, "%Y-%m-%d").toordinal()
+    return datetime.fromordinal(max(1, ordinal - ordinal % 2)).date().isoformat()
+
+
+@app.post("/api/library/cloud-download")
+def api_cloud_download_submit():
+    """Push one resource group's ED2K/magnet links to 115 cloud download
+    (spec §5). Order of checks: switch → link eligibility → target pid →
+    dedupe → daily cap → monthly quota → lock → serial chunked submit."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    settings = _cloud_settings_dict()
+    if not settings["enabled"]:
+        return json_error("115 云下载未开启，请先在设置中启用", 403, "CLOUD_DOWNLOAD_DISABLED")
+    gate = _cloud_download_gate()
+    if gate is not None:
+        return gate
+    deadline = g.request_started + _115_REQUEST_DEADLINE_SECONDS
+    body = request_json()
+    raw_ids = body.get("resource_link_ids")
+    if not isinstance(raw_ids, list) or not raw_ids or not all(isinstance(i, str) and i.strip() for i in raw_ids):
+        return json_error("请提供 resource_link_ids", 400, "BAD_REQUEST")
+    public_ids = list(dict.fromkeys(i.strip() for i in raw_ids))
+    if len(public_ids) > settings["per_submit_cap"]:
+        return json_error(f"单次最多提交 {settings['per_submit_cap']} 条链接", 400, "CLOUD_DOWNLOAD_PER_SUBMIT_CAP")
+
+    items: list[dict] = []
+    group_ids: set[int] = set()
+    for public_id in public_ids:
+        row = store.link_by_public_id(public_id)
+        if row is None:
+            return json_error("未找到该链接", 404, "LINK_NOT_FOUND")
+        label = row["url_label"] or ""
+        if row["provider"] != "ed2k" or row["deleted_at_source"] is not None:
+            return json_error(f"该链接不支持云下载：{label}", 400, "LINK_NOT_CLOUD_DOWNLOADABLE")
+        try:
+            url, _ = store.reveal(public_id)
+        except library_store.LibraryKeyUnavailable:
+            return json_error("主密钥不可用", 503, "LIBRARY_KEY_UNAVAILABLE")
+        if not (url or "").strip().lower().startswith(("ed2k://", "magnet:")):
+            return json_error(f"该链接不支持云下载：{label}", 400, "LINK_NOT_CLOUD_DOWNLOADABLE")
+        group_ids.add(int(row["group_id"]))
+        items.append({"link_id": public_id, "label": label, "url": url.strip()})
+    if len(group_ids) != 1:
+        return json_error("一次只能提交同一资源组的链接", 400, "CLOUD_DOWNLOAD_MIXED_GROUPS")
+    group_id = group_ids.pop()
+
+    pid, target_error = _resolve_115_target_pid(body, deadline)
+    if target_error:
+        return target_error
+    if not _cloud_dedupe_check(public_ids, pid):
+        return json_error("这些链接刚刚已提交过，请稍后再试", 409, "CLOUD_DOWNLOAD_DUPLICATE")
+
+    count = len(items)
+    if settings["daily_cap"] and _cloud_today_submitted() + count > settings["daily_cap"]:
+        _cloud_dedupe_clear(public_ids, pid)
+        return json_error(f"今日云下载提交已达上限 {settings['daily_cap']} 条", 429, "CLOUD_DOWNLOAD_DAILY_CAP")
+    quota, quota_error = _cloud_quota(deadline=deadline)
+    if quota is None:
+        _cloud_dedupe_clear(public_ids, pid)
+        return json_error("无法读取 115 云下载配额：" + quota_error, 502, "CLOUD_DOWNLOAD_QUOTA_UNAVAILABLE")
+    surplus = int(quota.get("surplus") or 0)
+    if surplus < count:
+        _cloud_dedupe_clear(public_ids, pid)
+        return jsonify({
+            "success": False, "code": "CLOUD_DOWNLOAD_QUOTA_EXHAUSTED",
+            "message": f"本月云下载配额不足：剩余 {surplus} 条，本次需要 {count} 条", "quota_surplus": surplus,
+        }), 409
+    if not _CLOUD_DOWNLOAD_LOCK.acquire(blocking=False):
+        _cloud_dedupe_clear(public_ids, pid)
+        return json_error("另一批云下载正在提交，请稍后再试", 409, "CLOUD_DOWNLOAD_BUSY")
+    request_id = secrets.token_hex(8)
+    started = time.monotonic()
+    try:
+        results, stop_error = _cloud_submit_chunks(items, pid, deadline)
+    finally:
+        _CLOUD_DOWNLOAD_LOCK.release()
+
+    ok = [r for r in results if r["state"] == "ok"]
+    failed = sum(1 for r in results if r["state"] == "failed")
+    not_submitted = [r["link_id"] for r in results if r["state"] == "not_submitted"]
+    if not_submitted:
+        _cloud_dedupe_clear(not_submitted, pid)
+    if ok:
+        legacy_owner = _writes_legacy_cloud_task()
+        conn = store.connect(readonly=True)
+        try:
+            origin = conn.execute(
+                "SELECT g.media_id AS media_id, m.title_zh AS title FROM resource_group g JOIN media m ON m.id = g.media_id WHERE g.id = ?",
+                (group_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        now = utc_now()
+        actor = actor_id()
+        with connect_db() as db:
+            for result in ok:
+                # Phase 6: the note about where a task came from belongs to
+                # the user who submitted it. Two users may hold the same
+                # info_hash independently -- the unique key is the pair.
+                db.execute(
+                    "INSERT INTO user_cloud_download_task(user_id, info_hash, source_kind, media_id, display_title, "
+                    "group_id, link_label, submitted_at, last_seen_at, state) VALUES(?,?,?,?,?,?,?,?,NULL,NULL) "
+                    "ON CONFLICT(user_id, info_hash) DO UPDATE SET submitted_at=excluded.submitted_at, "
+                    "media_id=excluded.media_id, display_title=excluded.display_title, "
+                    "group_id=excluded.group_id, link_label=excluded.link_label",
+                    (
+                        (current_user().id if current_user() else 0), result["info_hash"], "library",
+                        origin["media_id"] if origin else None,
+                        origin["title"] if origin else None, group_id, result["label"], now,
+                    ),
+                )
+                if legacy_owner:
+                    # F04: the administrator's own row, in the administrator's
+                    # own table. A member submitting the same info_hash leaves
+                    # it exactly as it was.
+                    db.execute(
+                        "INSERT OR REPLACE INTO cloud_download_task(info_hash, link_public_id, media_id, group_id, media_title, link_label, "
+                        "wp_path_id, target_path, submitted_at, submitted_by, last_status, last_message, last_seen_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,NULL,NULL,NULL)",
+                        (
+                            result["info_hash"], result["link_id"], origin["media_id"] if origin else None, group_id,
+                            origin["title"] if origin else None, result["label"], pid,
+                            str(body.get("target_path") or "")[:200] or None, now, actor,
+                        ),
+                    )
+        _cloud_cache_forget(_acting_user())
+    duration_ms = int((time.monotonic() - started) * 1000)
+    audit(
+        "cloud_download.submit",
+        "failed" if stop_error else "success",
+        f"group={group_id} req={request_id} submitted={count} ok={len(ok)} failed={failed} not_submitted={len(not_submitted)} "
+        f"pid={pid} duration_ms={duration_ms}" + (f" stop={_cloud_sanitize_message(stop_error)[:80]}" if stop_error else ""),
+        actor_id(),
+    )
+    message = (
+        f"已提交 {len(ok)} 条" + (f"，{failed} 条被 115 拒绝" if failed else "")
+        if not stop_error else f"已提交 {len(ok)} 条后中止：{stop_error}；{len(not_submitted)} 条未提交"
+    )
+    return jsonify({
+        "success": not stop_error,
+        "message": message,
+        "submitted": count,
+        "ok": len(ok),
+        "failed": failed,
+        "not_submitted": len(not_submitted),
+        "quota_surplus": max(surplus - len(ok), 0),
+        "results": results,
+    })
+
+
+def _writes_legacy_cloud_task() -> bool:
+    """Whether this caller owns the legacy ``cloud_download_task`` table.
+
+    That table predates users: one row per info_hash, no user column, and the
+    administrator's task list was read from it. It stays during the migration
+    window because rolling back to the previous release has to find it intact
+    -- but it is *the administrator's*, so a member's submit or delete must
+    not rewrite the target, origin or status recorded in it (review F04). A
+    request with no user at all is the deployment acting on its own behalf,
+    which in the dev auth modes is the administrator.
+    """
+    user = _acting_user()
+    return user is None or user.role == "admin"
+
+
+def _cloud_download_gate():
+    """The authorisation a cloud-download route needs before it touches 115.
+
+    Phase 6 (R05): the call runs under the acting user's own step-B token,
+    so a user without one is sent to the authorisation button and no
+    upstream request is made on anybody else's credential.
+    """
+    _token, error = _require_open115(_acting_user())
+    return error
+
+
+_CLOUD_STATUS_LABEL = {-2: "已删除", -1: "失败", 0: "分配中", 1: "下载中", 2: "已完成"}
+_CLOUD_INFO_HASH_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def _cloud_error_response(status: int, error: str):
+    return json_error("115 云下载接口失败：" + (error or "未知错误"), 502 if status in (200, 0) else status, "CLOUD_DOWNLOAD_UPSTREAM")
+
+
+@app.get("/api/library/cloud-download/tasks")
+def api_cloud_download_tasks():
+    try:
+        page = max(1, int(request.args.get("page", "1")))
+    except ValueError:
+        return json_error("page 必须为整数", 400, "BAD_REQUEST")
+    gate = _cloud_download_gate()
+    if gate is not None:
+        return gate
+    force = request.args.get("refresh") == "1"
+    data, error = _cloud_task_list(page, force=force)
+    if data is None:
+        return _cloud_error_response(502, error)
+    raw_tasks = [t for t in (data.get("tasks") or []) if isinstance(t, dict)]
+    hashes = [str(t.get("info_hash") or "") for t in raw_tasks]
+    origins: dict[str, dict] = {}
+    if hashes:
+        placeholders = ",".join("?" for _ in hashes)
+        now = utc_now()
+        user_id = current_user().id if current_user() else 0
+        with connect_db() as db:
+            # Only this user's own notes: another user's row for the same
+            # info_hash is theirs, and must not label this list.
+            for row in db.execute(
+                f"SELECT info_hash, media_id, display_title, group_id, link_label "
+                f"FROM user_cloud_download_task WHERE user_id=? AND info_hash IN ({placeholders})",
+                (user_id, *hashes),
+            ).fetchall():
+                origins[row["info_hash"]] = {
+                    "media_id": row["media_id"], "group_id": row["group_id"],
+                    "media_title": row["display_title"], "link_label": row["link_label"],
+                }
+            if _writes_legacy_cloud_task():
+                # The administrator's tasks from before this release -- or
+                # before the migration copies them -- are annotated only in
+                # the legacy table. Their notes are still theirs.
+                for row in db.execute(
+                    f"SELECT info_hash, media_id, media_title, group_id, link_label "
+                    f"FROM cloud_download_task WHERE info_hash IN ({placeholders})",
+                    tuple(hashes),
+                ).fetchall():
+                    origins.setdefault(row["info_hash"], {
+                        "media_id": row["media_id"], "group_id": row["group_id"],
+                        "media_title": row["media_title"], "link_label": row["link_label"],
+                    })
+            for task in raw_tasks:
+                info_hash = str(task.get("info_hash") or "")
+                if info_hash in origins:
+                    db.execute(
+                        "UPDATE user_cloud_download_task SET state=?, last_seen_at=? WHERE user_id=? AND info_hash=?",
+                        (str(task.get("status") or ""), now, user_id, info_hash),
+                    )
+    tasks = []
+    for task in raw_tasks:
+        info_hash = str(task.get("info_hash") or "")
+        status = task.get("status")
+        try:
+            status = int(status) if status is not None else None
+        except (TypeError, ValueError):
+            status = None
+        tasks.append({
+            "info_hash": info_hash,
+            "name": str(task.get("name") or ""),
+            "size": task.get("size"),
+            "percent": task.get("percentDone"),
+            "status": status,
+            "status_label": _CLOUD_STATUS_LABEL.get(status, "未知"),
+            "add_time": iso(task.get("add_time")) if isinstance(task.get("add_time"), int) else None,
+            "last_update": iso(task.get("last_update")) if isinstance(task.get("last_update"), int) else None,
+            "file_id": task.get("file_id"),
+            "can_appeal": bool(task.get("can_appeal")),
+            "origin": origins.get(info_hash),
+        })
+    return jsonify({
+        "success": True, "page": data.get("page", page), "page_count": data.get("page_count", 1),
+        "count": data.get("count", len(tasks)), "tasks": tasks,
+    })
+
+
+@app.get("/api/library/cloud-download/quota")
+def api_cloud_download_quota():
+    gate = _cloud_download_gate()
+    if gate is not None:
+        return gate
+    force = request.args.get("refresh") == "1"
+    data, error = _cloud_quota(force=force)
+    if data is None:
+        return _cloud_error_response(502, error)
+    settings = _cloud_settings_dict()
+    packages = [
+        {"name": str(p.get("name") or ""), "count": p.get("count"), "used": p.get("used"), "surplus": p.get("surplus")}
+        for p in (data.get("package") or []) if isinstance(p, dict)
+    ]
+    return jsonify({
+        "success": True, "count": data.get("count"), "used": data.get("used"), "surplus": data.get("surplus"),
+        "package": packages, "today_submitted": _cloud_today_submitted(), "daily_cap": settings["daily_cap"],
+    })
+
+
+@app.post("/api/library/cloud-download/tasks/<info_hash>/delete")
+def api_cloud_download_delete(info_hash):
+    if not _CLOUD_INFO_HASH_RE.match(info_hash or ""):
+        return json_error("任务标识不正确", 400, "BAD_REQUEST")
+    gate = _cloud_download_gate()
+    if gate is not None:
+        return gate
+    body = request_json()
+    delete_files = body.get("delete_files") is True
+    _, status, error = _open115_offline(
+        "POST", "/open/offline/del_task", data={"info_hash": info_hash, "del_source_file": "1" if delete_files else "0"},
+    )
+    audit("cloud_download.delete", "success" if status == 200 else "failed",
+          f"hash={info_hash} delete_files={int(delete_files)}" + (f" error={error[:80]}" if error else ""), actor_id())
+    if status != 200:
+        return _cloud_error_response(status, error)
+    now, user_id = utc_now(), (current_user().id if current_user() else 0)
+    with connect_db() as db:
+        if _writes_legacy_cloud_task():
+            # F04: a member deleting their own task must not mark the
+            # administrator's legacy row for the same info_hash deleted.
+            db.execute("UPDATE cloud_download_task SET last_status=-2, last_seen_at=? WHERE info_hash=?", (now, info_hash))
+        # The per-user row is what this user's task list reads (R05); only
+        # their own is touched, never another user's row for the same hash.
+        db.execute("UPDATE user_cloud_download_task SET state='-2', last_seen_at=? "
+                   "WHERE user_id=? AND info_hash=?", (now, user_id, info_hash))
+    _cloud_cache_forget(_acting_user())
+    return jsonify({"success": True, "message": "任务已删除" + ("（含文件）" if delete_files else "")})
+
+
+_CLOUD_CLEAR_FLAGS = {"failed": "2", "completed": "0"}
+
+
+@app.post("/api/library/cloud-download/tasks/clear")
+def api_cloud_download_clear():
+    body = request_json()
+    scope = body.get("scope")
+    if scope not in _CLOUD_CLEAR_FLAGS:
+        return json_error("scope 只能是 failed 或 completed", 400, "BAD_REQUEST")
+    gate = _cloud_download_gate()
+    if gate is not None:
+        return gate
+    _, status, error = _open115_offline("POST", "/open/offline/clear_task", data={"flag": _CLOUD_CLEAR_FLAGS[scope]})
+    audit("cloud_download.clear", "success" if status == 200 else "failed",
+          f"scope={scope}" + (f" error={error[:80]}" if error else ""), actor_id())
+    if status != 200:
+        return _cloud_error_response(status, error)
+    # F04: clearing upstream is this user's own action on their own account;
+    # it neither touches the administrator's legacy rows nor anybody else's
+    # cache.
+    _cloud_cache_forget(_acting_user())
+    return jsonify({"success": True, "message": "已清理" + ("失败任务" if scope == "failed" else "已完成任务")})
+
+
+@app.get("/api/library/cloud-download/status")
+def api_cloud_download_status():
+    settings = _cloud_settings_dict()
+    return jsonify({
+        "success": True,
+        "enabled": settings["enabled"],
+        "daily_cap": settings["daily_cap"],
+        "per_submit_cap": settings["per_submit_cap"],
+        "today_submitted": _cloud_today_submitted(),
+        # This user's own step-B authorisation (R05) -- reading the global
+        # setting here would tell a member about the administrator's.
+        "token_available": bool(user_115_open_token(_acting_user())),
+    })
 
 
 @app.get("/api/library/recommendations")
@@ -2606,7 +5459,7 @@ def api_library_recommendations():
         if not _RECOMMENDATION_DATE_RE.match(date_raw):
             return json_error("date 参数格式不正确", 400, "LIBRARY_RECOMMENDATIONS_DATE_INVALID")
         try:
-            day = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%Y-%m-%d")
+            day = datetime.strptime(date_raw, "%Y-%m-%d").date().isoformat()
         except ValueError:
             return json_error("date 参数格式不正确", 400, "LIBRARY_RECOMMENDATIONS_DATE_INVALID")
     else:
@@ -2620,7 +5473,11 @@ def api_library_recommendations():
     if not (1 <= limit <= _RECOMMENDATION_MAX_LIMIT):
         return json_error("limit 超出范围", 400, "LIBRARY_RECOMMENDATIONS_LIMIT_INVALID")
 
-    selection = _recommendation_selection(store, day, limit)
+    placement = request.args.get("placement", "")
+    if placement not in _RECOMMENDATION_PLACEMENTS:
+        return json_error("placement 参数不正确", 400, "LIBRARY_RECOMMENDATIONS_PLACEMENT_INVALID")
+
+    selection = _recommendation_selection(store, day, limit, placement)
 
     conn = store.connect(readonly=True)
     try:
@@ -2637,9 +5494,10 @@ def api_library_recommendations():
     return jsonify(
         {
             "success": True,
-            "section": "today_recommendations",
+            "section": _RECOMMENDATION_PLACEMENTS[placement],
             "date": day,
-            "algorithm_version": _RECOMMENDATION_ALGO_VERSION,
+            **({"rotation_date": _hero_rotation_date(day), "refresh_interval_days": 2} if placement == "hero" else {}),
+            "algorithm_version": _HERO_ALGO_VERSION if placement == "hero" else _RECOMMENDATION_ALGO_VERSION,
             "fallback": selection["fallback"],
             "items": items,
         }
@@ -2686,7 +5544,1016 @@ def api_library_media(media_id):
     media["poster_url"] = _tmdb_image_url(poster_path, LIBRARY_POSTER_SIZE)
     media["poster_large_url"] = _tmdb_image_url(poster_path, LIBRARY_POSTER_LARGE_SIZE)
     media["backdrop_url"] = _tmdb_image_url(media.pop("backdrop_path", None), LIBRARY_BACKDROP_SIZE)
+    # Invalid-candidate work order §3.2: an RE0 share the upstream confirmed
+    # dead is hidden unless the caller asks for the audit view. Independent of
+    # include_deleted, which is about LOCAL links.
+    include_invalid = (request.args.get("include_invalid") or "").strip().lower() in {"1", "true"}
+    candidates, hidden_invalid = _re0_candidates_for_media(store, media_id, provider, include_invalid=include_invalid)
+    media["re0_candidates"] = candidates
+    media["re0_invalid_hidden_count"] = hidden_invalid
+    media["provider_facets"] = _merge_re0_facets(media.get("provider_facets") or [], media["re0_candidates"])
+    media["provider_count"] = len(media["provider_facets"])
+    media["re0_calendar"] = _re0_calendar_for_media(store, media_id)
+    media["re0_follow"] = _re0_follow_for_media(store, media_id)
+    media["re0_follow_can_subscribe"] = _re0_has_scope("subscription")
     return jsonify({"success": True, **media})
+
+
+def _re0_has_scope(scope: str) -> bool:
+    row = get_tokens()
+    return bool(row and row["scope"] and scope in str(row["scope"]).split())
+
+
+def _re0_follow_for_media(store, media_id: int) -> list[dict]:
+    conn = store.connect(readonly=True)
+    try:
+        row = conn.execute("SELECT media_type, tmdb_id FROM media WHERE id=?", (media_id,)).fetchone()
+        if row is None or row["media_type"] != "tv" or not row["tmdb_id"]:
+            return []
+        return re0_sync.follow_rows(conn, tmdb_id=int(row["tmdb_id"]))
+    finally:
+        conn.close()
+
+
+@app.post("/api/library/re0-follow/query")
+def api_library_re0_follow_query():
+    """User-triggered pack lookup for one TV media (spec §9.2, read-only)."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    body = request_json()
+    media_id = body.get("media_id")
+    if not isinstance(media_id, int) or isinstance(media_id, bool):
+        return json_error("media_id 必须为整数", 400, "BAD_REQUEST")
+    conn = store.connect()
+    try:
+        row = conn.execute("SELECT media_type, tmdb_id FROM media WHERE id=?", (media_id,)).fetchone()
+        if row is None or row["media_type"] != "tv" or not row["tmdb_id"]:
+            return json_error("该媒体不是带 TMDB ID 的剧集", 400, "RE0_FOLLOW_NOT_TV")
+        salt = _re0_slug_salt(conn)
+    finally:
+        conn.close()
+    report = re0_sync.query_packs_for_tmdb(store, _re0_client(), tmdb_id=int(row["tmdb_id"]), salt=salt, now=utc_now())
+    if report.get("error_class"):
+        status = {"rate_limited": 429, "reauth_required": 401, "scope_denied": 403, "user_level_denied": 403, "quota_exhausted": 429}.get(report["error_class"], 502)
+        return jsonify({"success": False, "code": "RE0_" + report["error_class"].upper(), "message": "RE0 追更包查询失败", "retry_after": report.get("retry_after")}), status
+    return jsonify({"success": True, "report": report, "message": ("已查询，找到 %d 个追更包" % report.get("recorded", 0)) if report["queried"] else "刚刚查询过，请稍后再试"})
+
+
+@app.post("/api/library/re0-follow/<ref>/unlock")
+def api_library_re0_follow_unlock(ref):
+    """Explicit user unlock of one tv-follow pack (spec §9.2 items 4-6):
+    idempotent per request_id; subscribe_updates only with the
+    ``subscription`` scope; items are then materialised insert-only."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    if not re.fullmatch(r"[0-9a-f]{16}", ref or ""):
+        return json_error("追更包标识不正确", 400, "BAD_REQUEST")
+    body = request_json()
+    request_id = str(body.get("request_id") or "")
+    if not _RE0_REQUEST_ID_RE.match(request_id):
+        return json_error("request_id 格式不正确", 400, "BAD_REQUEST")
+    subscribe = body.get("subscribe_updates") is True and _re0_has_scope("subscription")
+    now = utc_now()
+    conn = store.connect()
+    try:
+        pack = re0_sync._pack_row(conn, ref=ref)
+        if pack is None:
+            return json_error("未找到该追更包", 404, "RE0_FOLLOW_NOT_FOUND")
+        pack = dict(pack)
+        action_key = -int(pack["slug_hash"][:8], 16)  # packs live in the negative id space of re0_action
+        prior = re0_sync.action_get(conn, request_id, action_key)
+        salt = _re0_slug_salt(conn)
+        try:
+            slug = store.fernet.decrypt(pack["slug_ciphertext"]).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            return json_error("主密钥不可用", 503, "LIBRARY_KEY_UNAVAILABLE")
+    finally:
+        conn.close()
+    if prior is not None and prior["status"] == "success":
+        return jsonify({"success": True, "replayed": True, "materialized": 0, "subscribe_updates": bool(prior["already_owned"] == 2), "already_owned": True})
+    # §10.1: the same rule as a resource unlock, or this would be the way
+    # around it. An already-unlocked pack costs nothing and is let through
+    # below; buying a new one is what the switch governs.
+    pack_holder = f"{actor_id()}:{request_id}"
+    if pack["is_unlocked"]:
+        # Already bought. Nothing to coordinate and nothing to spend: fetch
+        # the items and return.
+        return _re0_follow_items_only(store, pack, ref, slug, salt, request_id, action_key, subscribe, now)
+
+    if re0_sync.pack_unlock_state(pack) == re0_sync.STATE_RESULT_UNKNOWN:
+        # G03.5: the pack's own "result unknown", honoured before the member
+        # gate so an unconfirmed purchase is never repeated.
+        return json_error(_RE0_UNCERTAIN_MESSAGE, 409, "RE0_UNLOCK_RESULT_UNKNOWN")
+    refused = member_unlock_refused(f"follow={ref}")
+    if refused is not None:
+        return refused
+    # R08: packs need the same protection as resources, under their own
+    # key space -- a pack is not a resource id.
+    pack_lease = re0_sync.pack_lease_key(pack["slug_hash"])
+    if not _re0_lease_take(store, pack_lease, holder=pack_holder, now=now):
+        return json_error("该追更包正在解锁中，请稍后重试", 409, "RE0_UNLOCK_IN_PROGRESS")
+    with _re0_lease_held(store, pack_lease, holder=pack_holder):
+        conn = store.connect(readonly=True)
+        try:
+            replay = re0_sync.action_get(conn, request_id, action_key)
+            # F05: holding the lease is not the same as there being nothing
+            # here. A same-request_id record only catches this caller's own
+            # retry; the pack itself may have been unlocked by somebody else
+            # entirely while this request was reading its first snapshot, and
+            # buying it again is what that used to cost.
+            current = re0_sync._pack_row(conn, ref=ref)
+        finally:
+            conn.close()
+        if replay is not None and replay["status"] == "success":
+            return jsonify({"success": True, "replayed": True, "materialized": 0,
+                            "subscribe_updates": bool(replay["already_owned"] == 2), "already_owned": True})
+        if current is not None and current["is_unlocked"]:
+            return _re0_follow_items_only(store, dict(current), ref, slug, salt, request_id, action_key, subscribe, now)
+        return _re0_follow_unlock_locked(store, pack, ref, slug, salt, request_id, action_key, subscribe, now)
+
+
+def _re0_follow_items_only(store, pack, ref, slug, salt, request_id, action_key, subscribe, now):
+    """An already-unlocked pack: fetch what it contains, buy nothing.
+
+    F05: "already unlocked" has to mean "only collect the data", whichever
+    request discovers it -- the one that bought it, or the one that arrived a
+    moment later.
+    """
+    client = _re0_client()
+    items = re0_sync.fetch_pack_items(store, client, slug=slug, salt=salt, now=now)
+    conn = store.connect()
+    try:
+        re0_sync.action_put(conn, request_id, action_key, "follow-unlock", "success", result_code=items["status"],
+                            resource_link_id=None, already_owned=True, unlock_points=0, now=now)
+        conn.commit()
+    finally:
+        conn.close()
+    audit("re0.follow.unlock", "success",
+          f"pack={ref} items={items['items']} materialized={items['materialized']} already_owned=1 points=0 "
+          f"subscribe={int(subscribe)}", actor_id())
+    return jsonify({"success": True, "replayed": False, "materialized": items["materialized"],
+                    "items": items["items"], "items_status": items["status"], "already_owned": True,
+                    "unlock_points": 0, "subscribe_updates": subscribe})
+
+
+def _re0_follow_unlock_locked(store, pack, ref, slug, salt, request_id, action_key, subscribe, now):
+    """The pack unlock itself, with this pack's lease held."""
+    client = _re0_client()
+    # G03.1: a purchase is never repeated automatically.
+    result = client.post(f"/api/open/tv-follow/packs/{slug}/unlock",
+                         json={"subscribe_updates": subscribe}, consuming=True)
+    if not result.ok:
+        uncertain = result.error_class in re0_sync.UNCERTAIN_ERROR_CLASSES
+        conn = store.connect()
+        try:
+            if uncertain:
+                # G03.5: the same record the resource entry keeps, so the next
+                # click asks the user rather than RE0.
+                re0_sync.remember_pack_unlock_unknown(conn, pack["slug_hash"],
+                                                      error_class=result.error_class, now=now)
+            re0_sync.action_put(conn, request_id, action_key, "follow-unlock",
+                                "unknown" if uncertain else "failed", result_code=result.error_class,
+                                resource_link_id=None, already_owned=False, unlock_points=None, now=now)
+            conn.commit()
+        finally:
+            conn.close()
+        audit("re0.follow.unlock", "unknown" if uncertain else "failed",
+              f"pack={ref} error={result.error_class} status={result.status}", actor_id())
+        if uncertain:
+            return jsonify({"success": False, "code": "RE0_UNLOCK_RESULT_UNKNOWN",
+                            "message": _RE0_UNCERTAIN_MESSAGE}), 502
+        status = {"rate_limited": 429, "reauth_required": 401, "scope_denied": 403, "user_level_denied": 403, "quota_exhausted": 429}.get(result.error_class, 502)
+        payload = {"success": False, "code": "RE0_" + (result.error_class or "upstream_error").upper(), "message": result.message or "RE0 解锁追更包失败"}
+        if result.retry_after:
+            payload["retry_after"] = result.retry_after
+        return jsonify(payload), status
+    unlocked = re0_sync.parse_unlock_payload(result.data, slug)
+    conn = store.connect()
+    try:
+        conn.execute("UPDATE re0_tv_follow_pack SET is_unlocked=1, items_status=NULL, updated_at=? WHERE slug_hash=?", (now, pack["slug_hash"]))
+        # G03.5: confirmed, so any earlier "unknown" record is settled.
+        re0_sync.clear_pack_unlock_state(conn, pack["slug_hash"], now=now)
+        conn.commit()
+    finally:
+        conn.close()
+    items = re0_sync.fetch_pack_items(store, client, slug=slug, salt=salt, now=now)
+    conn = store.connect()
+    try:
+        re0_sync.action_put(conn, request_id, action_key, "follow-unlock", "success", result_code=items["status"], resource_link_id=None,
+                            already_owned=unlocked["already_owned"], unlock_points=unlocked["points"], now=now)
+        conn.commit()
+    finally:
+        conn.close()
+    audit("re0.follow.unlock", "success", f"pack={ref} items={items['items']} materialized={items['materialized']} already_owned={int(bool(unlocked['already_owned']))} "
+          f"points={unlocked['points']} subscribe={int(subscribe)}", actor_id())
+    return jsonify({"success": True, "replayed": False, "materialized": items["materialized"], "items": items["items"], "items_status": items["status"],
+                    "already_owned": bool(unlocked["already_owned"]), "unlock_points": unlocked["points"], "subscribe_updates": subscribe})
+
+
+def _re0_calendar_for_media(store, media_id: int) -> dict | None:
+    """Next future RE0 calendar event for a TV media with a TMDB id (spec
+    §9.1); ``local_max_season`` decides 新一季 vs 下一集."""
+    conn = store.connect(readonly=True)
+    try:
+        row = conn.execute("SELECT media_type, tmdb_id FROM media WHERE id=?", (media_id,)).fetchone()
+        if row is None or row["media_type"] != "tv" or not row["tmdb_id"]:
+            return None
+        max_row = conn.execute("SELECT MAX(COALESCE(season_to, season_from)) FROM resource_group WHERE media_id=?", (media_id,)).fetchone()
+        local_max = int(max_row[0]) if max_row and max_row[0] is not None else None
+        return re0_sync.next_event_for(conn, "tv", int(row["tmdb_id"]), now=utc_now(), local_max_season=local_max)
+    finally:
+        conn.close()
+
+
+def _re0_effective_status(store, res: dict, now: int) -> str:
+    """The derived verdict for one candidate row (§3.1), read from the fields
+    already stored -- no RE0 call, no slug."""
+    try:
+        raw = (json.loads(res.get("spec_json") or "{}") or {}).get("raw") or {}
+    except ValueError:
+        raw = {}
+    conn = store.connect(readonly=True)
+    try:
+        preview = conn.execute("SELECT * FROM re0_file_preview WHERE re0_resource_id=?", (res["id"],)).fetchone()
+    except sqlite3.OperationalError:
+        preview = None
+    finally:
+        conn.close()
+    return re0_sync.effective_status(
+        upstream_validate_status=res.get("upstream_validate_status"), validate_message=raw.get("validate_message"),
+        last_validated_at=raw.get("last_validated_at"), preview=preview, now=now,
+    )["status"]
+
+
+def _merge_re0_facets(facets: list, candidates: list) -> list:
+    """Round 25: the detail page organises old and new resources by pan -- a
+    pan only RE0 knows still gets a facet (``link_count`` 0), and a facet that
+    holds RE0 candidates says how many (``re0_count``, present only when
+    > 0 so facets without candidates keep their exact shape)."""
+    counts: dict[str, int] = {}
+    for cand in candidates:
+        counts[cand["provider"]] = counts.get(cand["provider"], 0) + 1
+    merged = {f["provider"]: dict(f) for f in facets}
+    for code, count in counts.items():
+        merged.setdefault(code, {"provider": code, "label": library_normalize.PROVIDERS.get(code, code), "link_count": 0})["re0_count"] = count
+    order = list(library_store.PROVIDER_ORDER)
+    return [merged[code] for code in sorted(merged, key=lambda c: (order.index(c) if c in order else len(order), c))]
+
+
+def _re0_candidates_for_media(store, media_id: int, provider: str | None, *, include_invalid: bool = False) -> tuple[list[dict], int]:
+    """``(visible candidates, hidden invalid count)`` for a local media (spec
+    §10.1): server-side provider isolation, never a slug/URL; empty when the
+    media has no TMDB id."""
+    conn = store.connect(readonly=True)
+    try:
+        row = conn.execute("SELECT media_type, tmdb_id FROM media WHERE id=?", (media_id,)).fetchone()
+        if row is None or not row["tmdb_id"] or row["media_type"] not in ("movie", "tv"):
+            return [], 0
+        try:
+            rows = re0_sync.candidate_rows(conn, row["media_type"], int(row["tmdb_id"]), (provider,) if provider else (), now=utc_now())
+        except sqlite3.OperationalError:
+            return [], 0
+    finally:
+        conn.close()
+    return re0_sync.split_invalid(rows, include_invalid)
+
+
+@app.get("/api/library/re0-media/<media_type>/<int:tmdb_id>")
+def api_library_re0_media(media_type, tmdb_id):
+    """Detail view for a remote-only projection (spec §10.4.4 item 3):
+    the same shape the local detail view renders, with no local groups."""
+    store, error = _library_store_or_error(False)
+    if error:
+        return error
+    if media_type not in ("movie", "tv"):
+        return json_error("media_type 必须为 movie/tv", 400, "LIBRARY_SEARCH_TYPE_INVALID")
+    provider = request.args.get("provider") or None
+    if provider is not None and provider not in library_normalize.PROVIDERS:
+        return json_error("provider 参数不正确", 400, "LIBRARY_PROVIDER_INVALID")
+    re0_sync.catalog_projections(store, [(media_type, tmdb_id)], charmap=_library_charmap(store))
+    conn = store.connect(readonly=True)
+    try:
+        proj = re0_sync.projection_row(conn, media_type, tmdb_id)
+        if proj is None:
+            return json_error("未找到该 RE0 媒体", 404, "RE0_MEDIA_NOT_FOUND")
+        local_id = proj["local_media_id"] or re0_sync.local_media_id_for(conn, media_type, tmdb_id)
+        candidates = re0_sync.candidate_rows(conn, media_type, tmdb_id, (provider,) if provider else (), now=utc_now())
+    finally:
+        conn.close()
+    try:
+        ratings = json.loads(proj["ratings_json"] or "{}")
+    except ValueError:
+        ratings = {}
+    include_invalid = (request.args.get("include_invalid") or "").strip().lower() in {"1", "true"}
+    candidates, hidden_invalid = re0_sync.split_invalid(candidates, include_invalid)
+    facets = _merge_re0_facets([], candidates)
+    return jsonify({
+        "success": True, "media_ref": f"re0:{media_type}:{tmdb_id}", "media_id": local_id, "media_type": media_type, "tmdb_id": tmdb_id,
+        "title": proj["title"], "original_title": proj["original_title"], "year": proj["year"], "overview": proj["overview"],
+        "poster_url": _tmdb_image_url(proj["poster_path"], LIBRARY_POSTER_SIZE), "poster_large_url": _tmdb_image_url(proj["poster_path"], LIBRARY_POSTER_LARGE_SIZE),
+        "backdrop_url": _tmdb_image_url(proj["backdrop_path"], LIBRARY_BACKDROP_SIZE), "genres": [], "match_status": "re0",
+        "ratings": ratings, "ratings_status": proj["ratings_status"], "metadata_status": proj["metadata_status"],
+        "groups": [], "group_count": 0,
+        "provider_facets": facets, "provider_count": len(facets), "re0_candidates": candidates,
+        "re0_invalid_hidden_count": hidden_invalid,
+        "re0_calendar": _re0_calendar_for_projection(store, media_type, tmdb_id),
+    })
+
+
+def _re0_calendar_for_projection(store, media_type: str, tmdb_id: int) -> dict | None:
+    if media_type != "tv":
+        return None
+    conn = store.connect(readonly=True)
+    try:
+        return re0_sync.next_event_for(conn, "tv", tmdb_id, now=utc_now(), local_max_season=None)
+    finally:
+        conn.close()
+
+
+@app.get("/api/library/re0/discoveries")
+def api_library_re0_discoveries():
+    """Home rail (spec §10.2): remote-only projections whose metadata is
+    complete and that carry at least one RE0 candidate. Never touches the
+    hero/recommendation selection, which stays local-media only."""
+    store, error = _library_store_or_error(False)
+    if error:
+        return error
+    try:
+        limit = int(request.args.get("limit", "12"))
+    except ValueError:
+        return json_error("limit 必须为整数", 400, "BAD_REQUEST")
+    if not (1 <= limit <= 24):
+        return json_error("limit 超出范围", 400, "BAD_REQUEST")
+    conn = store.connect(readonly=True)
+    try:
+        try:
+            refs = [(r["media_type"], int(r["tmdb_id"])) for r in conn.execute(
+                "SELECT media_type, tmdb_id FROM re0_media_projection p WHERE metadata_status='complete' "
+                "AND NOT EXISTS (SELECT 1 FROM resource_group rg JOIN resource_link rl ON rl.group_id=rg.id "
+                f"WHERE rg.media_id=p.local_media_id AND {library_store.live_link_sql('rl')}) "
+                "AND poster_path IS NOT NULL AND overview IS NOT NULL AND overview != '' ORDER BY last_seen_at DESC LIMIT ?", (limit * 3,))]
+            items = re0_sync.projection_items(conn, refs, (), _re0_image_url)[:limit]
+        except sqlite3.OperationalError:
+            items = []
+    finally:
+        conn.close()
+    return jsonify({"success": True, "items": items})
+
+
+@app.get("/api/library/re0/status")
+def api_library_re0_status():
+    store, error = _library_store_or_error(False)
+    if error:
+        return error
+    now = utc_now()
+    conn = store.connect(readonly=True)
+    try:
+        try:
+            summary = re0_sync.status_summary(conn, now)
+        except sqlite3.OperationalError:
+            summary = {"projections": {}, "resources": {}, "actions_today": 0, "last_error_class": None}
+    finally:
+        conn.close()
+    token_row = get_tokens()
+    settings = _re0_settings()
+    conn = store.connect(readonly=True)
+    try:
+        try:
+            sync = re0_sync.run_status(conn, now)
+        except sqlite3.OperationalError:
+            sync = None
+    finally:
+        conn.close()
+    return jsonify({
+        "success": True,
+        "sync": sync,
+        "configured": bool(config_value("hdhive_app_secret", "HDHIVE_APP_SECRET")),
+        "client_id_configured": bool(config_value("hdhive_client_id", "HDHIVE_CLIENT_ID")),
+        "authorized": bool(token_row and decrypt_token(token_row, "access_token")),
+        "budget": _re0_client().budget_status(), "daily_cap": settings["daily_cap"], "min_interval_ms": settings["min_interval_ms"],
+        "direct_search": bool(settings["direct_search_path"]), **summary,
+    })
+
+
+def _re0_check_server_quota(client: "re0_sync.Re0Client", store, now: int) -> None:
+    """Once per day (spec §4.1/§10.4.6): read /api/open/quota and, when RE0
+    reports an integer remaining count, cap today's requests at half of it."""
+    day = datetime.now(_CLOUD_TIMEZONE).date().isoformat()
+    conn = store.connect()
+    try:
+        if re0_sync.state_get(conn, f"quota_checked:{day}"):
+            return
+        re0_sync.state_set(conn, f"quota_checked:{day}", "1", now)
+        conn.commit()
+    finally:
+        conn.close()
+    result = client.get("/api/open/quota")
+    remaining = None
+    if result.ok and isinstance(result.data, dict):
+        value = result.data.get("endpoint_remaining")
+        remaining = int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+    client.apply_server_quota(remaining)
+
+
+_RE0_REFRESH_THROTTLE_SECONDS = 60
+_RE0_OWNERSHIP_TTL_SECONDS = 300
+
+
+@app.post("/api/library/re0/refresh")
+def api_library_re0_refresh():
+    """User-triggered refresh of ONE media's RE0 resources (spec §10.4.3):
+    bypasses the 24h resource TTL, still budgeted/cooled down, throttled
+    per media, read-only."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    body = request_json()
+    media_type = str(body.get("media_type") or "")
+    tmdb_id = body.get("tmdb_id")
+    if media_type not in ("movie", "tv") or not isinstance(tmdb_id, int) or isinstance(tmdb_id, bool) or tmdb_id <= 0:
+        return json_error("media_type 必须为 movie/tv，tmdb_id 必须为正整数", 400, "BAD_REQUEST")
+    # Ownership may change on RE0's website without a local action. For
+    # unresolved candidates, detail opens revalidate at most every five
+    # minutes, shared across users; settled resources retain the 24h TTL.
+    if_stale = body.get("if_stale") is True
+    now = utc_now()
+    key = f"refresh_media:{media_type}:{tmdb_id}"
+    conn = store.connect()
+    try:
+        proj = re0_sync.projection_row(conn, media_type, tmdb_id)
+        unresolved = conn.execute(
+            "SELECT 1 FROM re0_resource WHERE media_type=? AND tmdb_id=? "
+            "AND state IN ('candidate','already_unlocked') LIMIT 1", (media_type, tmdb_id),
+        ).fetchone()
+        ttl = _RE0_OWNERSHIP_TTL_SECONDS if unresolved else re0_sync.RESOURCES_TTL_SECONDS
+        if if_stale and proj and proj["last_fetched_at"] and now - int(proj["last_fetched_at"]) < ttl:
+            return jsonify({"success": True, "fetched": False, "skipped": "fresh"})
+        last = int(re0_sync.state_get(conn, key) or 0)
+        if now - last < _RE0_REFRESH_THROTTLE_SECONDS:
+            return json_error(f"刚刚刷新过，请 {_RE0_REFRESH_THROTTLE_SECONDS - (now - last)} 秒后再试", 429, "RE0_REFRESH_TOO_SOON")
+        re0_sync.state_set(conn, key, str(now), now)
+        salt = _re0_slug_salt(conn)
+        media_id = re0_sync.local_media_id_for(conn, media_type, tmdb_id)
+        title_row = conn.execute("SELECT title_zh FROM media WHERE id=?", (media_id,)).fetchone() if media_id else None
+        conn.commit()
+    finally:
+        conn.close()
+    title = (title_row["title_zh"] if title_row else None) or (proj["title"] if proj else f"TMDB {tmdb_id}")
+    result = _re0_client().get(f"/api/open/resources/{media_type}/{tmdb_id}")
+    if not result.ok:
+        status = {"rate_limited": 429, "reauth_required": 401, "scope_denied": 403, "user_level_denied": 403, "quota_exhausted": 429}.get(result.error_class, 502)
+        payload = {"success": False, "code": "RE0_" + (result.error_class or "upstream_error").upper(), "message": result.message or "RE0 查询失败"}
+        if result.retry_after:
+            payload["retry_after"] = result.retry_after
+        return jsonify(payload), status
+    raw_items = result.data if isinstance(result.data, list) else ((result.data or {}).get("items") if isinstance(result.data, dict) else [])
+    report = re0_sync.record_items(store, media_type, tmdb_id, raw_items or [], media_id=media_id, media_title=title, salt=salt, now=now)
+    re0_sync.upsert_projection(store, media_type, tmdb_id, title=title, year=None, overview=None, poster_path=None, backdrop_path=None, ratings={}, now=now, local_media_id=media_id)
+    conn = store.connect()
+    try:
+        conn.execute("UPDATE re0_media_projection SET last_fetched_at=?, updated_at=? WHERE media_type=? AND tmdb_id=?", (now, now, media_type, tmdb_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"success": True, "fetched": True, "report": report, "message": f"RE0 返回 {report['remote_items']} 条，新增候选 {report['new']}"})
+
+
+_RE0_PREVIEW_ERROR_MESSAGES = {
+    "rate_limited": "RE0 限流，请稍后再试",
+    "reauth_required": "RE0 授权已失效，请到设置页重新授权",
+    "quota_exhausted": "今日 RE0 查询额度已用完，请稍后再试",
+}
+
+
+@app.get("/api/library/re0/candidates/<int:candidate_id>/file-preview")
+def api_library_re0_file_preview(candidate_id):
+    """Work order §5.2: what is inside one RE0 share, on demand.
+
+    The client sends only a local candidate id -- the slug is decrypted
+    server-side and never leaves it. Read-only: no unlock, no points, no
+    ``resource_link`` write, no change to local link-check. A ready preview is
+    cached 12h, a confirmed-invalid share 5 minutes, a pan or account tier
+    that cannot preview at all 12h; 429/5xx are not cached."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    started = time.monotonic()
+    result = re0_sync.file_preview(store, _re0_client(), resource_id=candidate_id, now=utc_now())
+    if result.get("error_class") in ("unknown_resource", "slug_unreadable"):
+        return json_error("未找到该 RE0 候选", 404, "RE0_CANDIDATE_NOT_FOUND")
+    status = {"rate_limited": 429, "reauth_required": 401, "quota_exhausted": 429}.get(result.get("error_class") or "", 200)
+    LOG.info("re0 file-preview candidate=%s status=%s cached=%s files=%s ms=%s", candidate_id, result["status"],
+             result.get("cached"), result.get("file_count"), int((time.monotonic() - started) * 1000))
+    payload = {"success": status == 200, "preview": result}
+    if status != 200:
+        # The browser's fetch wrapper reads `message`/`code`/`retry_after` off
+        # the body for any non-2xx -- without them the user only sees the
+        # status number.
+        error_class = result.get("error_class") or "upstream_error"
+        payload["code"] = "RE0_" + error_class.upper()
+        payload["message"] = _RE0_PREVIEW_ERROR_MESSAGES.get(error_class, "文件预览暂不可用")
+        if result.get("retry_after"):
+            payload["retry_after"] = result["retry_after"]
+            payload["message"] = f"RE0 限流，{result['retry_after']} 秒后再试"
+    return jsonify(payload), status
+
+
+_RE0_SYNC_PHASES = ("status", "refresh-existing", "reconcile", "discover-calendar", "discover-top", "discover-bounded", "tv-follow",
+                    "file-list", "probe-resources")
+
+
+def _re0_sync_lock():
+    """The RE0 sync's own run lock (spec §11.1): distinct from the TMDB
+    enricher, link-checker, check-in and OpenList-sync locks. Returns the
+    open file (caller keeps it until done) or None when another run holds it."""
+    lock_path = DATA_DIR / "re0-sync.run.lock"
+    lock_file = lock_path.open("a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def re0_sync_cli(argv: list[str]) -> dict:
+    """``app.py --re0-sync`` (spec §11.3): status / refresh-existing /
+    reconcile. Read-only against RE0 -- there is deliberately no phase or
+    flag that spends points. ``--dry-run``/``--no-network`` select without
+    building a client or writing anything."""
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="app.py --re0-sync", add_help=False)
+    parser.add_argument("--phase", default="status")
+    parser.add_argument("--limit", type=int, default=25)
+    parser.add_argument("--max-requests", dest="max_requests", type=int, default=None)
+    parser.add_argument("--media-ids", dest="media_ids", default="")
+    parser.add_argument("--tmdb-ids", dest="tmdb_ids", default="")
+    parser.add_argument("--resource-ids", dest="resource_ids", default="")
+    parser.add_argument("--media-type", dest="media_type", default="movie", choices=["movie", "tv"])
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true")
+    parser.add_argument("--no-network", dest="no_network", action="store_true")
+    parser.add_argument("--resume", action="store_true", default=True)
+    parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--db", default=None)
+    parser.add_argument("--days", type=int, default=None)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return {"ok": False, "error": "RE0_SYNC_ARGS_INVALID"}
+    if args.phase not in _RE0_SYNC_PHASES:
+        return {"ok": False, "error": "RE0_SYNC_PHASE_INVALID", "phases": list(_RE0_SYNC_PHASES)}
+    try:
+        store = library_store.open_installed(Path(args.db) if args.db else LIBRARY_DB_PATH, load_fernet())
+    except (library_store.LibraryNotInstalled, library_store.LibraryNotEncrypted, library_store.LibrarySchemaMismatch,
+            library_store.LibraryIndexUnreadable) as exc:
+        return {"ok": False, "error": type(exc).__name__}
+    now = utc_now()
+    settings = _re0_settings()
+    dry_run = args.dry_run or args.no_network
+    def _ids(raw: str) -> list[int]:
+        return [int(x) for x in raw.split(",") if x.strip().isdigit()]
+    if args.phase == "status":
+        client = _re0_client()
+        _re0_check_server_quota(client, store, now)
+        conn = store.connect(readonly=True)
+        try:
+            sync = re0_sync.run_status(conn, now)
+            summary = re0_sync.status_summary(conn, now)
+        finally:
+            conn.close()
+        conn = store.connect(readonly=True)
+        try:
+            calendar = re0_sync.calendar_status(conn, now)
+        finally:
+            conn.close()
+        return {"ok": True, "phase": "status", "budget": client.budget_status(), "daily_cap": settings["daily_cap"],
+                "min_interval_ms": settings["min_interval_ms"], "sync": sync, "calendar": calendar,
+                "streaming_top_sources": setting_get("re0_streaming_top_sources") or "", **summary}
+    lock_file = _re0_sync_lock()
+    if lock_file is None:
+        return {"ok": False, "error": "RE0_SYNC_BUSY"}
+    try:
+        conn = store.connect()
+        try:
+            salt = _re0_slug_salt(conn)
+        finally:
+            conn.close()
+        client = None if dry_run else _re0_client()
+        if client is not None:
+            _re0_check_server_quota(client, store, now)
+        max_requests = args.max_requests if args.max_requests is not None else settings["daily_cap"]
+        if args.phase == "refresh-existing":
+            report = re0_sync.refresh_existing(
+                store, client, limit=max(1, args.limit), max_requests=max(1, max_requests), salt=salt, now=now,
+                media_ids=_ids(args.media_ids) or None, tmdb_ids=_ids(args.tmdb_ids) or None, resume=not args.restart, dry_run=dry_run,
+            )
+        elif args.phase == "reconcile":
+            report = re0_sync.reconcile_report(store, client, limit=max(1, args.limit), salt=salt, now=now, dry_run=dry_run)
+        elif args.phase == "discover-calendar":
+            days = args.days or int(setting_get("re0_calendar_days") or os.getenv("RE0_SYNC_CALENDAR_DAYS") or 31)
+            if dry_run:
+                report = {"phase": "discover-calendar", "dry_run": True, "would_fetch": True, "days": days}
+            else:
+                report = re0_sync.discover_calendar(store, client, days=days, now=now)
+        elif args.phase == "discover-top":
+            sources = [s for s in (setting_get("re0_streaming_top_sources") or os.getenv("RE0_STREAMING_TOP_SOURCES") or "").split(",") if s]
+            if dry_run:
+                report = {"phase": "discover-top", "dry_run": True, "sources": [":".join(t) for t in re0_sync.parse_top_sources(",".join(sources))]}
+            else:
+                report = re0_sync.discover_top(store, client, sources=sources, now=now)
+        elif args.phase == "file-list":
+            # Round 26: read-only preview of what is inside a share (合集包 vs
+            # 单集) -- one GET per candidate, and it spends no points. (The
+            # word this guard forbids belongs to the click-only route.)
+            ids = _ids(args.resource_ids)[:max(1, args.limit)]
+            if not ids:
+                return {"ok": False, "error": "RE0_FILE_LIST_NEEDS_RESOURCE_IDS"}
+            if dry_run:
+                report = {"phase": "file-list", "dry_run": True, "would_request": len(ids), "resource_ids": ids}
+            else:
+                previews = [re0_sync.fetch_file_list(store, client, resource_id=rid, now=now) for rid in ids]
+                report = {"phase": "file-list", "requested": len(previews), "succeeded": sum(1 for p in previews if p.get("ok")),
+                          "failed": sum(1 for p in previews if not p.get("ok")), "previews": previews}
+        elif args.phase == "probe-resources":
+            # Round 27 diagnostic: what the upstream returns for one media,
+            # item by item, next to the rows we kept. Writes nothing.
+            targets: list[tuple[str, int]] = []
+            conn = store.connect(readonly=True)
+            try:
+                for mid in _ids(args.media_ids):
+                    row = conn.execute("SELECT media_type, tmdb_id FROM media WHERE id=? AND tmdb_id IS NOT NULL", (mid,)).fetchone()
+                    if row is not None and row["media_type"] in ("movie", "tv"):
+                        targets.append((row["media_type"], int(row["tmdb_id"])))
+                for tid in _ids(args.tmdb_ids):
+                    targets.append((args.media_type, tid))
+            finally:
+                conn.close()
+            seen_targets: list[tuple[str, int]] = []
+            for target in targets:
+                if target not in seen_targets:
+                    seen_targets.append(target)
+            seen_targets = seen_targets[:max(1, args.limit)]
+            if not seen_targets:
+                return {"ok": False, "error": "RE0_PROBE_NEEDS_IDS"}
+            if dry_run:
+                report = {"phase": "probe-resources", "dry_run": True, "would_request": len(seen_targets),
+                          "targets": [f"{t}:{i}" for t, i in seen_targets]}
+            else:
+                probes = [re0_sync.probe_resources(store, client, media_type=t, tmdb_id=i, salt=salt, now=now) for t, i in seen_targets]
+                report = {"phase": "probe-resources", "requested": len(probes), "succeeded": sum(1 for p in probes if p.get("ok")),
+                          "failed": sum(1 for p in probes if not p.get("ok")), "probes": probes}
+        elif args.phase == "tv-follow":
+            cap = int(setting_get("re0_tv_follow_daily_cap") or os.getenv("RE0_SYNC_TV_FOLLOW_DAILY_CAP") or 20)
+            if dry_run:
+                report = {"phase": "tv-follow", "dry_run": True, "would_query_up_to": min(max(1, args.limit), cap)}
+            else:
+                report = re0_sync.tv_follow_phase(store, client, limit=min(max(1, args.limit), cap), salt=salt, now=now)
+        else:
+            if dry_run:
+                conn = store.connect(readonly=True)
+                try:
+                    pending = conn.execute("SELECT COUNT(*) FROM re0_media_projection WHERE local_media_id IS NULL AND (last_fetched_at IS NULL OR last_fetched_at <= ?)",
+                                           (now - re0_sync.RESOURCES_TTL_SECONDS,)).fetchone()[0]
+                finally:
+                    conn.close()
+                report = {"phase": "discover-bounded", "dry_run": True, "would_request": min(int(pending), max(1, args.limit), max(1, max_requests))}
+            else:
+                report = re0_sync.discover_bounded(store, client, limit=max(1, args.limit), max_requests=max(1, max_requests), salt=salt, now=now)
+        report.setdefault("dry_run", dry_run)
+        if not dry_run:
+            audit("re0.sync", "success" if report.get("status", "completed") in ("completed", "budget_reached") else "failed",
+                  f"phase={args.phase} requested={report.get('requested', report.get('queried', 0))} succeeded={report.get('succeeded', 0)} "
+                  f"failed={report.get('failed', 0)} error={report.get('error_class')}", "system")
+        report["ok"] = True
+        return report
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+def run_re0_sync(argv: list[str]) -> int:
+    init_db()
+    report = re0_sync_cli(argv)
+    print(json.dumps(report, ensure_ascii=False))
+    return 0 if report.get("ok") else 1
+
+
+@app.post("/api/library/re0/run-small")
+def api_library_re0_run_small():
+    """Settings-card probe (spec §10.3): one media, one read-only RE0
+    request, never an unlock."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    lock_file = _re0_sync_lock()
+    if lock_file is None:
+        return json_error("RE0 同步正在运行，请稍后再试", 409, "RE0_SYNC_BUSY")
+    try:
+        conn = store.connect()
+        try:
+            salt = _re0_slug_salt(conn)
+        finally:
+            conn.close()
+        report = re0_sync.refresh_existing(store, _re0_client(), limit=1, max_requests=1, salt=salt, now=utc_now())
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+    audit("re0.sync", "success" if report["status"] in ("completed", "budget_reached") else "failed",
+          f"phase=run-small requested={report['requested']} succeeded={report['succeeded']} failed={report['failed']} error={report['error_class']}", actor_id())
+    return jsonify({"success": report["error_class"] is None, "report": report, "message": "已探测 1 条（只读）" if report["error_class"] is None else ("探测失败：" + str(report["error_class"]))})
+
+
+_RE0_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_RE0_ACTIONS = {"transfer", "copy", "cloud"}
+
+
+@app.post("/api/library/re0-resource/<int:resource_id>/unlock-and-action")
+def api_library_re0_unlock_and_action(resource_id):
+    """The ONLY code path that calls RE0's unlock endpoint: one slug, on an
+    explicit user click, idempotent per ``request_id``. On success (or
+    ``already_owned``) the payload is encrypted into ``resource_link``
+    (insert-only) and the caller continues with the existing transfer /
+    reveal-copy / cloud-download flows on ``link_public_id``."""
+    store, error = _library_store_or_error(True)
+    if error:
+        return error
+    body = request_json()
+    action = str(body.get("action") or "")
+    request_id = str(body.get("request_id") or "")
+    if action not in _RE0_ACTIONS:
+        return json_error("action 只能是 transfer/copy/cloud", 400, "BAD_REQUEST")
+    if not _RE0_REQUEST_ID_RE.match(request_id):
+        return json_error("request_id 格式不正确", 400, "BAD_REQUEST")
+    now = utc_now()
+    conn = store.connect(readonly=True)
+    try:
+        res = conn.execute("SELECT * FROM re0_resource WHERE id=?", (resource_id,)).fetchone()
+        if res is None:
+            return json_error("未找到该 RE0 资源", 404, "RE0_RESOURCE_NOT_FOUND")
+        res = dict(res)
+        prior = re0_sync.action_get(conn, request_id, resource_id)
+        assoc = conn.execute(
+            "SELECT l.public_id, l.id FROM re0_resource_link rl JOIN resource_link l ON l.id = rl.resource_link_id WHERE rl.re0_resource_id=? ORDER BY rl.linked_at DESC LIMIT 1",
+            (resource_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    expected = re0_sync.action_for_provider(res["provider_code"])
+    if expected == "unavailable":
+        return json_error("该网盘类型暂未映射，无法自动解锁", 409, "RE0_PROVIDER_UNMAPPED")
+    # §3.3: a share RE0 confirmed dead is refused BEFORE the slug is decrypted
+    # and before any unlock request -- but only when nothing of it exists
+    # locally yet; an already materialised candidate keeps its idempotent
+    # replay path below. checking / unknown / preview_unavailable are not
+    # verdicts and never land here.
+    if prior is None and assoc is None and _re0_effective_status(store, res, now) == "invalid":
+        LOG.info("re0 unlock refused resource=%s reason=invalid", resource_id)
+        audit("re0.unlock", "refused", f"resource={resource_id} hash={res['slug_hash'][:12]} reason=invalid", "user")
+        return json_error("该 RE0 分享已被标记失效，请选择其他候选", 409, "RE0_RESOURCE_INVALID")
+    if action != expected:
+        return json_error(f"该资源只支持「{expected}」动作", 400, "RE0_ACTION_NOT_ALLOWED")
+    slug_hash_short = res["slug_hash"][:12]
+
+    def _done(link_public_id: str, *, already_owned: bool, points, replayed: bool, media_id):
+        return jsonify({
+            "success": True, "replayed": replayed, "next_action": action, "provider": res["provider_code"], "link_public_id": link_public_id,
+            "media_id": media_id, "already_owned": already_owned, "unlock_points": points,
+        })
+
+    if prior is not None and prior["status"] == "success" and prior["resource_link_id"]:
+        conn = store.connect(readonly=True)
+        try:
+            link = conn.execute("SELECT public_id FROM resource_link WHERE id=?", (prior["resource_link_id"],)).fetchone()
+        finally:
+            conn.close()
+        if link is not None:
+            return _done(link["public_id"], already_owned=bool(prior["already_owned"]), points=prior["unlock_points"], replayed=True, media_id=res["media_id"])
+    if assoc is not None:
+        # Already materialised by an earlier action or a search-time unlocked
+        # payload: never unlock twice, just continue with the action.
+        conn = store.connect()
+        try:
+            re0_sync.action_put(conn, request_id, resource_id, action, "success", result_code="already_materialized", resource_link_id=int(assoc["id"]),
+                                already_owned=True, unlock_points=0, now=now)
+            conn.commit()
+        finally:
+            conn.close()
+        return _done(assoc["public_id"], already_owned=True, points=0, replayed=False, media_id=res["media_id"])
+
+    # Nothing local to reuse: this would spend points, so the member policy
+    # decides before the slug is even decrypted.
+    refused = member_unlock_refused(f"resource={resource_id}")
+    if refused is not None:
+        return refused
+
+    # §10.2: one unlock per resource at a time, across users and workers.
+    holder = f"{actor_id()}:{request_id}"
+    lease_key = re0_sync.resource_lease_key(resource_id)
+    conn = store.connect()
+    try:
+        got_lease = re0_sync.acquire_unlock_lease(conn, lease_key, holder=holder, now=now)
+        conn.commit()
+    finally:
+        conn.close()
+    if not got_lease:
+        # Somebody is unlocking this very share. Look again before paying:
+        # by the time they finish there is a local link to use instead.
+        conn = store.connect(readonly=True)
+        try:
+            fresh = re0_sync.materialized_link(conn, resource_id)
+        finally:
+            conn.close()
+        if fresh is not None:
+            return _done(fresh["public_id"], already_owned=True, points=0, replayed=False, media_id=res["media_id"])
+        return json_error("该资源正在解锁中，请稍后重试", 409, "RE0_UNLOCK_IN_PROGRESS")
+
+    try:
+        # R08: holding the lease is not the same as there being nothing here.
+        # Whoever held it before may have just finished, in which case there
+        # is a local link to use and nothing left to buy.
+        conn = store.connect(readonly=True)
+        try:
+            fresh = re0_sync.materialized_link(conn, resource_id)
+        finally:
+            conn.close()
+        if fresh is not None:
+            conn = store.connect()
+            try:
+                re0_sync.action_put(conn, request_id, resource_id, action, "success",
+                                    result_code="already_materialized", resource_link_id=int(fresh["id"]),
+                                    already_owned=True, unlock_points=0, now=now)
+                conn.commit()
+            finally:
+                conn.close()
+            return _done(fresh["public_id"], already_owned=True, points=0, replayed=False,
+                         media_id=res["media_id"])
+        # G03.3: two states this resource may be in that mean "do not buy it".
+        resumed = _re0_resume_pending(store, res, resource_id, action, request_id, now, _done)
+        if resumed is not None:
+            return resumed
+        if re0_sync.resource_state(store, resource_id) == re0_sync.STATE_RESULT_UNKNOWN:
+            return json_error(_RE0_UNCERTAIN_MESSAGE, 409, "RE0_UNLOCK_RESULT_UNKNOWN")
+        try:
+            slug = store.fernet.decrypt(res["slug_ciphertext"]).decode("utf-8")
+        except Exception:  # noqa: BLE001
+            return json_error("主密钥不可用", 503, "LIBRARY_KEY_UNAVAILABLE")
+        return _unlock_and_action_locked(
+            store, res, resource_id, action, request_id, slug, slug_hash_short, now, _done)
+    finally:
+        conn = store.connect()
+        try:
+            re0_sync.release_unlock_lease(conn, lease_key, holder=holder)
+            conn.commit()
+        finally:
+            conn.close()
+
+
+_RE0_UNCERTAIN_MESSAGE = ("RE0 未确认这次解锁的结果。已记录为待确认：再次点击不会重复请求解锁，"
+                          "请稍后在 RE0 页面确认后重试。")
+
+
+def _re0_save_unlocked(store, resource_id: int, payload: dict, *, media_id, media_title, now: int):
+    """Save a confirmed unlock, having first recorded that it *is* confirmed.
+
+    G03.3: the order matters. RE0 has already charged for this by the time we
+    get here, so the fact of the unlock is persisted before the save is
+    attempted -- if the save then fails, the next click recovers from the
+    record instead of buying the same thing again. Returns
+    ``(outcome, error_class)``; ``outcome`` is None when the save failed and
+    the payload is left pending.
+    """
+    re0_sync.remember_unlock_pending(
+        store, resource_id, url=payload["url"], access_code=payload.get("access_code"),
+        points=payload.get("points"), already_owned=bool(payload.get("already_owned")), now=now)
+    try:
+        outcome = re0_sync.materialize(store, resource_id, payload["url"], payload.get("access_code"),
+                                       media_id=media_id, media_title=media_title, now=now)
+    except (ValueError, sqlite3.DatabaseError) as exc:
+        return None, type(exc).__name__
+    return outcome, None
+
+
+def _re0_resume_pending(store, res, resource_id, action, request_id, now, _done):
+    """Finish a save that was left pending, spending nothing.
+
+    G03.3: "已解锁但待保存" is a state the next click resumes from, through
+    whichever entry it arrives at.
+    """
+    pending = re0_sync.pending_unlock(store, resource_id)
+    if pending is None:
+        return None
+    media_id = res["media_id"]
+    if media_id is None and res["tmdb_id"]:
+        media_id = re0_sync.local_media_id_for(store.connect(readonly=True), res["media_type"], int(res["tmdb_id"]))
+    if media_id is None:
+        media_id = re0_sync.create_media_from_projection(store, res["media_type"], int(res["tmdb_id"]), now)
+    if media_id is None:
+        return json_error("缺少该媒体的投影，无法落库；已解锁的结果仍在本地待保存，不会重复扣分",
+                          409, "RE0_PROJECTION_MISSING")
+    outcome, failure = _re0_save_unlocked(store, resource_id, pending, media_id=media_id,
+                                         media_title=res["media_title"], now=now)
+    if outcome is None:
+        audit("re0.unlock", "failed", f"resource={res['slug_hash'][:12]} error=pending_save_failed class={failure}", actor_id())
+        return json_error("RE0 已解锁该资源，但本地保存失败；不会重复扣分，请稍后重试", 502,
+                          "RE0_UNLOCK_PENDING_SAVE")
+    conn = store.connect()
+    try:
+        link = conn.execute("SELECT public_id FROM resource_link WHERE id=?", (outcome["resource_link_id"],)).fetchone()
+        re0_sync.action_put(conn, request_id, resource_id, action, "success", result_code="pending_save_resumed",
+                            resource_link_id=outcome["resource_link_id"], already_owned=True,
+                            unlock_points=0, now=now)
+        conn.commit()
+    finally:
+        conn.close()
+    re0_sync.clear_unlock_pending(store, resource_id, now=now)
+    audit("re0.unlock", "success", f"resource={res['slug_hash'][:12]} action={action} relation=pending_save_resumed", actor_id())
+    return _done(link["public_id"], already_owned=True, points=0, replayed=False, media_id=media_id)
+
+
+def _unlock_and_action_locked(store, res, resource_id, action, request_id, slug, slug_hash_short, now, _done):
+    """The unlock itself, with this resource's lease held. Split out so the
+    lease is released on every path out, including a raised exception."""
+    # G03.1: a purchase is never repeated automatically.
+    result = _re0_client().post("/api/open/resources/unlock", json={"slug": slug}, consuming=True)
+    started = time.monotonic()
+    if not result.ok:
+        uncertain = result.error_class in re0_sync.UNCERTAIN_ERROR_CLASSES
+        if uncertain:
+            # G03.3: a 5xx, a timeout or an unparseable body does not say the
+            # purchase did not happen. Record it so the next click asks the
+            # user instead of asking RE0 again.
+            re0_sync.remember_unlock_unknown(store, resource_id, error_class=result.error_class, now=now)
+        conn = store.connect()
+        try:
+            re0_sync.action_put(conn, request_id, resource_id, action,
+                                "unknown" if uncertain else "failed", result_code=result.error_class,
+                                resource_link_id=None, already_owned=False, unlock_points=None, now=now)
+            conn.commit()
+        finally:
+            conn.close()
+        audit("re0.unlock", "unknown" if uncertain else "failed",
+              f"resource={slug_hash_short} provider={res['provider_code']} action={action} error={result.error_class} status={result.status}", actor_id())
+        if uncertain:
+            return jsonify({"success": False, "code": "RE0_UNLOCK_RESULT_UNKNOWN",
+                            "message": _RE0_UNCERTAIN_MESSAGE}), 502
+        status = {"rate_limited": 429, "reauth_required": 401, "scope_denied": 403, "user_level_denied": 403, "quota_exhausted": 429}.get(result.error_class, 502)
+        code = "RE0_" + (result.error_class or "upstream_error").upper()
+        payload = {"success": False, "code": code, "message": result.message or "RE0 解锁失败"}
+        if result.retry_after:
+            payload["retry_after"] = result.retry_after
+        return jsonify(payload), status
+    unlocked = re0_sync.parse_unlock_payload(result.data, slug)
+    if not unlocked["url"]:
+        conn = store.connect()
+        try:
+            re0_sync.action_put(conn, request_id, resource_id, action, "failed", result_code="already_unlocked_no_payload", resource_link_id=None,
+                                already_owned=unlocked["already_owned"], unlock_points=unlocked["points"], now=now)
+            conn.execute("UPDATE re0_resource SET state='already_unlocked', last_error_class='already_unlocked_no_payload', updated_at=? WHERE id=?", (now, resource_id))
+            conn.commit()
+        finally:
+            conn.close()
+        audit("re0.unlock", "failed", f"resource={slug_hash_short} provider={res['provider_code']} action={action} error=already_unlocked_no_payload", actor_id())
+        return json_error("RE0 已解锁但未返回链接，请稍后在 RE0 页面查看", 502, "RE0_ALREADY_UNLOCKED_NO_PAYLOAD")
+    # RE0 has confirmed this is ours: record that *now*, before anything that
+    # can still fail -- resolving the media, creating it from the projection,
+    # parsing the link, writing the library. Every one of those used to be a
+    # way for a paid unlock to be forgotten and bought again on the next click.
+    re0_sync.remember_unlock_pending(
+        store, resource_id, url=unlocked["url"], access_code=unlocked["access_code"],
+        points=unlocked["points"], already_owned=bool(unlocked["already_owned"]), now=now)
+    media_id = res["media_id"] or re0_sync.local_media_id_for(store.connect(readonly=True), res["media_type"], int(res["tmdb_id"]))
+    if media_id is None:
+        media_id = re0_sync.create_media_from_projection(store, res["media_type"], int(res["tmdb_id"]), now)
+        if media_id is None:
+            audit("re0.unlock", "failed", f"resource={slug_hash_short} provider={res['provider_code']} action={action} error=projection_missing pending_save=1", actor_id())
+            return json_error("缺少该媒体的投影，无法落库；已解锁的结果已在本地待保存，不会重复扣分",
+                              409, "RE0_PROJECTION_MISSING")
+        audit("re0.media.create", "success", f"tmdb={res['media_type']}:{res['tmdb_id']} reason=re0_public_tmdb_id", actor_id())
+    outcome, failure = _re0_save_unlocked(store, resource_id, unlocked, media_id=media_id,
+                                          media_title=res["media_title"], now=now)
+    if outcome is None:
+        # G03.3: the unlock happened; only the local save did not. Saying
+        # "unlock failed" here is what made the next click pay again.
+        audit("re0.unlock", "failed", f"resource={slug_hash_short} provider={res['provider_code']} action={action} error=materialize_failed class={failure}", actor_id())
+        return json_error("RE0 已解锁该资源，但本地保存失败；不会重复扣分，请稍后重试", 502,
+                          "RE0_UNLOCK_PENDING_SAVE")
+    conn = store.connect()
+    try:
+        re0_sync.action_put(conn, request_id, resource_id, action, "success", result_code="unlocked", resource_link_id=outcome["resource_link_id"],
+                            already_owned=unlocked["already_owned"], unlock_points=unlocked["points"], now=now)
+        link = conn.execute("SELECT public_id FROM resource_link WHERE id=?", (outcome["resource_link_id"],)).fetchone()
+        conn.commit()
+    finally:
+        conn.close()
+    duration_ms = int((time.monotonic() - started) * 1000)
+    audit("re0.unlock", "success",
+          f"resource={slug_hash_short} provider={res['provider_code']} action={action} relation={outcome['relation']} "
+          f"already_owned={int(unlocked['already_owned'])} points={unlocked['points']} duration_ms={duration_ms}", actor_id())
+    return _done(link["public_id"], already_owned=unlocked["already_owned"], points=unlocked["points"], replayed=False, media_id=media_id)
 
 
 @app.get("/api/library/resource/<int:group_id>")
@@ -3043,7 +6910,7 @@ def api_library_transfer():
     if target_error:
         return target_error
 
-    if not _transfer_dedupe_check(public_id, pid):
+    if not _transfer_dedupe_check(public_id, pid, _dedupe_user_key()):
         # T17 fix wave 1 item 3: the rejection itself is audited (it never
         # was before), distinct from both "success" and "failed" below.
         audit("library.transfer", "duplicate", f"link={public_id} code=TRANSFER_DUPLICATE", actor_id())
@@ -3057,7 +6924,7 @@ def api_library_transfer():
         # T17 fix wave 1 item 3: nothing was actually sent to 115 -- don't
         # let this rejection occupy the dedupe window against a legitimate
         # immediate retry.
-        _transfer_dedupe_clear(public_id, pid)
+        _transfer_dedupe_clear(public_id, pid, _dedupe_user_key())
     if row["deleted_at_source"] is not None:
         result.message = "该分享在来源已标记删除，" + result.message
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -3074,14 +6941,17 @@ def api_library_transfer():
 def oauth_start():
     client_id = config_value("hdhive_client_id", "HDHIVE_CLIENT_ID")
     if not client_id:
-        return json_error("请先配置 HDHive Client ID", 503, "HDHIVE_CLIENT_ID_MISSING")
+        return json_error("请先配置 RE0 Client ID", 503, "HDHIVE_CLIENT_ID_MISSING")
     state = secrets.token_urlsafe(32)
     created_by = actor_id()
     with connect_db() as db:
         db.execute("DELETE FROM oauth_states WHERE expires_at < ? OR used_at IS NOT NULL", (utc_now(),))
         db.execute("INSERT INTO oauth_states(state,expires_at,created_by) VALUES(?,?,?)", (state, utc_now() + STATE_TTL_SECONDS, created_by))
     redirect_uri = PUBLIC_ORIGIN + "/api/oauth/hdhive/callback"
-    query = urlencode({"client_id": client_id, "redirect_uri": redirect_uri, "scope": "query unlock write", "state": state})
+    # ``meta`` is required by RE0 for the authenticated /api/open/ping
+    # connectivity check; keep it alongside the business scopes used by the
+    # library and check-in flows.
+    query = urlencode({"client_id": client_id, "redirect_uri": redirect_uri, "scope": "meta query unlock write", "state": state})
     audit("hdhive.oauth.start", "success", "authorization URL issued", created_by)
     return jsonify({"success": True, "url": HDHIVE_BASE + "/openapi/authorize?" + query})
 
@@ -3091,36 +6961,43 @@ def oauth_callback():
     code = request.args.get("code", "").strip()
     state = request.args.get("state", "").strip()
     if not code or not state:
-        return json_error("HDHive OAuth 回调缺少 code/state", 400, "OAUTH_CALLBACK_INVALID")
+        return json_error("RE0 OAuth 回调缺少 code/state", 400, "OAUTH_CALLBACK_INVALID")
     current_actor = actor_id()
+    now = utc_now()
     with connect_db() as db:
-        row = db.execute("SELECT * FROM oauth_states WHERE state=? AND used_at IS NULL AND expires_at>=?", (state, utc_now())).fetchone()
+        row = db.execute(
+            "SELECT * FROM oauth_states WHERE state=? AND created_by=? AND used_at IS NULL AND expires_at>=?",
+            (state, current_actor, now),
+        ).fetchone()
         if not row:
             return json_error("OAuth state 无效或已过期", 400, "OAUTH_STATE_INVALID")
-        if str(row["created_by"] or "") != current_actor:
-            audit("hdhive.oauth.callback", "failed", "state actor mismatch", current_actor)
-            return json_error("OAuth state 不属于当前用户", 403, "OAUTH_STATE_ACTOR_MISMATCH")
-        db.execute("UPDATE oauth_states SET used_at=? WHERE state=?", (utc_now(), state))
+        consumed_at = utc_now()
+        consumed = db.execute(
+            "UPDATE oauth_states SET used_at=? WHERE state=? AND created_by=? AND used_at IS NULL AND expires_at>=?",
+            (consumed_at, state, current_actor, consumed_at),
+        )
+        if consumed.rowcount != 1:
+            return json_error("OAuth state 无效或已被使用", 400, "OAUTH_STATE_INVALID")
     secret = config_value("hdhive_app_secret", "HDHIVE_APP_SECRET")
     client_id = config_value("hdhive_client_id", "HDHIVE_CLIENT_ID")
     if not secret or not client_id:
-        return json_error("HDHive App Secret/Client ID 尚未配置", 503, "HDHIVE_CREDENTIALS_MISSING")
+        return json_error("RE0 App Secret/Client ID 尚未配置", 503, "HDHIVE_CREDENTIALS_MISSING")
     redirect_uri = PUBLIC_ORIGIN + "/api/oauth/hdhive/callback"
     try:
         response = requests.post(HDHIVE_BASE + HDHIVE_TOKEN_PATH, headers={"X-API-Key": secret, "Accept": "application/json"}, json={"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri}, timeout=20)
         data = response.json() if response.content else {}
     except (requests.RequestException, ValueError, TypeError) as exc:
         code = "HDHIVE_INVALID_JSON" if isinstance(exc, (ValueError, TypeError)) else "HDHIVE_UNAVAILABLE"
-        return json_error("HDHive OAuth 返回格式异常" if code == "HDHIVE_INVALID_JSON" else f"HDHive OAuth 换 token 失败：{type(exc).__name__}", 502, code)
+        return json_error("RE0 OAuth 返回格式异常" if code == "HDHIVE_INVALID_JSON" else f"RE0 OAuth 换 token 失败：{type(exc).__name__}", 502, code)
     if response.status_code >= 400 or not data.get("success", False):
         safe_error = _safe_hdhive_envelope(data)
-        return json_error(str(safe_error.get("message") or "HDHive OAuth 授权失败"), response.status_code if response.status_code >= 400 else 400, str(safe_error.get("code") or "OAUTH_EXCHANGE_FAILED"))
+        return json_error(str(safe_error.get("message") or "RE0 OAuth 授权失败"), response.status_code if response.status_code >= 400 else 400, str(safe_error.get("code") or "OAUTH_EXCHANGE_FAILED"))
     try:
         save_tokens(data.get("data") or {})
     except RuntimeError as exc:
         return json_error(str(exc), 502, "OAUTH_TOKEN_INVALID")
-    audit("hdhive.oauth.callback", "success", "encrypted access/refresh tokens stored", current_actor)
-    return redirect("/?oauth=success")
+    audit("hdhive.oauth.callback", "success", "encrypted access/refresh tokens stored", actor_id())
+    return redirect("/?tab=settings&oauth=success")
 
 
 @app.get("/api/hdhive/resources")
@@ -3151,18 +7028,177 @@ def api_hdhive_unlock():
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", slug):
         return json_error("slug 格式不正确")
     allow_points = body.get("allow_points") is True
+    # R07: the client's own flag is not an authorisation. RE0 documents no
+    # promise that omitting `allow_points` cannot spend points -- the main
+    # unlock path sends only the slug too -- so the decision is made here,
+    # in the same order as every other consuming path (§10.1):
+    #
+    #   already materialised locally?  -> reuse it, free, for anybody
+    #   otherwise                      -> the member policy decides
+    materialised = _materialised_link_for_slug(slug)
+    if materialised is not None:
+        audit("hdhive.unlock", "success", "served from the local materialised link", actor_id())
+        return jsonify({"success": True, "already_owned": True, "unlock_points": 0,
+                        "link_public_id": materialised, "replayed": True})
+    refused = member_unlock_refused("hdhive-unlock")
+    if refused is not None:
+        return refused
+
+    # F05: this entry used to go straight upstream, so two concurrent callers
+    # both spent. It takes the *same* lease key the main entry uses for this
+    # resource -- resolved from the slug -- so one resource is one unlock
+    # however it is reached.
+    #
+    # G03.2: and when the coordination store cannot be read, it stops. A
+    # single-caller deployment could afford "carry on without coordination";
+    # with several users that is exactly how two purchases happen. The master
+    # key is needed both to resolve the slug (candidate rows are keyed by a
+    # salted hash) and to save a success, so its absence is the same refusal.
+    try:
+        store, store_error = _library_store_or_error(True)
+    except Exception:  # noqa: BLE001 - treated as unavailable, never as permission
+        store, store_error = None, True
+    if store is None or store_error:
+        return json_error("资源库暂时不可读，无法安全协调解锁；请稍后重试", 503,
+                          "RE0_COORDINATION_UNAVAILABLE")
+
+    res, slug_hash_value = _re0_resource_for_slug(store, slug)
+    if res is None:
+        # G03.4: nothing local to attach a result to means nothing local to
+        # make the next click free. Refuse before spending rather than buy
+        # something this deployment cannot record.
+        audit("hdhive.unlock", "refused", "no local candidate for this slug", actor_id())
+        return json_error("本地还没有这条资源的候选记录，无法安全解锁；请先在资源页搜索该资源后重试",
+                          409, "RE0_CANDIDATE_UNKNOWN")
+
+    resource_id = int(res["id"])
+    lease_key = re0_sync.resource_lease_key(resource_id)
+    # G01.1-style identity: one per operation, so nothing can commit or
+    # release under a lease that is no longer its own.
+    holder = f"{actor_id()}:hdhive-unlock:{secrets.token_hex(8)}"
+    if not _re0_lease_take(store, lease_key, holder=holder, now=utc_now()):
+        again = _materialised_link_for_slug(slug)
+        if again is not None:
+            return jsonify({"success": True, "already_owned": True, "unlock_points": 0,
+                            "link_public_id": again, "replayed": True})
+        return json_error("该资源正在解锁中，请稍后重试", 409, "RE0_UNLOCK_IN_PROGRESS")
+    with _re0_lease_held(store, lease_key, holder=holder):
+        # F05: re-read inside the lease. The previous holder -- possibly the
+        # main entry, for the same resource -- may have just materialised it.
+        again = _materialised_link_for_slug(slug)
+        if again is not None:
+            audit("hdhive.unlock", "success", "served from the local materialised link", actor_id())
+            return jsonify({"success": True, "already_owned": True, "unlock_points": 0,
+                            "link_public_id": again, "replayed": True})
+        # G03.3: the same two "do not buy it" states the main entry honours.
+        pending = re0_sync.pending_unlock(store, resource_id)
+        if pending is not None:
+            public_id = _re0_materialise_legacy(store, res, slug, None, payload=pending)
+            if public_id:
+                return jsonify({"success": True, "already_owned": True, "unlock_points": 0,
+                                "link_public_id": public_id, "replayed": True})
+            return json_error("RE0 已解锁该资源，但本地保存失败；不会重复扣分，请稍后重试", 502,
+                              "RE0_UNLOCK_PENDING_SAVE")
+        if re0_sync.resource_state(store, resource_id) == re0_sync.STATE_RESULT_UNKNOWN:
+            return json_error(_RE0_UNCERTAIN_MESSAGE, 409, "RE0_UNLOCK_RESULT_UNKNOWN")
+
+        response, status = _hdhive_unlock_upstream(slug, allow_points, raw=True)
+        if status >= 400 or not (isinstance(response, dict) and response.get("success")):
+            if _hdhive_outcome_uncertain(response, status):
+                # G03.3: unknown, not refused. Record it so the next click
+                # asks the user rather than RE0.
+                re0_sync.remember_unlock_unknown(store, resource_id,
+                                                 error_class=str((response or {}).get("code") or status)[:64],
+                                                 now=utc_now())
+                audit("hdhive.unlock", "unknown", f"status={status} result unconfirmed", actor_id())
+                return json_error(_RE0_UNCERTAIN_MESSAGE, 502, "RE0_UNLOCK_RESULT_UNKNOWN")
+            return jsonify(_safe_hdhive_unlock_response(response)), status
+        # F05/G03.3: a legacy success is recorded as confirmed *before* the
+        # save is attempted, so the next caller through either entry resumes
+        # instead of paying again.
+        public_id = _re0_materialise_legacy(store, res, slug, response)
+        safe = _safe_hdhive_unlock_response(response)
+        if public_id:
+            safe["link_public_id"] = public_id
+        return jsonify(safe), status
+
+
+# The upstream answers whose meaning is "we do not know whether this happened"
+# (review G03.3). Everything else this endpoint can see is a refusal, and a
+# refusal costs nothing.
+_HDHIVE_UNCERTAIN_CODES = frozenset({"UPSTREAM_UNAVAILABLE", "UPSTREAM_INVALID_JSON"})
+
+
+def _hdhive_outcome_uncertain(response, status: int) -> bool:
+    if isinstance(response, dict) and str(response.get("code") or "") in _HDHIVE_UNCERTAIN_CODES:
+        return True
+    return status >= 500
+
+
+def _hdhive_unlock_upstream(slug: str, allow_points: bool, *, raw: bool = False):
+    """The upstream call itself, audited the same way it always was."""
     payload = {"slug": slug}
     if allow_points:
         payload["allow_points"] = True
     data, status = hdhive_request("POST", "/api/open/resources/unlock", payload=payload)
     if status < 400 and data.get("success"):
         audit("hdhive.unlock", "success", "points unlock requested" if allow_points else "free or already-owned resource; link omitted from audit", actor_id())
-    return jsonify(_safe_hdhive_unlock_response(data)), status
+    return (data, status) if raw else (jsonify(_safe_hdhive_unlock_response(data)), status)
+
+
+def _re0_materialise_legacy(store, res: dict, slug: str, response, *, payload: dict | None = None) -> str | None:
+    """Save a legacy-entry unlock into the local library, insert-only.
+
+    Returns the local link's public id, or None when the payload carried no
+    URL, the media could not be resolved, or the save failed -- and in the
+    last case the confirmed result is left **pending** (G03.3), so the next
+    click through either entry resumes it for free. Reporting a failure to
+    *save* as a failure to unlock is what invites paying twice (F05).
+    """
+    now = utc_now()
+    try:
+        unlocked = payload if payload is not None else re0_sync.parse_unlock_payload(
+            response.get("data") or response, slug)
+        if not unlocked.get("url"):
+            return None
+        media_id = res.get("media_id")
+        if media_id is None and res.get("tmdb_id"):
+            conn = store.connect(readonly=True)
+            try:
+                media_id = re0_sync.local_media_id_for(conn, res["media_type"], int(res["tmdb_id"]))
+            finally:
+                conn.close()
+        if media_id is None:
+            media_id = re0_sync.create_media_from_projection(store, res["media_type"], int(res["tmdb_id"]), now)
+        if media_id is None:
+            # Still confirmed, still unsaved: record it rather than forget it.
+            re0_sync.remember_unlock_pending(
+                store, int(res["id"]), url=unlocked["url"], access_code=unlocked.get("access_code"),
+                points=unlocked.get("points"), already_owned=bool(unlocked.get("already_owned")), now=now)
+            return None
+        outcome, failure = _re0_save_unlocked(store, int(res["id"]), unlocked, media_id=media_id,
+                                              media_title=res.get("media_title"), now=now)
+        if outcome is None:
+            audit("hdhive.unlock", "failed",
+                  f"unlocked upstream but could not be saved locally class={failure}", actor_id())
+            return None
+        conn = store.connect(readonly=True)
+        try:
+            link = conn.execute("SELECT public_id FROM resource_link WHERE id=?",
+                                (outcome["resource_link_id"],)).fetchone()
+        finally:
+            conn.close()
+        re0_sync.clear_unlock_pending(store, int(res["id"]), now=now)
+        return link["public_id"] if link is not None else None
+    except (ValueError, KeyError, TypeError, sqlite3.DatabaseError) as exc:
+        audit("hdhive.unlock", "failed",
+              f"unlocked upstream but could not be saved locally class={type(exc).__name__}", actor_id())
+        return None
 
 
 @app.get("/api/hdhive/search")
 def api_hdhive_search():
-    """Search the same TMDB catalogue HDHive uses, then let the user open resources."""
+    """Search the same TMDB catalogue RE0 uses, then let the user open resources."""
     key = config_value("tmdb_api_key", "TMDB_API_KEY")
     query = request.args.get("q", "").strip()
     media_type = request.args.get("media_type", "multi").strip().lower()
@@ -3213,7 +7249,7 @@ def api_hdhive_search():
                 "overview": str(row.get("overview") or ""),
             }
         )
-    return jsonify({"success": True, "source": "TMDB + HDHive OpenAPI", "results": normalized})
+    return jsonify({"success": True, "source": "TMDB + RE0 OpenAPI", "results": normalized})
 
 
 @app.get("/api/tmdb/search")
@@ -3328,9 +7364,10 @@ def api_115_reauth_start():
     expires_at = now + REAUTH_TTL_SECONDS
     with connect_db() as db:
         db.execute(
-            "INSERT INTO reauth_challenges(id_hash,actor,state,created_at,expires_at,qr_uid_cipher,qr_time,qr_sign_cipher) VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO reauth_challenges(id_hash,actor,user_id,state,created_at,expires_at,qr_uid_cipher,qr_time,qr_sign_cipher) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (
-                id_hash, actor, "pending", now, expires_at,
+                id_hash, actor, (current_user().id if current_user() else None), "pending", now, expires_at,
                 fernet.encrypt(str(qr_data["uid"]).encode("utf-8")),
                 int(qr_data["time"]),
                 fernet.encrypt(str(qr_data["sign"]).encode("utf-8")),
@@ -3580,6 +7617,27 @@ def api_115_reauth_cancel():
 
 @app.get("/api/115/folders")
 def api_115_folders():
+    """The folder picker.
+
+    A user with their own step-B authorisation browses their own 115 by cid
+    (Phase 6). The administrator's legacy OpenList path stays while the
+    migration window is open -- it is the same account, reached the way it
+    always was. A member with no authorisation is told which button to press,
+    never shown somebody else's folders (R05).
+    """
+    user = current_user()
+    is_admin = bool(user and user.role == "admin")
+    if user_115_open_token(user) and (_has_own_open_token(user) or not is_admin):
+        cid = str(request.args.get("cid") or "0").strip() or "0"
+        items, status, message = user_115_folders(user, cid)
+        if status != 200:
+            return jsonify({"success": False, "code": "OPEN115_FOLDER_FAILED", "message": message}), status
+        return jsonify({"success": True, "mode": "115", "cid": cid, "items": items})
+
+    if not is_admin:
+        _token, error = _require_open115(user)
+        return error if error is not None else json_error("尚未完成「目录与云下载」授权", 409, "OPEN115_NOT_AUTHORIZED")
+
     root = normalized_path(OPENLIST_115PAN_PATH)
     path = normalized_path(request.args.get("path", root))
     if not path_under(root, path):
@@ -3588,7 +7646,8 @@ def api_115_folders():
     if status >= 400:
         return json_error(message, status, "OPENLIST_LIST_FAILED")
     parent = root if path == root else normalized_path(posixpath.dirname(path))
-    return jsonify({"success": True, "root": root, "path": path, "parent": parent, "items": folders})
+    return jsonify({"success": True, "mode": "openlist", "root": root, "path": path,
+                    "parent": parent, "items": folders})
 
 
 @app.get("/api/openlist/list")
@@ -3933,9 +7992,14 @@ def run_checkin() -> int:
 
 
 if __name__ == "__main__":
-    init_db()
+    # R10: the read-only command is dispatched before anything creates a
+    # table. Every other command still initialises first, as it always has.
+    if not _read_only_cli():
+        init_db()
     if len(sys.argv) > 1 and sys.argv[1] == "--checkin":
         raise SystemExit(run_checkin())
+    if len(sys.argv) > 1 and sys.argv[1] == "--re0-sync":
+        raise SystemExit(run_re0_sync(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "--library-install":
         if len(sys.argv) < 3:
             print(json.dumps({"ok": False, "error": "MissingBundleArgument"}, ensure_ascii=False))
@@ -3963,6 +8027,13 @@ if __name__ == "__main__":
         raise SystemExit(run_library_requeue_review(
             max_media=cli_max_media, resume="--resume" in sys.argv, dry_run="--dry-run" in sys.argv,
         ))
+    if len(sys.argv) > 1 and sys.argv[1] == "--auth-migrate":
+        if "--apply" not in sys.argv and "--dry-run" not in sys.argv:
+            print(json.dumps({"ok": False, "error": "NeedDryRunOrApply"}, ensure_ascii=False))
+            raise SystemExit(2)
+        if "--apply" not in sys.argv:
+            raise SystemExit(run_auth_migrate_dry_run())
+        raise SystemExit(run_auth_migrate(apply=True))
     if len(sys.argv) > 1 and sys.argv[1] == "--library-check-links":
         cli_provider = None
         if "--provider" in sys.argv:

@@ -3,7 +3,21 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<script>
+// Apply the saved appearance before the stylesheet paints; storage can be blocked.
+(function () {
+  var preference = "system";
+  try { preference = localStorage.getItem("hidrive.theme") || "system"; } catch (_) {}
+  document.documentElement.dataset.theme = preference === "dark" || preference === "light" ? preference :
+    (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+}());
+</script>
 <title>HiDrive-Lite</title>
+<link rel="icon" type="image/svg+xml" href="/static/branding/hidrive-lite/favicon.svg?v=20260911">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/branding/hidrive-lite/favicon-16.png?v=20260911">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/branding/hidrive-lite/favicon-32.png?v=20260911">
+<link rel="icon" type="image/png" sizes="48x48" href="/static/branding/hidrive-lite/favicon-48.png?v=20260911">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/branding/hidrive-lite/apple-touch-icon.png?v=20260911">
 <link rel="stylesheet" href="/static/app.css?v={{ asset_version }}">
 </head>
 <body data-public-origin="{{ public_origin }}" data-asset-version="{{ asset_version }}">
@@ -11,16 +25,29 @@
   <div class="site-sticky">
   <header class="topbar">
     <div class="brand">
-      <h1>HiDrive-Lite</h1>
-      <p>资源库 · 115 转存 · OpenList / STRM 查看</p>
+      <a class="brand-home" href="/" aria-label="返回首页"><picture class="brand-logo-picture">
+        <source media="(prefers-color-scheme: dark)" srcset="/static/branding/hidrive-lite/hidrive-lite-logo-on-dark.svg?v=20260911">
+        <img class="brand-logo-image" src="/static/branding/hidrive-lite/hidrive-lite-logo.svg?v=20260911" alt="HiDrive-Lite" width="248" height="44">
+      </picture></a>
+      <script data-theme-logo>
+      // Match the first logo paint too, without waiting for the main script download.
+      (function () {
+        var theme = document.documentElement.dataset.theme;
+        if (theme) document.currentScript.previousElementSibling.querySelector("source").media = theme === "dark" ? "all" : "not all";
+      }());
+      </script>
+      <p>个人影视资源库</p>
     </div>
-    <div id="actor" class="access-badge">检查访问状态</div>
+    <label class="theme-control"><span>外观</span><select id="themePreference" aria-label="外观模式">
+      <option value="system">跟随系统</option><option value="light">白天模式</option><option value="dark">夜间模式</option>
+    </select></label>
   </header>
   <nav class="workspace-nav" role="tablist" aria-label="工作区">
     <button type="button" class="nav-item" data-tab="library" id="tab-library" role="tab" aria-selected="true" aria-controls="library">
       <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-library"></use></svg></span>
       <span>资源库</span>
     </button>
+{% if capabilities.openlist %}
     <button type="button" class="nav-item" data-tab="openlist" id="tab-openlist" role="tab" aria-selected="false" aria-controls="openlist">
       <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-openlist"></use></svg></span>
       <span>OpenList</span>
@@ -29,13 +56,23 @@
       <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-strm"></use></svg></span>
       <span>STRM</span>
     </button>
+{% endif %}
+{% if capabilities.own_115_cloud_download or capabilities.global_settings %}
+    <button type="button" class="nav-item" data-tab="cloud" id="tab-cloud" role="tab" aria-selected="false" aria-controls="cloud">
+      <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-cloud"></use></svg></span>
+      <span>云下载</span>
+    </button>
+{% endif %}
     <button type="button" class="nav-item" data-tab="settings" id="tab-settings" role="tab" aria-selected="false" aria-controls="settings">
       <span class="nav-icon" aria-hidden="true"><svg><use href="/static/icons.svg?v={{ asset_version }}#icon-settings"></use></svg></span>
       <span>设置</span>
+{% if capabilities.global_settings %}
+      <span id="settingsPendingBadge" class="nav-notification" hidden aria-hidden="true"></span>
+{% endif %}
     </button>
     <span class="workspace-status">
       <span id="globalDot" class="status-mark"></span>
-      <span id="globalStatusText">检查服务状态</span>
+      <span id="globalStatusText">{% if capabilities.global_settings %}检查服务状态{% else %}个人空间{% endif %}</span>
     </span>
   </nav>
   </div>
@@ -44,34 +81,43 @@
     <section id="library" role="tabpanel" aria-labelledby="tab-library">
       <div class="page-intro">
         <span class="eyebrow">资源库</span>
-        <h2>个人影视资源库</h2>
-        <p id="libraryStats">搜索片名、英文名、原名或拼音，浏览资源库并转存到 115。</p>
+        <h2>影视资源库</h2>
+        <p id="libraryStats">搜索片名、英文名、原名或拼音，浏览资源库并转存到自己的网盘</p>
       </div>
       <div id="libraryHome">
         <section id="libraryHero" class="library-hero" hidden>
-          <div class="library-hero-media" aria-hidden="true">
-            <img class="library-hero-backdrop" alt="">
-            <div class="library-hero-overlay"></div>
+          <div class="library-hero-media">
+            <div class="library-hero-frame">
+              <img class="library-hero-backdrop" alt="">
+              <div class="library-hero-overlay" aria-hidden="true"></div>
+              <div class="library-hero-thumbs" id="heroThumbnails" aria-label="切换首页推荐"></div>
+            </div>
           </div>
           <div class="library-hero-content">
             <span class="pill library-hero-type"></span>
             <h2 class="library-hero-title"></h2>
             <p class="library-hero-overview"></p>
             <button type="button" class="library-hero-cta">查看详情</button>
+            <div class="library-hero-controls" id="heroControls" aria-label="推荐轮播" hidden>
+              <button type="button" id="heroPrevious" aria-label="上一部推荐">‹</button>
+              <span id="heroPosition"></span>
+              <button type="button" id="heroNext" aria-label="下一部推荐">›</button>
+              <button type="button" id="heroPause" aria-label="暂停推荐轮播">暂停</button>
+            </div>
           </div>
         </section>
         <article class="card library-search-card">
           <div class="library-search-row">
             <div class="search-field">
               <span class="search-field-icon" aria-hidden="true"><svg class="icon"><use href="/static/icons.svg?v={{ asset_version }}#icon-search"></use></svg></span>
-              <input id="libraryQuery" type="search" placeholder="搜索片名、英文名、原名或拼音…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="librarySuggest" aria-autocomplete="list">
+              <input id="libraryQuery" name="library-query" type="search" placeholder="搜索片名、英文名、原名或拼音…" autocomplete="off" readonly role="combobox" aria-expanded="false" aria-controls="librarySuggest" aria-autocomplete="list">
               <ul id="librarySuggest" class="suggest-list" role="listbox" aria-label="搜索建议" hidden></ul>
             </div>
             <div id="libraryType" class="segmented" role="group" aria-label="媒体类型">
               <button type="button" data-value="all" aria-pressed="true">全部</button>
               <button type="button" data-value="movie" aria-pressed="false">电影</button>
               <button type="button" data-value="tv" aria-pressed="false">剧集</button>
-              <button type="button" data-value="unknown" aria-pressed="false">未分类</button>
+              <button type="button" data-value="unknown" aria-pressed="false">系列合集</button>
             </div>
             <button type="button" id="librarySearch">搜索</button>
             <div class="filter-anchor">
@@ -97,12 +143,19 @@
           <div class="empty">索引未安装，见设置页说明。</div>
         </div>
         <nav id="libraryPagination" class="pagination" hidden aria-label="结果分页"></nav>
+        <section id="libraryRemote" class="remote-lane" hidden aria-live="polite">
+          <div class="remote-lane-head">
+            <h3>搜索状态</h3>
+            <span id="libraryRemoteStatus" class="remote-lane-status"></span>
+          </div>
+          <div id="libraryRemoteResults" class="media-grid"></div>
+        </section>
       </div>
       <div id="libraryDetail" class="library-detail" hidden>
         <button type="button" id="detailBack" class="secondary"><svg class="icon" aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-back"></use></svg><span>返回结果</span></button>
         <div id="detailContent"></div>
         <div id="revealPanel" class="reveal-panel card" hidden>
-          <div class="reveal-row">
+          <div id="revealCodeRow" class="reveal-row">
             <span>访问码</span>
             <code id="revealCode">••••</code>
             <button type="button" id="revealCodeToggle" class="tertiary">显示访问码</button>
@@ -114,6 +167,7 @@
         </div>
       </div>
     </section>
+{% if capabilities.openlist %}
     <section id="openlist" hidden role="tabpanel" aria-labelledby="tab-openlist">
       <div class="page-intro">
         <span class="eyebrow">只读浏览</span>
@@ -154,18 +208,103 @@
         </div>
       </article>
     </section>
+{% endif %}
+{% if capabilities.own_115_cloud_download or capabilities.global_settings %}
+    <section id="cloud" hidden role="tabpanel" aria-labelledby="tab-cloud">
+      <div class="page-intro">
+        <span class="eyebrow">115 开放平台</span>
+        <h2>115 云下载</h2>
+        <p>这里是你 115 账号里的云下载任务。从详情页提交的任务会标注来自哪部片；其余任务来自 115 客户端或其他工具。页面打开期间每 15 秒刷新一次。</p>
+      </div>
+      <article class="card">
+        <div class="section-head">
+          <div>
+            <h3>本月配额</h3>
+            <p id="cloudQuotaSummary">配额读取中…</p>
+          </div>
+        </div>
+        <div id="cloudQuotaPackages" class="cloud-quota-packages"></div>
+      </article>
+      <article class="card">
+        <div class="toolbar cloud-toolbar">
+          <button type="button" id="cloudRefresh" class="secondary">刷新</button>
+          <button type="button" id="cloudClearFailed" class="secondary">清理失败任务</button>
+          <button type="button" id="cloudClearCompleted" class="secondary">清理已完成任务</button>
+        </div>
+        <div id="cloudTabResult" class="feedback" hidden></div>
+        <div id="cloudTasks" class="cloud-tasks">
+          <div class="empty">任务读取中…</div>
+        </div>
+        <div id="cloudPager" class="cloud-pager" hidden>
+          <button type="button" id="cloudPrev" class="secondary">上一页</button>
+          <span id="cloudPageText">第 1 / 1 页</span>
+          <button type="button" id="cloudNext" class="secondary">下一页</button>
+        </div>
+      </article>
+    </section>
+{% endif %}
     <section id="settings" hidden role="tabpanel" aria-labelledby="tab-settings">
       <div class="page-intro">
-        <span class="eyebrow">本地加密</span>
+        <span class="eyebrow">偏好与连接</span>
         <h2>设置</h2>
-        <p>凭据只保存在服务器端加密数据库。OpenList Token 与 115 开放平台令牌由现有 OpenList 配置自动同步。</p>
+        <p>管理你的 115 连接与账户{% if capabilities.global_settings %}，以及站点的用户、资源服务和运行状态{% endif %}。</p>
       </div>
-      <div class="settings-grid">
-        <article class="card">
+      <div class="settings-layout">
+        <nav class="settings-nav" aria-label="设置分类">
+          <p class="settings-nav-label">个人设置</p>
+          <button type="button" id="settings-nav-my115" data-settings-section="my115" aria-controls="settings-panel-my115" aria-current="page">我的 115</button>
+          <button type="button" id="settings-nav-account" data-settings-section="account" aria-controls="settings-panel-account">账户</button>
+{% if capabilities.global_settings %}
+          <p class="settings-nav-label">站点管理</p>
+          <button type="button" id="settings-nav-users" data-settings-section="users" aria-controls="settings-panel-users"><span>用户与权限</span><span id="usersNavPendingBadge" class="nav-notification" hidden aria-hidden="true"></span></button>
+          <button type="button" id="settings-nav-services" data-settings-section="services" aria-controls="settings-panel-services">资源服务</button>
+          <button type="button" id="settings-nav-system" data-settings-section="system" aria-controls="settings-panel-system">系统状态</button>
+{% endif %}
+        </nav>
+        <div class="settings-content">
+          <p id="settingsDraftNotice" class="settings-draft-notice" role="status" aria-live="polite" hidden>有未保存的修改。切换分区会保留输入，请返回对应分区保存。</p>
+          <section id="settings-panel-my115" class="settings-panel" data-settings-panel="my115" aria-labelledby="settings-nav-my115">
+        <article class="card" id="my115Card">
           <div class="section-head">
             <div>
-              <h3>私有凭据</h3>
-              <p>保存后输入框会清空；115 Cookie 只在后台验证可用性。</p>
+              <h3>我的 115</h3>
+              <p>使用 115 APP 分两步扫码，连接自己的网盘。</p>
+            </div>
+            <span id="my115Summary" class="pill">读取中</span>
+          </div>
+          <div class="my115-step" id="my115StepA">
+            <div class="my115-step-head">
+              <span class="my115-step-title">第一步 · 一键转存</span>
+              <span id="my115TransferState" class="my115-state">读取中</span>
+            </div>
+            <p class="my115-note">使用 115 APP 扫码，接收分享并转存到自己的网盘。</p>
+            <div class="form-actions">
+              <button type="button" id="my115TransferConnect">重新扫码</button>
+              <button type="button" id="my115TransferDisconnect" class="secondary" hidden>断开</button>
+            </div>
+          </div>
+          <div class="my115-step" id="my115StepB">
+            <div class="my115-step-head">
+              <span class="my115-step-title">第二步 · 目录与云下载</span>
+              <span id="my115BrowseState" class="my115-state">读取中</span>
+            </div>
+            <p class="my115-note">再次使用 115 APP 扫码，选择保存目录并管理云下载任务。</p>
+            <div class="form-actions">
+              <button type="button" id="my115BrowseConnect">重新扫码</button>
+              <button type="button" id="my115BrowseDisconnect" class="secondary" hidden>断开</button>
+            </div>
+          </div>
+{% if capabilities.global_settings %}
+          <p id="my115LegacyNote" class="my115-note" hidden></p>
+{% endif %}
+          <div id="my115Result" class="feedback" role="status" aria-live="polite" hidden></div>
+        </article>
+{% if capabilities.global_settings %}
+        <details class="card settings-advanced" id="legacy115Card" data-settings-form="legacy115">
+          <summary>高级 / 手动配置（管理员）</summary>
+          <div class="section-head">
+            <div>
+              <p>维护管理员兼容配置。凭据加密保存在服务器；保存后 Cookie 输入框会清空。</p>
             </div>
           </div>
           <div class="field">
@@ -178,14 +317,75 @@
             <label for="settingPid">兼容旧配置的默认 115 目录 PID</label>
             <input id="settingPid" placeholder="可留空">
           </div>
-          <button type="button" id="settingsSave">保存设置</button>
-          <div id="settingsResult" class="feedback" hidden></div>
+          <div class="settings-actions"><button type="button" id="settingsSave">保存 115 配置</button></div>
+          <div id="settingsResult" class="feedback" role="status" aria-live="polite" hidden></div>
+        </details>
+{% endif %}
+          </section>
+          <section id="settings-panel-account" class="settings-panel" data-settings-panel="account" aria-labelledby="settings-nav-account" hidden>
+        <article class="card" id="accountCard">
+          <div class="section-head"><div><h3>账户</h3><p>当前登录身份与登录方式。</p></div></div>
+          <div id="accountList" class="status-list"></div>
+          <div class="settings-actions"><button type="button" id="accountLogout" class="secondary">退出登录</button></div>
         </article>
-        <article class="card">
+          </section>
+{% if capabilities.global_settings %}
+          <section id="settings-panel-services" class="settings-panel" data-settings-panel="services" aria-labelledby="settings-nav-services" hidden>
+            <nav class="settings-services-nav" aria-label="资源服务分类">
+              <button type="button" id="settings-service-re0" data-settings-service="re0" aria-controls="settings-service-panel-re0" aria-current="page">RE0</button>
+              <button type="button" id="settings-service-tmdb" data-settings-service="tmdb" aria-controls="settings-service-panel-tmdb">TMDB</button>
+              <button type="button" id="settings-service-linkcheck" data-settings-service="linkcheck" aria-controls="settings-service-panel-linkcheck">资源检测</button>
+              <button type="button" id="settings-service-cloud" data-settings-service="cloud" aria-controls="settings-service-panel-cloud">云下载策略</button>
+            </nav>
+            <section id="settings-service-panel-re0" class="settings-panel" data-service-panel="re0" aria-labelledby="settings-service-re0">
+        <article class="card" id="re0OAuthCard">
+          <div class="section-head">
+            <div>
+              <h3>RE0 OAuth 授权</h3>
+              <p>授权后才能查询 RE0 资源、执行签到与解锁。令牌只会加密保存在服务器端，不在页面显示。</p>
+            </div>
+          </div>
+          <div id="re0OAuthStatus" class="feedback" role="status" aria-live="polite">读取中…</div>
+          <div class="scrape-actions">
+            <button type="button" id="re0OAuthBtn" disabled>授权 RE0</button>
+            <button type="button" id="re0OAuthRefresh" class="secondary">刷新状态</button>
+          </div>
+          <div id="re0OAuthResult" class="feedback" role="status" aria-live="polite" hidden></div>
+        </article>
+        <article class="card" id="re0SyncCard" data-settings-form="re0">
+          <div class="section-head">
+            <div>
+              <h3>RE0 资源同步</h3>
+              <p>设置搜索与同步的请求额度。新资源仅在详情页点击解锁后才会消耗积分。</p>
+            </div>
+          </div>
+          <div id="re0SyncStatus" class="feedback" role="status" aria-live="polite">读取中…</div>
+          <div id="re0SyncMetrics" class="settings-metrics"></div>
+          <details class="settings-details"><summary>详细状态</summary><p id="re0SyncDetails" class="settings-note">读取中…</p></details>
+          <div class="field-row">
+            <div class="field">
+              <label for="re0DailyCap">RE0 每日请求上限</label>
+              <input id="re0DailyCap" type="number" min="1" max="1000" placeholder="默认 100">
+            </div>
+            <div class="field">
+              <label for="re0MinInterval">两次请求最小间隔（毫秒）</label>
+              <input id="re0MinInterval" type="number" min="500" max="60000" placeholder="默认 1000">
+            </div>
+          </div>
+          <div class="scrape-actions">
+            <button type="button" id="re0SyncSave">保存 RE0 设置</button>
+            <button type="button" id="re0SyncRefresh" class="secondary">刷新状态</button>
+            <button type="button" id="re0RunSmall" class="secondary">只读探测 1 条</button>
+          </div>
+          <div id="re0SyncResult" class="feedback" hidden></div>
+        </article>
+            </section>
+            <section id="settings-service-panel-tmdb" class="settings-panel" data-service-panel="tmdb" aria-labelledby="settings-service-tmdb" hidden>
+        <article class="card" data-settings-form="tmdb">
           <div class="section-head">
             <div>
               <h3>TMDB 刮削</h3>
-              <p>为资源库补全海报、简介与类型；下方状态与操作直接读取后台线程，无需登录服务器排查。</p>
+              <p>为资源库补全海报、简介与类型。修改后保存，测试连接使用已保存的配置。</p>
             </div>
           </div>
           <label class="switch-field">
@@ -200,18 +400,25 @@
             <label for="tmdbBudget">TMDB 每日预算</label>
             <input id="tmdbBudget" type="number" min="1" max="5000" placeholder="默认 3000，上限 5000">
           </div>
-          <div id="tmdbScrapeStatus" class="scrape-status"></div>
           <div class="scrape-actions">
+            <button type="button" id="tmdbSave">保存 TMDB 设置</button>
             <button type="button" id="tmdbCheck" class="secondary">测试 TMDB 连接</button>
-            <button type="button" id="tmdbEnrichNow" class="secondary">立即补全一轮</button>
           </div>
+          <div id="tmdbResult" class="feedback" role="status" aria-live="polite" hidden></div>
+        </article>
+        <article class="card">
+          <div class="section-head"><div><h3>刮削状态</h3><p>后台进度与最近运行结果。</p></div></div>
+          <div id="tmdbScrapeStatus" class="scrape-status"></div>
+          <div class="scrape-actions"><button type="button" id="tmdbEnrichNow" class="secondary">立即补全一轮</button></div>
           <div id="tmdbScrapeResult" class="feedback" hidden></div>
         </article>
-        <article class="card" id="linkcheckCard">
+            </section>
+            <section id="settings-service-panel-linkcheck" class="settings-panel" data-service-panel="linkcheck" aria-labelledby="settings-service-linkcheck" hidden>
+        <article class="card" id="linkcheckCard" data-settings-form="linkcheck">
           <div class="section-head">
             <div>
               <h3>资源有效性检测</h3>
-              <p>勾选后请点击下方「保存检测设置」才会生效，刷新页面后勾选状态即为服务器已保存的状态。115 为匿名探测，不使用你的登录会话；失效判定只依据网盘的明确提示，无法确认的不标记。</p>
+              <p>修改后点击「保存检测设置」生效。115 使用匿名探测；仅按网盘明确提示判定失效。</p>
             </div>
           </div>
           <label class="switch-field">
@@ -225,32 +432,88 @@
           <div id="linkcheckResult" class="feedback" hidden></div>
           <div id="linkcheckHeartbeat" class="feedback" hidden></div>
         </article>
+            </section>
+            <section id="settings-service-panel-cloud" class="settings-panel" data-service-panel="cloud" aria-labelledby="settings-service-cloud" hidden>
+        <article class="card" id="cloudCard" data-settings-form="cloud">
+          <div class="section-head">
+            <div>
+              <h3>云下载策略</h3>
+              <p>设置站点的 115 云下载开关与提交上限。提交按顺序执行，并消耗对应 115 账户的月配额。</p>
+            </div>
+          </div>
+          <label class="switch-field">
+            <input id="cloudEnabled" type="checkbox">
+            <span>启用 115 云下载</span>
+          </label>
+          <div class="field-row">
+            <div class="field">
+              <label for="cloudDailyCap">每日提交上限</label>
+              <input id="cloudDailyCap" type="number" min="0" max="100000" placeholder="0 表示不限制">
+            </div>
+            <div class="field">
+              <label for="cloudPerSubmitCap">单次提交上限</label>
+              <input id="cloudPerSubmitCap" type="number" min="1" max="50" placeholder="默认 30">
+            </div>
+          </div>
+          <div class="scrape-actions">
+            <button type="button" id="cloudSave">保存云下载设置</button>
+          </div>
+          <div id="cloudResult" class="feedback" hidden></div>
+          <div id="cloudStatusLine" class="feedback" hidden></div>
+        </article>
+            </section>
+          </section>
+          <section id="settings-panel-system" class="settings-panel" data-settings-panel="system" aria-labelledby="settings-nav-system" hidden>
         <article class="card">
           <div class="section-head">
             <div>
-              <h3>服务状态</h3>
-              <p>状态只显示可读标签和路径，不显示令牌、Cookie 或原始 JSON。</p>
+              <h3>系统状态</h3>
+              <p>站点配置与后台服务状态。已配置的凭据不等同于实时连接测试。</p>
             </div>
+            <button type="button" id="settingsStatusRefresh" class="secondary">刷新状态</button>
           </div>
           <div id="statusList" class="status-list"></div>
+          <p id="settingsStatusUpdated" class="settings-note" role="status" aria-live="polite">读取中…</p>
         </article>
-        <article class="card" id="settingsHelp">
-          <div class="section-head">
-            <div>
-              <h3>说明</h3>
-              <p>资源库与只读浏览的更新方式。</p>
-            </div>
-          </div>
+        <details class="card settings-advanced" id="settingsHelp">
+          <summary>高级说明</summary>
           <p>资源库索引通过离线导入更新：在有网环境构建索引后，运维通过 <code>--library-install</code> 原子替换到本机，页面本身不会发起任何联网抓取。</p>
           <p>OpenList 与 Infuse STRM 页面只读浏览已有目录与文件，不修改现有配置或媒体文件。</p>
-          <p>Cloudflare Access 负责登录与身份校验；本页的凭据保存与状态刷新均在 Access 会话内进行。</p>
+          <p>登录方式以账户分区与当前系统状态为准。凭据仅保存在服务器端的加密数据库中。</p>
+        </details>
+          </section>
+          <section id="settings-panel-users" class="settings-panel" data-settings-panel="users" aria-labelledby="settings-nav-users" hidden>
+        <article class="card" id="usersCard">
+          <div class="section-head">
+            <div>
+              <h3>用户与权限 <span id="usersPendingCount" class="pill">读取中</span></h3>
+              <p>新申请默认待审批，批准后才能登录；停用会立刻吊销该用户的全部会话。</p>
+            </div>
+            <button type="button" id="usersRefresh" class="tertiary">刷新</button>
+          </div>
+          <div id="usersList" class="status-list"></div>
+          <div id="usersResult" class="feedback" hidden></div>
         </article>
+        <article class="card" id="policyCard" data-settings-form="policy">
+          <div class="section-head">
+            <div>
+              <h3>普通用户权限</h3>
+              <p>默认关闭。允许后普通用户可消耗管理员的 RE0 积分解锁新资源。修改后点击保存生效；已落库资源不受限制。</p>
+            </div>
+          </div>
+          <label class="switch-field">
+            <input id="policyMemberUnlock" type="checkbox" disabled>
+            <span>允许普通用户消耗管理员 RE0 积分解锁</span>
+          </label>
+          <div class="settings-actions"><button type="button" id="policySave" disabled>保存用户权限</button></div>
+          <div id="policyResult" class="feedback" role="status" aria-live="polite" hidden></div>
+        </article>
+          </section>
+{% endif %}
+        </div>
       </div>
     </section>
   </main>
-  <footer class="app-footer">
-    <p>只读浏览 OpenList 与 Infuse STRM 目录，不修改现有配置或媒体文件。资源库索引通过离线导入更新，详见设置页说明。</p>
-  </footer>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </div>
 <div id="libraryFiltersScrim" class="popover-scrim" hidden></div>
@@ -299,6 +562,10 @@
     </select>
   </div>
 </div>
+{# F01: one shared dialog, two independent capabilities. Step A drives the
+   transfer flow and step B the cloud-download flow, so gating it on the
+   cookie alone left a step-B-only member holding a button with no dialog. #}
+{% if capabilities.own_115_transfer or capabilities.own_115_cloud_download or capabilities.global_settings %}
 <div id="transferDialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="transferTitle">
   <div class="modal-backdrop" data-close-transfer></div>
   <div class="modal-card">
@@ -323,6 +590,10 @@
       <span class="field-label-static">分享来源</span>
       <div id="transferServerHeld" class="feedback">115 分享 · 访问码由服务端保管</div>
     </div>
+    <div class="field" id="transferCloudField" hidden>
+      <span class="field-label-static">将提交到 115 云下载</span>
+      <ul id="transferCloudList" class="cloud-link-list"></ul>
+    </div>
     <div class="browser-head">
       <code id="folderCurrent">/115pan</code>
       <button type="button" id="folderUp" class="secondary">上级</button>
@@ -342,6 +613,7 @@
     </div>
   </div>
 </div>
+{% endif %}
 <div id="reauthDialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="reauthTitle">
   <div class="modal-backdrop" data-close-reauth></div>
   <div class="modal-card">
@@ -365,6 +637,33 @@
     </div>
   </div>
 </div>
+
+<div id="open115Dialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="open115Title" aria-describedby="open115Subtitle">
+  <div class="modal-backdrop" data-close-open115></div>
+  <div class="modal-card">
+    <div class="modal-head">
+      <div>
+        <h3 id="open115Title">授权 115 目录与云下载</h3>
+        <p id="open115Subtitle">请使用 115 APP 扫码，并在手机上确认授权。</p>
+      </div>
+      <button type="button" class="modal-close" id="open115Close" aria-label="关闭">
+        <svg aria-hidden="true"><use href="/static/icons.svg?v={{ asset_version }}#icon-close"></use></svg>
+      </button>
+    </div>
+    <p class="my115-note">请与第一步使用同一个 115 账号。重复授权可能影响该账号在同一应用下的旧连接。</p>
+    <div class="reauth-qr-wrap">
+      <canvas id="open115Qr" class="open115-qr" role="img" aria-label="115 APP 授权二维码" hidden></canvas>
+    </div>
+    <p id="open115Countdown" class="reauth-countdown"></p>
+    <div id="open115Result" class="feedback" role="status" aria-live="polite" hidden></div>
+    <div class="modal-actions">
+      <button type="button" id="open115Cancel" class="secondary">取消</button>
+      <button type="button" id="open115Refresh" class="secondary">刷新二维码</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/vendor/qrcode.js?v={{ asset_version }}"></script>
 <script src="/static/app.js?v={{ asset_version }}"></script>
 </body>
 </html>

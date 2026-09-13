@@ -526,7 +526,7 @@ class TestSearchRoute:
         assert body["success"] is True
         assert body["total"] == 6
         assert body["page"] == 1
-        assert body["page_size"] == 24
+        assert body["page_size"] == 25
         assert body["query"] == {"q": "", "type": "all"}
         assert "interpreted" in body
 
@@ -577,6 +577,14 @@ class TestSearchRoute:
         assert len(body["items"]) == 2
         assert body["total"] == 6
 
+    @pytest.mark.parametrize("page", [201, 10**30])
+    def test_late_page_is_not_rejected_or_bound_as_overflow_offset(self, client, installed_library, page):
+        response = client.get(f"/api/library/search?page={page}&page_size=10")
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body["page"] == page and body["page_size"] == 10
+        assert body["total"] == 6 and body["items"] == []
+
     def test_poster_url_is_built_from_poster_path(self, client, installed_library):
         response = client.get("/api/library/search?q=" + "虚构电影一")
         item = response.get_json()["items"][0]
@@ -585,7 +593,7 @@ class TestSearchRoute:
 
     @pytest.mark.parametrize(
         "query",
-        ["page=0", "page=201", "page_size=0", "page_size=51", "type=bogus", "year=abcd", "year=2020-abcd", "sort=bogus"],
+        ["page=0", "page=-1", "page=bad", "page_size=0", "page_size=51", "type=bogus", "year=abcd", "year=2020-abcd", "sort=bogus"],
     )
     def test_invalid_params_return_400(self, client, installed_library, query):
         response = client.get("/api/library/search?" + query)
@@ -598,6 +606,21 @@ class TestSearchRoute:
 
 
 class TestFiltersRoute:
+    def test_series_collection_label_preserves_unknown_wire_value(self, client, installed_library):
+        # Keep the fixture's existing visible links; only change one media's
+        # classification so the filters response actually includes unknown.
+        conn = installed_library.connect()
+        try:
+            media_id = conn.execute("SELECT id FROM media WHERE media_type='movie' ORDER BY id LIMIT 1").fetchone()[0]
+            conn.execute("UPDATE media SET media_type='unknown' WHERE id=?", (media_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        response = client.get("/api/library/filters")
+        assert response.status_code == 200
+        types = {entry["value"]: entry["label"] for entry in response.get_json()["types"]}
+        assert types["unknown"] == "系列合集"
+
     def test_returns_dimensions(self, client, installed_library):
         response = client.get("/api/library/filters")
         assert response.status_code == 200

@@ -1,6 +1,6 @@
 """SQLite index store for the personal media-resource library.
 
-Owns the on-disk schema (see docs/architecture.md
+Owns the on-disk schema (see docs/claude-media-library-construction-plan.md
 §3), the ``schema_meta`` key/value table, and the write/upsert API shared by
 the offline importer and the production install step.  Query, search,
 install-time encryption and the TMDB cache/budget tables are out of scope
@@ -34,6 +34,15 @@ if TYPE_CHECKING:
 LOG = logging.getLogger("HiDrive-Lite.library_store")
 
 SCHEMA_VERSION = 1
+
+
+def enqueue_index(conn: sqlite3.Connection, media_ids, *, now: int) -> None:
+    """Queue changed media in the caller's transaction; never commit here."""
+    conn.executemany(
+        "INSERT INTO re0_sync_state(key,value,updated_at) VALUES (?,'1',?) "
+        "ON CONFLICT(key) DO UPDATE SET value='1',updated_at=excluded.updated_at",
+        [(f"index_pending:{int(media_id)}", now) for media_id in media_ids],
+    )
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -179,7 +188,7 @@ CREATE TABLE IF NOT EXISTS import_run (
   row_counts_json TEXT, duplicate_counts_json TEXT, conflict_counts_json TEXT, status TEXT NOT NULL
 );
 
--- w6: anonymous link-validity checker (docs/architecture.md).
+-- w6: anonymous link-validity checker (docs/claude-link-validity-check-design-20260906.md).
 -- Keyed by resource_link's own stable (provider, canonical_url_hash) pair
 -- rather than link_id, so a re-import that reassigns a link's row id (or
 -- moves it to a different group) never loses its check history. Deliberately
@@ -261,6 +270,14 @@ def _ensure_media_metadata_columns(conn: sqlite3.Connection) -> None:
             changed = True
     if changed:
         conn.commit()
+
+
+def _ensure_re0_tables(conn: sqlite3.Connection) -> None:
+    """RE0 projection tables (re0_sync.ensure_tables): same self-healing
+    write-connection migration as link_check -- idempotent, additive only."""
+    import re0_sync  # local import: re0_sync depends on library_normalize only
+
+    re0_sync.ensure_tables(conn)
 
 
 def _ensure_link_check_tables(conn: sqlite3.Connection) -> None:
@@ -440,6 +457,7 @@ class LibraryStore:
         conn.execute("PRAGMA foreign_keys=ON")
         _ensure_media_metadata_columns(conn)
         _ensure_link_check_tables(conn)
+        _ensure_re0_tables(conn)
         return conn
 
     def create_schema(self) -> None:
@@ -658,6 +676,38 @@ class LibraryStore:
                 ),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def insert_link_preserving_existing(self, rec: LinkRecord) -> tuple[int, bool]:
+        """Insert-only counterpart of ``upsert_link`` for RE0 materialisation:
+        on a ``(provider, canonical_url_hash)`` conflict the existing row is
+        returned untouched -- no column, not even ``group_id``, is updated.
+        Returns ``(id, created)``."""
+        conn = self.connect()
+        try:
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO resource_link (
+                    public_id, group_id, provider, canonical_url_hash, url_plain, access_code_plain,
+                    url_ciphertext, access_code_ciphertext, url_label, has_access_code, title_raw,
+                    remark, created_at_source, deleted_at_source, imported_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    rec.public_id, rec.group_id, rec.provider, rec.canonical_url_hash, rec.url_plain,
+                    rec.access_code_plain, rec.url_ciphertext, rec.access_code_ciphertext, rec.url_label,
+                    rec.has_access_code, rec.title_raw, rec.remark, rec.created_at_source, rec.deleted_at_source,
+                    rec.imported_at,
+                ),
+            )
+            created = cur.rowcount == 1
+            row = conn.execute(
+                "SELECT id FROM resource_link WHERE provider=? AND canonical_url_hash=?",
+                (rec.provider, rec.canonical_url_hash),
+            ).fetchone()
+            conn.commit()
+            return int(row["id"]), created
         finally:
             conn.close()
 
@@ -1007,6 +1057,58 @@ class LibraryStore:
             conn.close()
         return [row["id"] for row in rows]
 
+    def eligible_hero_media_ids(self, media_ids: list[int] | None = None) -> list[int]:
+        """High-rated movies/TV with verified metadata and a live resource.
+
+        Use the same primary rating as cards (TMDB, then IMDb), at least
+        7.5/10 and 200 votes. Never promote an unrated item as high-rated.
+        Read-only; ratings already belong to the local enrichment pipeline.
+        """
+        if media_ids == []:
+            return []
+        scope = "" if media_ids is None else " AND m.id IN (" + ",".join("?" for _ in media_ids) + ")"
+        conn = self.connect(readonly=True)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT m.id, m.media_type, m.tmdb_id, m.imdb_id, m.tvmaze_id,
+                       m.ratings_json FROM media m
+                WHERE m.match_status = 'exact'
+                  AND m.media_type IN ('movie', 'tv')
+                  AND m.poster_path IS NOT NULL
+                  AND m.backdrop_path IS NOT NULL
+                  AND m.overview IS NOT NULL AND m.overview != ''
+                  {scope}
+                  AND EXISTS (
+                    SELECT 1 FROM resource_group rg
+                    JOIN resource_link rl ON rl.group_id = rg.id
+                    WHERE rg.media_id = m.id AND {live_link_sql('rl')}
+                  )
+                ORDER BY m.id
+                """, media_ids or [],
+            ).fetchall()
+        finally:
+            conn.close()
+        eligible = []
+        seen = set()
+        for row in rows:
+            try:
+                rating = library_normalize.primary_rating(library_normalize.format_ratings(
+                    row["ratings_json"], media_type=row["media_type"], tmdb_id=row["tmdb_id"],
+                    imdb_id=row["imdb_id"], tvmaze_id=row["tvmaze_id"],
+                ))
+            except (TypeError, ValueError, OverflowError):
+                # A malformed/non-finite upstream rating must not break the pool.
+                continue
+            if rating and 7.5 <= rating["score"] <= 10 and rating["votes"] >= 200:
+                identity = (row["media_type"], "tmdb", row["tmdb_id"]) if row["tmdb_id"] else (
+                    (row["media_type"], "imdb", row["imdb_id"]) if row["imdb_id"] else ("local", row["id"]))
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                eligible.append(row["id"])
+        return eligible
+
     def fallback_recommendation_media_ids(self, limit: int) -> list[int]:
         """T16 §2.1 fallback -- used only when
         ``eligible_recommendation_media_ids()`` is empty: the most
@@ -1185,6 +1287,7 @@ class LibraryStore:
         return {
             "media_id": media_row["id"],
             "media_type": media_row["media_type"],
+            "tmdb_id": media_row["tmdb_id"],
             "title": media_row["title_zh"],
             "original_title": media_row["title_original"],
             "year": media_row["year"],
@@ -1551,7 +1654,7 @@ class LibraryStore:
 _FILTERS_CACHE: dict[str, tuple[float, dict]] = {}
 FILTERS_CACHE_TTL_SECONDS = 300.0
 
-_MEDIA_TYPE_LABELS = {"movie": "电影", "tv": "剧集", "unknown": "待定"}
+_MEDIA_TYPE_LABELS = {"movie": "电影", "tv": "剧集", "unknown": "系列合集"}
 _QUALITY_LABELS = {"2160p": "2160p", "1080p": "1080p", "720p": "720p", "other": "其他画质"}
 _HDR_LABELS = {"dv": "杜比视界", "dv_hdr": "DV/HDR", "hdr10plus": "HDR10+", "hdr10": "HDR10", "hlg": "HLG", "sdr": "SDR"}
 _QUALITY_RANK = {"2160p": 3, "1080p": 2, "720p": 1}

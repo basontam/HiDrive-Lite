@@ -210,6 +210,10 @@ def assemble_report(
     provider_isolation: dict | None = None,
     backdrop: dict | None = None,
     linkcheck: dict | None = None,
+    re0: dict | None = None,
+    sticky: dict | None = None,
+    brand: dict | None = None,
+    login: dict | None = None,
     retries: int = 0,
 ) -> dict:
     """Build the ``build/ui-screenshots/report.json`` structure. Every value
@@ -233,14 +237,18 @@ def assemble_report(
         "provider_isolation": provider_isolation if provider_isolation is not None else {
             "filtered_dom_excludes_other_provider": True,
             "filtered_accessibility_tree_excludes_other_provider": True,
-            "tab_switch_dom_excludes_other_provider": True,
-            "tab_switch_accessibility_tree_excludes_other_provider": True,
+            "tab_switch_shows_only_the_selected_pans_card": True,
+            "tab_switch_keeps_every_tab_button": True,
             "unfiltered_view_shows_other_provider": True,
             "violations": [],
             "ok": True,
         },
         "backdrop": backdrop if backdrop is not None else {"sizes": [], "results": [], "violations": [], "ok": True},
         "linkcheck": linkcheck if linkcheck is not None else {"sizes": [], "results": [], "violations": [], "ok": True},
+        "re0_candidates": re0 if re0 is not None else {"sizes": [], "results": [], "violations": [], "ok": True},
+        "sticky_header": sticky if sticky is not None else {"sizes": [], "results": [], "violations": [], "ok": True},
+        "brand_logo": brand if brand is not None else {"sizes": [], "results": [], "violations": [], "ok": True},
+        "login_page": login if login is not None else {"sizes": [], "results": [], "violations": [], "ok": True},
         "retries": retries,
     }
 
@@ -1145,6 +1153,8 @@ def running_app() -> Iterator[str]:
         base_dir = Path(base_dir_str)
         env, bundle_path = build_temp_environment(base_dir)
         install_library(env, bundle_path)
+        global _app_env
+        _app_env = env
 
         # The app's access log goes to a file, never to an unread PIPE: a
         # pipe nobody drains fills after ~64 KiB of Werkzeug request lines
@@ -1323,7 +1333,7 @@ def _install_reauth_mock(page) -> None:
     reaches the real subprocess's own real-115 network calls -- those
     aren't visible to install_network_guard's page.route interception at
     all (they happen in the Python subprocess, not the browser). Never a
-    real QR/uid/cookie value -- see docs/115-integration.md."""
+    real QR/uid/cookie value -- see docs/115-reauth-adapter.md."""
 
     def handle(route):
         url = route.request.url
@@ -1717,20 +1727,24 @@ def run_keyboard_walkthrough(page, max_tab_presses: int = 60) -> dict:
     _wait_for_active_provider_tab("quark")
     provider_tab_end_selects_last_tab = True
 
-    # Back on 全部 (Home again -- unscoped fetch, 3 tabs) -- ArrowRight
-    # lands on the first real provider once more; its link rows must now
-    # be limited to that provider's own count, with no reload.
+    # Back on 全部 (Home again) -- ArrowRight lands on the first real provider
+    # once more. Round 32: activating a tab narrows the cards to that pan
+    # without reloading, and the tab row itself keeps every button.
     page.keyboard.press("Home")
     _wait_for_active_provider_tab("")
     page.keyboard.press("ArrowRight")
     _wait_for_active_provider_tab("115")
-    target_tab_id = page.evaluate("() => document.activeElement.id")
-    target_count = page.eval_on_selector(f"#{target_tab_id} .provider-tab-count", "el => el.textContent")
-    links_after_filter = page.eval_on_selector_all(".link-row", "els => els.length")
-    provider_tab_activation_filters_group_links = bool(
-        links_after_filter > 0
-        and str(links_after_filter) == target_count
-        and links_after_filter < links_before_filter
+    activation = page.evaluate(
+        """() => ({
+            pans: Array.from(document.querySelectorAll('.pan-card')).map(c => c.dataset.pan),
+            tabs: document.querySelectorAll('.provider-tab').length,
+            links: document.querySelectorAll('.link-row').length,
+        })"""
+    )
+    provider_tab_activation_filters_cards_and_keeps_tabs = bool(
+        activation["pans"] == ["115"]
+        and activation["tabs"] >= 3
+        and 0 < activation["links"] < links_before_filter
     )
 
     return {
@@ -1749,7 +1763,7 @@ def run_keyboard_walkthrough(page, max_tab_presses: int = 60) -> dict:
         "provider_tab_arrow_right_moves_focus": provider_tab_arrow_right_moves_focus,
         "provider_tab_end_selects_last_tab": provider_tab_end_selects_last_tab,
         "provider_tab_home_selects_first_tab": provider_tab_home_selects_first_tab,
-        "provider_tab_activation_filters_group_links": provider_tab_activation_filters_group_links,
+        "provider_tab_activation_filters_cards_and_keeps_tabs": provider_tab_activation_filters_cards_and_keeps_tabs,
     }
 
 
@@ -2032,6 +2046,670 @@ def backdrop_hero_violations(results: Sequence[dict]) -> list[str]:
 # navigations (detail + a search + settings) on top of everything else
 # already captured per size.
 LINKCHECK_CAPTURE_SIZES: tuple[str, ...] = ("1440x900", "390x844")
+# Composition work order §8.3: the RE0 candidate cards (remark, composition,
+# file preview). Seeded into the RUNNING instance immediately before this
+# capture -- never earlier -- so no other page/size check ever sees the extra
+# media in its counts.
+RE0_CAPTURE_SIZES: tuple[str, ...] = ("1440x900", "390x844")
+# Sticky-header work order §6: desktop and mobile both have to hide on the way
+# down, return on the way up, survive jitter, and reveal on keyboard focus.
+STICKY_CAPTURE_SIZES: tuple[str, ...] = ("1440x900", "390x844")
+# Multi-user plan §16.5: the login page at both ends of the range -- two
+# columns wide, stacked narrow, reachable by keyboard, and honest when TMDB
+# has nothing to show.
+LOGIN_CAPTURE_SIZES: tuple[str, ...] = ("1440x900", "390x844")
+
+# Logo work order §验证清单: the wordmark has to render undistorted at both
+# ends of the range, swap artwork with the system colour scheme, and never
+# push the topbar into a horizontal scroll.
+BRAND_CAPTURE_SIZES: tuple[str, ...] = ("1440x900", "390x844")
+
+
+def _sticky_state(page) -> dict:
+    return page.evaluate(
+        """() => {
+            const el = document.querySelector('.site-sticky');
+            const nav = document.querySelector('.workspace-nav');
+            const main = document.querySelector('.content');
+            const style = getComputedStyle(el);
+            return {
+                hidden: el.classList.contains('is-scroll-hidden'),
+                position: style.position,
+                display: style.display,
+                visibility: style.visibility,
+                offsetHeight: el.offsetHeight,
+                mainVisible: !!(main && main.offsetHeight > 0),
+                navScrollable: !!(nav && nav.scrollWidth >= nav.clientWidth),
+                tabs: document.querySelectorAll('.workspace-nav [role="tab"]').length,
+                selected: (document.querySelector('.workspace-nav [role="tab"][aria-selected="true"]') || {}).dataset?.tab || '',
+                ariaHidden: el.getAttribute('aria-hidden'),
+                scrollY: Math.round(window.scrollY),
+            };
+        }"""
+    )
+
+
+def _scroll_to(page, y: int) -> None:
+    page.evaluate("y => window.scrollTo(0, y)", y)
+    page.wait_for_timeout(220)
+
+
+def _capture_and_check_sticky(page, base_url: str, out_dir: Path, size_label: str) -> dict:
+    """§6: the top block hides on the way down and returns on the way up,
+    without leaving the flow, the accessibility tree, or the tablist state
+    any different."""
+    violations: list[str] = []
+    # A page long enough to scroll: the unfiltered library list.
+    page.goto(f"{base_url}/?tab=library&sort=year_desc", wait_until="load")
+    page.wait_for_selector("#libraryResults .media-card", state="visible", timeout=20000)
+    page.wait_for_timeout(250)
+
+    top = _sticky_state(page)
+    if top["hidden"]:
+        violations.append(f"{size_label}: the header is hidden at the top of the page")
+    if top["position"] != "sticky":
+        violations.append(f"{size_label}: the header lost position:sticky ({top['position']})")
+    if top["tabs"] < 5 or not top["selected"]:
+        violations.append(f"{size_label}: the tablist is not intact: {top['tabs']} tabs, selected {top['selected']!r}")
+    _full_page_screenshot(page, out_dir / "sticky-header-top.png")
+
+    _scroll_to(page, 600)
+    down = _sticky_state(page)
+    if not down["hidden"]:
+        violations.append(f"{size_label}: the header did not hide after scrolling down")
+    # §3.5/§3.6: still in the flow, still in the tree, content untouched.
+    for key, bad in (("display", "none"), ("visibility", "hidden")):
+        if down[key] == bad:
+            violations.append(f"{size_label}: the header hid via {key}:{bad}")
+    if down["offsetHeight"] <= 0:
+        violations.append(f"{size_label}: the header lost its height in the flow")
+    if down["ariaHidden"]:
+        violations.append(f"{size_label}: the header was taken out of the accessibility tree")
+    if not down["mainVisible"]:
+        violations.append(f"{size_label}: the content went with it")
+    if down["navScrollable"] is False:
+        violations.append(f"{size_label}: the nav lost its horizontal scroll")
+    _full_page_screenshot(page, out_dir / "sticky-header-hidden.png")
+
+    # A jitter smaller than the dead zone must not toggle anything.
+    _scroll_to(page, 604)
+    _scroll_to(page, 601)
+    if not _sticky_state(page)["hidden"]:
+        violations.append(f"{size_label}: a few pixels of jitter brought the header back")
+
+    _scroll_to(page, 400)
+    if _sticky_state(page)["hidden"]:
+        violations.append(f"{size_label}: the header did not return on the way up")
+
+    _scroll_to(page, 800)
+    if not _sticky_state(page)["hidden"]:
+        violations.append(f"{size_label}: the header did not hide again")
+    _scroll_to(page, 0)
+    back_at_top = _sticky_state(page)
+    if back_at_top["hidden"]:
+        violations.append(f"{size_label}: the header stayed hidden at the top of the page")
+
+    # §5: keyboard focus on a header button reveals it immediately.
+    _scroll_to(page, 800)
+    if not _sticky_state(page)["hidden"]:
+        violations.append(f"{size_label}: setup for the focus check failed")
+    page.evaluate("() => document.querySelector('.workspace-nav [role=\"tab\"]').focus()")
+    page.wait_for_timeout(200)
+    focused = _sticky_state(page)
+    if focused["hidden"]:
+        violations.append(f"{size_label}: keyboard focus left the header invisible")
+    # §5: what matters is that the focused button is actually on screen. The
+    # browser's own scroll-into-view on focus is standard behaviour, not
+    # something this controller should fight.
+    focus_visible = page.evaluate(
+        """() => {
+            const el = document.activeElement;
+            if (!el || !el.closest('.site-sticky')) return { inHeader: false };
+            const r = el.getBoundingClientRect();
+            const style = getComputedStyle(el.closest('.site-sticky'));
+            return { inHeader: true, onScreen: r.top >= 0 && r.bottom <= innerHeight && r.width > 0,
+                     opacity: parseFloat(style.opacity) };
+        }"""
+    )
+    if not focus_visible.get("inHeader"):
+        violations.append(f"{size_label}: focus did not land inside the header")
+    elif not focus_visible.get("onScreen") or focus_visible.get("opacity", 0) < 0.9:
+        violations.append(f"{size_label}: the focused header button is not actually visible: {focus_visible}")
+
+    # §6 regression: the tab still activates, and the panel follows.
+    page.click('.workspace-nav [data-tab="settings"]')
+    page.wait_for_selector("#settings:not([hidden])", state="attached", timeout=20000)
+    after = _sticky_state(page)
+    if after["selected"] != "settings":
+        violations.append(f"{size_label}: the tab did not activate ({after['selected']!r})")
+    if after["hidden"]:
+        violations.append(f"{size_label}: switching workspace left the header hidden")
+
+    return {"size": size_label, "hides_on_scroll_down": down["hidden"], "returns_on_scroll_up": True,
+            "stays_in_flow": down["offsetHeight"] > 0 and down["display"] != "none",
+            "stays_in_a11y_tree": not down["ariaHidden"],
+            "reveals_on_focus": (not focused["hidden"]) and bool(focus_visible.get("onScreen")),
+            "violations": violations, "ok": not violations}
+
+
+def _capture_and_check_login(page, base_url: str, out_dir: Path, size_label: str) -> dict:
+    """§11/§16.5: the card is always the priority -- the collage collapses
+    before it does, the form is keyboard-reachable, and a TMDB outage shows
+    a gradient rather than a broken page."""
+    violations: list[str] = []
+    page.goto(f"{base_url}/login", wait_until="load")
+    page.wait_for_selector("#loginForm", state="visible", timeout=20000)
+    page.wait_for_timeout(250)
+
+    layout = page.evaluate(
+        """() => {
+            const card = document.querySelector('.login-card');
+            const artwork = document.querySelector('.login-artwork');
+            const intro = document.querySelector('.login-intro');
+            const rect = card.getBoundingClientRect();
+            const artworkShown = artwork && getComputedStyle(artwork).display !== 'none';
+            return {
+                cardVisible: rect.width > 240 && rect.height > 200,
+                cardInsideViewport: rect.left >= -1 && rect.right <= innerWidth + 1,
+                artworkShown: !!artworkShown,
+                artworkDecorative: !artwork || artwork.getAttribute('aria-hidden') === 'true',
+                introShown: intro && getComputedStyle(intro).display !== 'none',
+                twoColumn: !!artworkShown && rect.left > intro.getBoundingClientRect().left,
+                pageOverflows: document.documentElement.scrollWidth > innerWidth + 1,
+                brokenImages: Array.from(document.images).filter(i => i.complete && i.naturalWidth === 0).length,
+                attribution: (document.getElementById('loginAttribution') || {}).textContent || '',
+            };
+        }"""
+    )
+    if not layout["cardVisible"]:
+        violations.append(f"{size_label}: the sign-in card is not usable at this size")
+    if not layout["cardInsideViewport"] or layout["pageOverflows"]:
+        violations.append(f"{size_label}: the login page scrolls sideways")
+    if not layout["artworkDecorative"]:
+        violations.append(f"{size_label}: the collage is not marked decorative")
+    if layout["brokenImages"]:
+        violations.append(f"{size_label}: {layout['brokenImages']} image(s) failed to load and stayed on the page")
+    if "TMDB" not in layout["attribution"]:
+        violations.append(f"{size_label}: the TMDB attribution is missing")
+    _full_page_screenshot(page, out_dir / "login-desktop.png")
+
+    # §16.5 keyboard: every control on the card is reachable in order.
+    order = page.evaluate(
+        """() => {
+            const wanted = ['loginGoogle', 'loginEmail', 'loginPassword', 'loginSubmit', 'loginSwitch'];
+            const focusable = Array.from(document.querySelectorAll(
+                'button, input, [href], select, textarea, [tabindex]:not([tabindex="-1"])'))
+                .filter(el => el.offsetParent !== null);
+            return focusable.map(el => el.id).filter(id => wanted.includes(id));
+        }"""
+    )
+    if order != ["loginGoogle", "loginEmail", "loginPassword", "loginSubmit", "loginSwitch"]:
+        violations.append(f"{size_label}: the keyboard order through the card is {order}")
+
+    focus_ring = page.evaluate(
+        """() => {
+            const input = document.getElementById('loginEmail');
+            input.focus();
+            const style = getComputedStyle(input, ':focus-visible');
+            return { focused: document.activeElement === input, outline: style.outlineStyle };
+        }"""
+    )
+    if not focus_ring["focused"]:
+        violations.append(f"{size_label}: the email field does not take focus")
+
+    # Applying reveals the second field and the rules, and says what happens
+    # next without ever signing anyone in.
+    page.click("#loginSwitch")
+    page.wait_for_timeout(150)
+    register = page.evaluate(
+        """() => ({
+            confirmShown: !document.getElementById('loginConfirmField').hidden,
+            rules: (document.getElementById('loginPasswordRules') || {}).textContent || '',
+            submit: document.getElementById('loginSubmit').textContent,
+        })"""
+    )
+    if not register["confirmShown"] or "8" not in register["rules"]:
+        violations.append(f"{size_label}: applying does not show the confirmation field and the rules")
+    if register["submit"] != "提交申请":
+        violations.append(f"{size_label}: the apply button still reads {register['submit']!r}")
+    _full_page_screenshot(page, out_dir / "login-register.png")
+
+    # A refused sign-in shows one message, in a region that announces itself.
+    page.click("#loginSwitch")
+    page.wait_for_timeout(150)
+    page.fill("#loginEmail", "nobody@example.test")
+    page.fill("#loginPassword", "Wrong1Password")
+    page.click("#loginSubmit")
+    page.wait_for_timeout(600)
+    message = page.evaluate(
+        """() => {
+            const box = document.getElementById('loginMessage');
+            return { shown: !box.hidden, text: box.textContent,
+                     live: box.getAttribute('aria-live'), role: box.getAttribute('role') };
+        }"""
+    )
+    if not message["shown"] or not message["text"]:
+        violations.append(f"{size_label}: a refused sign-in said nothing")
+    if message["live"] != "polite" or message["role"] != "status":
+        violations.append(f"{size_label}: the message area does not announce itself")
+    _full_page_screenshot(page, out_dir / "login-error.png")
+
+    return {
+        "size": size_label,
+        "two_column": bool(layout["twoColumn"]),
+        "artwork_shown": bool(layout["artworkShown"]),
+        "card_usable": bool(layout["cardVisible"]),
+        "no_horizontal_overflow": not layout["pageOverflows"],
+        "no_broken_images": layout["brokenImages"] == 0,
+        "keyboard_order_ok": order == ["loginGoogle", "loginEmail", "loginPassword", "loginSubmit", "loginSwitch"],
+        "violations": violations,
+        "ok": not violations,
+    }
+
+
+def _brand_state(page) -> dict:
+    return page.evaluate(
+        """() => {
+            const img = document.querySelector('.brand-logo-image');
+            const brand = document.querySelector('.brand');
+            const badge = document.getElementById('actor');
+            if (!img || !brand) return { present: false };
+            const r = img.getBoundingClientRect();
+            const b = badge ? badge.getBoundingClientRect() : null;
+            const subtitle = brand.querySelector('p');
+            return {
+                present: true,
+                file: (img.currentSrc || img.src).split('?')[0].split('/').pop(),
+                loaded: img.complete && img.naturalWidth > 0,
+                natural: [img.naturalWidth, img.naturalHeight],
+                box: [Math.round(r.width * 100) / 100, Math.round(r.height * 100) / 100],
+                alt: img.alt,
+                insideViewport: r.left >= -1 && r.right <= innerWidth + 1 && r.width > 0 && r.height > 0,
+                overlapsBadge: b ? !(r.right <= b.left + 1 || r.left >= b.right - 1) : false,
+                subtitleShown: subtitle ? getComputedStyle(subtitle).display !== 'none' : false,
+                pageOverflows: document.documentElement.scrollWidth > innerWidth + 1,
+                titleCount: document.querySelectorAll('.brand h1').length,
+            };
+        }"""
+    )
+
+
+def _capture_and_check_brand(page, base_url: str, out_dir: Path, size_label: str) -> dict:
+    """Logo work order §验证清单 items 4, 6: the right artwork for the system
+    colour scheme, at its own aspect ratio, inside the topbar, with no
+    horizontal overflow."""
+    violations: list[str] = []
+
+    def _check(state: dict, scheme: str) -> None:
+        if not state.get("present"):
+            violations.append(f"{size_label}/{scheme}: the topbar has no logo image")
+            return
+        if not state["loaded"]:
+            violations.append(f"{size_label}/{scheme}: the logo did not load")
+        if state["alt"] != "HiDrive-Lite":
+            violations.append(f"{size_label}/{scheme}: the logo lost its accessible name ({state['alt']!r})")
+        if state["titleCount"]:
+            violations.append(f"{size_label}/{scheme}: the old text title is still rendered beside the logo")
+        natural_w, natural_h = state["natural"]
+        box_w, box_h = state["box"]
+        if natural_w and natural_h and box_h:
+            drawn = box_w / box_h
+            intrinsic = natural_w / natural_h
+            if abs(drawn - intrinsic) > 0.02 * intrinsic:
+                violations.append(
+                    f"{size_label}/{scheme}: the logo is distorted -- drawn {drawn:.3f}, intrinsic {intrinsic:.3f}"
+                )
+        if not state["insideViewport"]:
+            violations.append(f"{size_label}/{scheme}: the logo is clipped or sits outside the viewport")
+        if state["overlapsBadge"]:
+            violations.append(f"{size_label}/{scheme}: the logo overlaps the Access badge")
+        if state["pageOverflows"]:
+            violations.append(f"{size_label}/{scheme}: the page scrolls horizontally")
+
+    page.emulate_media(color_scheme="light")
+    page.goto(f"{base_url}/", wait_until="load")
+    page.wait_for_selector(".brand-logo-image", state="visible", timeout=20000)
+    page.wait_for_timeout(150)
+    light = _brand_state(page)
+    _check(light, "light")
+    if light.get("present") and light["file"] != "hidrive-lite-logo.svg":
+        violations.append(f"{size_label}/light: the light theme drew {light['file']}")
+    _full_page_screenshot(page, out_dir / "brand-logo-light.png")
+
+    page.emulate_media(color_scheme="dark")
+    page.wait_for_timeout(200)
+    dark = _brand_state(page)
+    _check(dark, "dark")
+    if dark.get("present") and dark["file"] != "hidrive-lite-logo-on-dark.svg":
+        violations.append(f"{size_label}/dark: the dark theme drew {dark['file']}")
+    _full_page_screenshot(page, out_dir / "brand-logo-dark.png")
+    page.emulate_media(color_scheme="light")
+
+    return {
+        "size": size_label,
+        "light_file": light.get("file"),
+        "dark_file": dark.get("file"),
+        "swaps_with_colour_scheme": light.get("file") != dark.get("file"),
+        "undistorted": not any("distorted" in v for v in violations),
+        "no_horizontal_overflow": not any("horizontally" in v for v in violations),
+        "subtitle_shown": light.get("subtitleShown"),
+        "violations": violations,
+        "ok": not violations,
+    }
+_app_env: dict = {}
+_re0_media_id: int | None = None
+_re0_movie_media_id: int | None = None
+
+_RE0_SEED_SCRIPT = """
+import json, sys, time
+sys.path.insert(0, ".")
+import app, library_store, re0_sync
+
+store = library_store.open_installed(app.LIBRARY_DB_PATH, app.load_fernet())
+now = int(time.time())
+media_id = store.upsert_media(library_store.MediaRecord(
+    media_identity="fp:tv:900900", media_type="tv", title_zh="构成示例剧", search_key="构成示例剧",
+    year=2023, tmdb_id=900900, match_status="exact"))
+shares = [
+    ("fixture-comp-a", "115", "末日地堡 (2023)", "79.52GB", "4K高码，S03 全24集 完结", "2025-04-30T00:00:00+08:00", "C", "valid", None),
+    ("fixture-comp-b", "115", "末日地堡 (2023)", "9.1GB", "S03E01-E03 抢先版，更新中", "2025-05-02T00:00:00+08:00", None, "valid", None),
+    # aliPan on purpose: its mark is the one drawn with a gradient, so this
+    # capture proves the sprite's gradient resolves through an external <use>.
+    ("fixture-comp-c", "aliPan", "末日地堡 (2023)", "41.0GB", None, None, "匿名", "valid", None),
+    # A share RE0 confirmed dead, and a protocol link -- the two candidates the
+    # invalid-visibility work order's browser acceptance needs.
+    ("fixture-comp-d", "189", "末日地堡 (2023)", "12.0GB", "S03 全集", None, None, "invalid", "链接状态异常，需人工复核"),
+    ("fixture-comp-e", "ed2k", "末日地堡 (2023)", "8.0GB", "S03E01", None, None, "valid", None),
+]
+ids = []
+for slug, pan, title, size, remark, created, nick, validate, validate_msg in shares:
+    item = re0_sync.normalize_item({
+        "slug": slug, "pan_type": pan, "title": title, "share_size": size, "remark": remark,
+        "created_at": created, "user": ({"nickname": nick} if nick else None), "is_unlocked": False,
+        "unlock_points": 4, "video_resolution": ["4K"], "source": ["WEB-DL"],
+        "subtitle_language": ["简中"], "subtitle_type": ["内封"], "validate_status": validate,
+        "validate_message": validate_msg, "last_validated_at": "2026-09-10T00:00:00+08:00",
+    }, salt="screenshot-salt")
+    rid, _ = re0_sync.upsert_resource(store, "tv", 900900, item, media_id=media_id, media_title="构成示例剧", now=now)
+    ids.append(rid)
+# A ready preview already in cache: clicking 文件预览 serves it without any
+# upstream request, so this capture stays offline like every other one.
+files = [{"name": "Silo.S03E%02d.2160p.WEB-DL.mkv" % i, "path": "/Silo/S03/E%02d.mkv" % i,
+          "size": 1073741824 * 2, "extension": "mkv"} for i in range(1, 11)]
+re0_sync._preview_store(store, ids[0], status="ready", now=now, ttl=re0_sync.PREVIEW_READY_TTL_SECONDS,
+                        file_count=10, files=files,
+                        composition=re0_sync.parse_composition(remark=shares[0][4], title=shares[0][2],
+                                                              file_names=[f["name"] for f in files], file_count=10),
+                        validate_status="valid")
+# A movie with its own candidates: same shares, different media_type, so the
+# capture can compare the two rendering rules side by side.
+movie_id = store.upsert_media(library_store.MediaRecord(
+    media_identity="fp:movie:900901", media_type="movie", title_zh="构成示例电影", search_key="构成示例电影",
+    year=2021, tmdb_id=900901, match_status="exact"))
+movie_ids = []
+for slug, pan, title, size, remark, created, nick, validate, validate_msg in [
+    ("fixture-movie-a", "115", "构成示例电影 (2021)", "62.0GB", "4K HDR 内封简繁 HiveWeb自购", "2025-03-01T00:00:00+08:00", "C", "valid", None),
+    ("fixture-movie-b", "115", "构成示例电影 (2021)", "18.0GB", None, None, None, "valid", None),
+]:
+    item = re0_sync.normalize_item({
+        "slug": slug, "pan_type": pan, "title": title, "share_size": size, "remark": remark,
+        "created_at": created, "user": ({"nickname": nick} if nick else None), "is_unlocked": False,
+        "unlock_points": 4, "video_resolution": ["4K"], "source": ["WEB-DL"],
+        "subtitle_language": ["简中"], "subtitle_type": ["内封"], "validate_status": validate,
+        "validate_message": validate_msg,
+    }, salt="screenshot-salt")
+    rid, _ = re0_sync.upsert_resource(store, "movie", 900901, item, media_id=movie_id, media_title="构成示例电影", now=now)
+    movie_ids.append(rid)
+movie_files = [{"name": "Movie.2021.2160p.WEB-DL.mkv", "path": "/Movie/Movie.mkv", "size": 1073741824 * 62, "extension": "mkv"}]
+re0_sync._preview_store(store, movie_ids[0], status="ready", now=now, ttl=re0_sync.PREVIEW_READY_TTL_SECONDS,
+                        file_count=1, files=movie_files,
+                        composition=re0_sync.parse_composition(remark=None, file_names=[f["name"] for f in movie_files], file_count=1),
+                        validate_status="valid")
+print(json.dumps({"media_id": media_id, "resource_ids": ids, "movie_media_id": movie_id}))
+"""
+
+
+def seed_re0_fixture() -> int:
+    """Create the RE0 candidate fixture inside the already-installed library
+    (the slug is encrypted with the running instance's own key, so this has
+    to happen after --library-install, not in the bundle)."""
+    global _re0_media_id
+    if _re0_media_id is not None:
+        return _re0_media_id
+    proc = subprocess.run([sys.executable, "-c", _RE0_SEED_SCRIPT], cwd=str(ROOT), env=_app_env,
+                          capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError(f"re0 fixture seeding failed: {proc.stderr.strip()[:400]}")
+    seeded = json.loads(proc.stdout.strip().splitlines()[-1])
+    _re0_media_id = int(seeded["media_id"])
+    global _re0_movie_media_id
+    _re0_movie_media_id = int(seeded["movie_media_id"])
+    return _re0_media_id
+
+
+def _capture_and_check_re0(page, base_url: str, out_dir: Path, size_label: str) -> dict:
+    """Composition work order §8.3: the candidate cards really do show the
+    publisher's remark and a composition summary (not three identical
+    titles), the file preview really lists names/paths/sizes, a pan filter
+    really isolates them, and nothing on the page carries a slug or link."""
+    media_id = seed_re0_fixture()
+    violations: list[str] = []
+
+    page.goto(f"{base_url}/?tab=library&media={media_id}", wait_until="load")
+    page.wait_for_selector(".re0-card", state="visible", timeout=20000)
+    page.wait_for_timeout(200)
+    _full_page_screenshot(page, out_dir / "detail-re0-candidates.png")
+    overflow = _check_overflow(page, size_label, "detail-re0-candidates")
+
+    facts = page.evaluate(
+        """() => {
+            const cards = Array.from(document.querySelectorAll('.re0-card'));
+            return {
+                count: cards.length,
+                compositions: cards.map(c => (c.querySelector('.re0-composition') || {}).textContent || ''),
+                remarks: cards.map(c => (c.querySelector('.re0-remark') || {}).textContent || ''),
+                previewButtons: cards.filter(c => c.querySelector('[data-re0-preview]')).length,
+                unlockButtons: cards.filter(c => c.querySelector('[data-re0-action]')).length,
+                html: document.body.innerHTML,
+            };
+        }"""
+    )
+    if facts["count"] < 4:
+        violations.append(f"{size_label}: expected 4 visible RE0 candidate cards, found {facts['count']}")
+    # Round 40: the number beside each pan logo counts that pan's local links
+    # plus the RE0 candidates it is offering -- each resource once, so an
+    # already-unlocked candidate (which keeps its RE0 row and has a link row)
+    # is not counted on both sides.
+    tab_counts = page.evaluate(
+        """() => Array.from(document.querySelectorAll('.provider-tab'))
+            .filter(t => t.dataset.provider)
+            .map(t => {
+                const code = t.dataset.provider;
+                const shown = t.querySelector('.provider-tab-count');
+                const card = document.querySelector('.pan-card[data-pan="' + code + '"]');
+                const rows = card ? Array.from(card.querySelectorAll('.re0-card')) : [];
+                return {
+                    code: code,
+                    tab: shown ? Number(shown.textContent) : null,
+                    links: card ? card.querySelectorAll('.link-row').length : 0,
+                    candidates: rows.length,
+                    stored: rows.filter(r => r.querySelector('.re0-state.done')).length,
+                };
+            })"""
+    )
+    if not tab_counts:
+        violations.append(f"{size_label}: the detail rendered no pan tabs to count")
+    for entry in tab_counts:
+        expected = entry["links"] + entry["candidates"] - entry["stored"]
+        if entry["tab"] != expected:
+            violations.append(
+                f"{size_label}: the {entry['code']} tab says {entry['tab']} but its card offers {expected} "
+                f"({entry['links']} links + {entry['candidates']} candidates - {entry['stored']} already stored)"
+            )
+    if not any(entry["candidates"] for entry in tab_counts):
+        violations.append(f"{size_label}: no pan tab was checked against RE0 candidates")
+
+    if len({c for c in facts["compositions"] if c}) < 2:
+        violations.append(f"{size_label}: candidate cards do not differ by composition: {facts['compositions']}")
+    if not any(facts["remarks"]):
+        violations.append(f"{size_label}: no candidate card shows the publisher's remark")
+    if facts["unlockButtons"] < 3:
+        violations.append(f"{size_label}: every candidate needs exactly one unlock action")
+    for needle in ("fixture-comp-", "screenshot-salt", "access_code", "ed2k://"):
+        if needle in facts["html"]:
+            violations.append(f"{size_label}: candidate markup leaked {needle!r}")
+
+    # §8.3 item 3: the preview lists file names, paths and sizes (served from
+    # the seeded cache -- install_network_guard proves nothing external ran).
+    page.click("[data-re0-preview]")
+    page.wait_for_selector(".re0-file-list li", state="visible", timeout=20000)
+    preview = page.evaluate(
+        """() => {
+            const first = document.querySelector('.re0-file-list li');
+            return {
+                rows: document.querySelectorAll('.re0-file-list li').length,
+                name: (first.querySelector('.re0-file-name') || {}).textContent || '',
+                path: (first.querySelector('.re0-file-path') || {}).textContent || '',
+                size: (first.querySelector('.re0-file-size') || {}).textContent || '',
+                head: (document.querySelector('.re0-preview-head') || {}).textContent || '',
+            };
+        }"""
+    )
+    _full_page_screenshot(page, out_dir / "detail-re0-file-preview.png")
+    overflow_preview = _check_overflow(page, size_label, "detail-re0-file-preview")
+    if preview["rows"] < 10 or not preview["name"] or not preview["path"] or not preview["size"]:
+        violations.append(f"{size_label}: file preview is missing name/path/size rows: {preview}")
+    if "10" not in preview["head"]:
+        violations.append(f"{size_label}: file preview does not state the file count: {preview['head']!r}")
+
+    # Invalid-candidate work order §5.3: the dead 天翼 share is hidden by
+    # default with its count announced, the audit toggle brings it back with no
+    # unlock button, and the ed2k row never offers a file preview.
+    invalid = page.evaluate(
+        """() => {
+            const cards = Array.from(document.querySelectorAll('.re0-card'));
+            const list = document.querySelector('#detailGroupList');
+            return {
+                cards: cards.length,
+                dead: cards.filter(c => c.querySelector('.re0-state.invalid')).length,
+                toolbars: document.querySelectorAll('.re0-toolbar').length,
+                hasToggle: !!document.querySelector('#re0ShowInvalid'),
+                hasRefresh: !!document.querySelector('#re0Refresh'),
+                text: (list || {}).innerText || '',
+                lastChild: list && list.lastElementChild ? list.lastElementChild.className : '',
+                previewButtons: cards.filter(c => c.querySelector('[data-re0-preview]')).length,
+                unlockButtons: cards.filter(c => c.querySelector('[data-re0-action]')).length,
+            };
+        }"""
+    )
+    if invalid["dead"]:
+        violations.append(f"{size_label}: a dead RE0 candidate is visible by default")
+    # Round 37: the auxiliary toolbar is gone -- the resource list simply ends.
+    if invalid["toolbars"] or invalid["hasToggle"] or invalid["hasRefresh"]:
+        violations.append(f"{size_label}: the removed RE0 toolbar is still in the DOM: {invalid}")
+    for phrase in ("已隐藏", "显示失效候选", "刷新 RE0 候选", "RE0 候选未解锁前只显示规格与状态"):
+        if phrase in invalid["text"]:
+            violations.append(f"{size_label}: the resource area still says {phrase!r}")
+    if "pan-grid" not in invalid["lastChild"]:
+        violations.append(f"{size_label}: the resource list does not end with the resources ({invalid['lastChild']!r})")
+    # Four visible candidates, but only the three pan shares may offer a preview.
+    if invalid["previewButtons"] != 3:
+        violations.append(f"{size_label}: expected 3 preview buttons (ed2k has none), found {invalid['previewButtons']}")
+    if invalid["unlockButtons"] != 4:
+        violations.append(f"{size_label}: every visible candidate needs its action, found {invalid['unlockButtons']}")
+
+    # Round 37 removed the audit toggle from the UI, so a browser can no
+    # longer reach that view at all -- which is the requirement. The
+    # include_invalid contract itself is covered at the API level
+    # (tests/test_re0_search_api.py), and "a dead candidate offers no unlock"
+    # at the row level (tests/test_re0_ui.py).
+    page.goto(f"{base_url}/?tab=library&media={media_id}", wait_until="load")
+    page.wait_for_selector(".re0-card", state="visible", timeout=20000)
+
+    # Movie work order §6: a film's candidates carry no composition chip and
+    # its preview head has no composition suffix; the series above still has
+    # both. Same fixture data, only media_type differs.
+    page.goto(f"{base_url}/?tab=library&media={_re0_movie_media_id}", wait_until="load")
+    page.wait_for_selector(".re0-card", state="visible", timeout=20000)
+    page.wait_for_timeout(200)
+    movie = page.evaluate(
+        """() => {
+            const cards = Array.from(document.querySelectorAll('.re0-card'));
+            return {
+                cards: cards.length,
+                chips: document.querySelectorAll('.re0-composition').length,
+                text: document.body.innerText,
+                remarks: cards.filter(c => c.querySelector('.re0-remark')).length,
+                specs: cards.filter(c => c.querySelector('.spec-item')).length,
+                unlock: cards.filter(c => c.querySelector('[data-re0-action]')).length,
+                preview: cards.filter(c => c.querySelector('[data-re0-preview]')).length,
+                emptyChipStrips: cards.filter(c => {
+                    const strip = c.querySelector('.re0-chips');
+                    return strip && strip.children.length === 0;
+                }).length,
+            };
+        }"""
+    )
+    _full_page_screenshot(page, out_dir / "detail-re0-movie.png")
+    overflow_movie = _check_overflow(page, size_label, "detail-re0-movie")
+    if movie["cards"] != 2:
+        violations.append(f"{size_label}: expected 2 movie candidates, found {movie['cards']}")
+    if movie["chips"]:
+        violations.append(f"{size_label}: a movie candidate still renders a composition chip")
+    for phrase in ("构成未说明", "据发布者备注", "据文件名推断"):
+        if phrase in movie["text"]:
+            violations.append(f"{size_label}: movie page still says {phrase!r}")
+    if movie["remarks"] != 1:
+        violations.append(f"{size_label}: the movie remark did not survive ({movie['remarks']})")
+    if movie["specs"] != 2 or movie["unlock"] != 2 or movie["preview"] != 2:
+        violations.append(f"{size_label}: a movie card lost its specs/actions: {movie}")
+    if movie["emptyChipStrips"]:
+        violations.append(f"{size_label}: hiding the chip left an empty chip strip")
+
+    page.click("[data-re0-preview]")
+    page.wait_for_selector(".re0-file-list li", state="visible", timeout=20000)
+    movie_preview = page.evaluate(
+        """() => ({ head: (document.querySelector('.re0-preview-head') || {}).textContent || '',
+                    rows: document.querySelectorAll('.re0-file-list li').length,
+                    name: (document.querySelector('.re0-file-name') || {}).textContent || '',
+                    chips: document.querySelectorAll('.re0-composition').length })"""
+    )
+    _full_page_screenshot(page, out_dir / "detail-re0-movie-preview.png")
+    if "共 1 个文件" not in movie_preview["head"] or "·" in movie_preview["head"]:
+        violations.append(f"{size_label}: the movie preview head carries a composition suffix: {movie_preview['head']!r}")
+    if movie_preview["rows"] != 1 or not movie_preview["name"]:
+        violations.append(f"{size_label}: the movie preview lost its files: {movie_preview}")
+    if movie_preview["chips"]:
+        violations.append(f"{size_label}: opening a movie preview brought a composition chip back")
+
+    page.goto(f"{base_url}/?tab=library&media={media_id}", wait_until="load")
+    page.wait_for_selector(".re0-card", state="visible", timeout=20000)
+    series_chips = page.evaluate("() => document.querySelectorAll('.re0-composition').length")
+    if series_chips < 1:
+        violations.append(f"{size_label}: the series lost its composition chips")
+
+    # §8.3 item 2: a pan filter leaves no other pan's candidate behind.
+    page.goto(f"{base_url}/?tab=library&media={media_id}&provider=115", wait_until="load")
+    page.wait_for_selector(".re0-card", state="visible", timeout=20000)
+    page.wait_for_timeout(150)
+    scoped = page.evaluate(
+        """() => ({ pans: Array.from(document.querySelectorAll('.pan-card')).map(c => c.dataset.pan),
+                    cards: document.querySelectorAll('.re0-card').length })"""
+    )
+    if any(pan != "115" for pan in scoped["pans"]):
+        violations.append(f"{size_label}: provider=115 still shows other pans: {scoped['pans']}")
+
+    return {"size": size_label, "cards": facts["count"], "preview_rows": preview["rows"],
+            "dead_hidden_by_default": invalid["dead"] == 0,
+            "auxiliary_toolbar_removed": invalid["toolbars"] == 0 and not invalid["hasToggle"] and not invalid["hasRefresh"],
+            "tab_counts_include_re0": all(
+            entry["tab"] == entry["links"] + entry["candidates"] - entry["stored"] for entry in tab_counts
+        ) and bool(tab_counts),
+        "ed2k_has_no_preview": invalid["previewButtons"] == 3,
+            "movie_hides_composition": movie["chips"] == 0, "movie_keeps_remark_and_actions": movie["remarks"] == 1 and movie["unlock"] == 2,
+            "movie_preview_has_no_composition": "·" not in movie_preview["head"], "series_keeps_composition": series_chips >= 1,
+            "overflow_ok": overflow["ok"] and overflow_preview["ok"] and overflow_movie["ok"], "violations": violations,
+            "ok": not violations and overflow["ok"] and overflow_preview["ok"] and overflow_movie["ok"]}
 
 # A representative, internally-consistent GET /api/library/linkcheck-status
 # stand-in (§ contract item 4 shape) -- one provider of each interesting
@@ -2133,15 +2811,20 @@ def _capture_and_check_linkcheck(page, base_url: str, out_dir: Path, size_label:
     """w6-contract §UI item 5 acceptance, against the seeded linkcheck
     fixtures (_seed_linkcheck_fixtures_for_screenshots) with their network
     responses patched (_install_linkcheck_route_stub): the link-invalid
-    text badge's computed colour really is --danger, the detail page with
-    all three check states rendered never overflows horizontally, 重新检测
+    text badge's computed colour really is --danger (in the 包含已失效 audit
+    view, the only place an invalid link still renders since round 25), the
+    detail page with all check states rendered never overflows horizontally, 重新检测
     is reachable via the keyboard, the all-invalid title's card shows its
     corner badge, and the settings card renders its four provider rows."""
     assert _linkcheck_media_id and _linkcheck_all_invalid_media_id, \
         "_seed_linkcheck_fixtures_for_screenshots must run before this capture"
     _install_linkcheck_route_stub(page)
 
-    page.goto(f"{base_url}/?tab=library&media={_linkcheck_media_id}", wait_until="load")
+    # Round 25: a checker-invalid (or source-deleted) link is hidden from the
+    # normal detail view -- it only renders, disabled and carrying its 已失效
+    # word, under the 包含已失效 audit view (`deleted=1`), which is therefore
+    # where the badge's colour is checked.
+    page.goto(f"{base_url}/?tab=library&media={_linkcheck_media_id}&deleted=1", wait_until="load")
     page.wait_for_selector(".link-invalid-text", state="visible")
     _full_page_screenshot(page, out_dir / "detail-linkcheck.png")
     overflow = _check_overflow(page, size_label, "detail-linkcheck")
@@ -2242,29 +2925,41 @@ def check_provider_isolation(page, base_url: str) -> dict:
     filtered_dom, filtered_a11y = _scan(f"{base_url}/?tab=library&media=1&provider=115")
     full_dom, full_a11y = _scan(f"{base_url}/?tab=library&media=1")
 
-    # I1: the URL-driven load above only proves open() is isolated. The
-    # in-page tab switch (selectProvider) must be equally isolated -- open
-    # the media unfiltered, click the 115 tab in real Chromium, wait for
-    # the resulting backend-scoped re-render (the tablist shrinks to just
-    # [全部, 115] once the quark facet is gone from the scoped response),
-    # and scan the same way.
+    # Round 32: an in-page tab narrows the CARDS to its pan while the tab row
+    # itself stays complete -- the old backend-scoped switch deleted the other
+    # tab buttons along with their cards. `?provider=` isolation above is
+    # unchanged and still has to be airtight.
     page.goto(f"{base_url}/?tab=library&media=1", wait_until="load")
     page.wait_for_selector(f"{detail_root}:not([hidden]) .link-row", state="visible")
+    tabs_before = page.eval_on_selector_all(f"{detail_root} .provider-tab", "els => els.length")
     page.click(f'{detail_root} .provider-tab[data-provider="115"]')
-    page.wait_for_selector(f'{detail_root} .provider-tab[data-provider="quark"]', state="detached")
-    tab_switch_dom = page.eval_on_selector(detail_root, "el => el.innerHTML")
-    tab_switch_a11y = page.locator(detail_root).aria_snapshot()
+    page.wait_for_function(
+        "root => document.querySelectorAll(root + ' .pan-card').length === 1", arg=detail_root, timeout=20000
+    )
+    tab_switch = page.evaluate(
+        """(root) => {
+            const scope = document.querySelector(root);
+            return {
+                pans: Array.from(scope.querySelectorAll('.pan-card')).map(c => c.dataset.pan),
+                tabs: Array.from(scope.querySelectorAll('.provider-tab')).map(t => t.dataset.provider),
+                selectedTabs: Array.from(scope.querySelectorAll('.provider-tab[aria-selected="true"]')).map(t => t.dataset.provider),
+            };
+        }""",
+        detail_root,
+    )
 
     violations: list[str] = []
+    if tab_switch["pans"] != ["115"]:
+        violations.append(f"tab click left {tab_switch['pans']!r} on screen, expected only ['115']")
+    if len(tab_switch["tabs"]) != tabs_before:
+        violations.append(f"tab click dropped tab buttons: {tabs_before} -> {tab_switch['tabs']!r}")
+    if tab_switch["selectedTabs"] != ["115"]:
+        violations.append(f"tab click left aria-selected on {tab_switch['selectedTabs']!r}")
     for marker in _PROVIDER_ISOLATION_OTHER_PROVIDER_MARKERS:
         if marker in filtered_dom:
             violations.append(f"filtered DOM contains {marker!r}")
         if marker in filtered_a11y:
             violations.append(f"filtered accessibility tree contains {marker!r}")
-        if marker in tab_switch_dom:
-            violations.append(f"in-page tab switch DOM contains {marker!r}")
-        if marker in tab_switch_a11y:
-            violations.append(f"in-page tab switch accessibility tree contains {marker!r}")
     unfiltered_shows_other_provider = any(
         marker in full_dom or marker in full_a11y for marker in _PROVIDER_ISOLATION_OTHER_PROVIDER_MARKERS
     )
@@ -2272,14 +2967,12 @@ def check_provider_isolation(page, base_url: str) -> dict:
         violations.append("positive control failed: unfiltered view never showed the other provider at all")
     if "115" not in filtered_dom:
         violations.append("filtered view lost the REQUESTED provider's own link too")
-    if "115" not in tab_switch_dom:
-        violations.append("in-page tab switch lost the SELECTED provider's own link too")
 
     return {
         "filtered_dom_excludes_other_provider": not any(m in filtered_dom for m in _PROVIDER_ISOLATION_OTHER_PROVIDER_MARKERS),
         "filtered_accessibility_tree_excludes_other_provider": not any(m in filtered_a11y for m in _PROVIDER_ISOLATION_OTHER_PROVIDER_MARKERS),
-        "tab_switch_dom_excludes_other_provider": not any(m in tab_switch_dom for m in _PROVIDER_ISOLATION_OTHER_PROVIDER_MARKERS),
-        "tab_switch_accessibility_tree_excludes_other_provider": not any(m in tab_switch_a11y for m in _PROVIDER_ISOLATION_OTHER_PROVIDER_MARKERS),
+        "tab_switch_shows_only_the_selected_pans_card": tab_switch["pans"] == ["115"],
+        "tab_switch_keeps_every_tab_button": len(tab_switch["tabs"]) == tabs_before,
         "unfiltered_view_shows_other_provider": unfiltered_shows_other_provider,
         "violations": violations,
         "ok": not violations,
@@ -2381,6 +3074,10 @@ def run_full_capture(
     retry_counts: dict[str, int] = {}
     backdrop_results: list[dict] = []
     linkcheck_results: list[dict] = []
+    re0_results: list[dict] = []
+    sticky_results: list[dict] = []
+    brand_results: list[dict] = []
+    login_results: list[dict] = []
 
     with running_app() as base_url:
         with sync_playwright() as p:
@@ -2501,6 +3198,22 @@ def run_full_capture(
                     if label in LINKCHECK_CAPTURE_SIZES:
                         with _crash_guard(page, label, "linkcheck"):
                             linkcheck_results.append(_capture_and_check_linkcheck(page, base_url, out_dir / label, label))
+                    # Composition work order §8.3: RE0 candidate cards + file
+                    # preview. Runs last for the same reason linkcheck does --
+                    # its fixture is seeded into the live instance here, so no
+                    # earlier check can see the extra media.
+                    if label in RE0_CAPTURE_SIZES:
+                        with _crash_guard(page, label, "re0-candidates"):
+                            re0_results.append(_capture_and_check_re0(page, base_url, out_dir / label, label))
+                    if label in STICKY_CAPTURE_SIZES:
+                        with _crash_guard(page, label, "sticky-header"):
+                            sticky_results.append(_capture_and_check_sticky(page, base_url, out_dir / label, label))
+                    if label in BRAND_CAPTURE_SIZES:
+                        with _crash_guard(page, label, "brand-logo"):
+                            brand_results.append(_capture_and_check_brand(page, base_url, out_dir / label, label))
+                    if label in LOGIN_CAPTURE_SIZES:
+                        with _crash_guard(page, label, "login"):
+                            login_results.append(_capture_and_check_login(page, base_url, out_dir / label, label))
                     # capture_pages may have replaced ``context`` with a
                     # fresh one (a timeout retry) -- close whichever one
                     # is actually live via the returned page.
@@ -2548,6 +3261,38 @@ def run_full_capture(
         "ok": not linkcheck_report_violations,
     }
 
+    re0_report_violations = [v for entry in re0_results for v in entry["violations"]]
+    re0_report = {
+        "sizes": list(RE0_CAPTURE_SIZES),
+        "results": re0_results,
+        "violations": re0_report_violations,
+        "ok": not re0_report_violations,
+    }
+
+    sticky_report_violations = [v for entry in sticky_results for v in entry["violations"]]
+    sticky_report = {
+        "sizes": list(STICKY_CAPTURE_SIZES),
+        "results": sticky_results,
+        "violations": sticky_report_violations,
+        "ok": not sticky_report_violations,
+    }
+
+    login_report_violations = [v for entry in login_results for v in entry["violations"]]
+    login_report = {
+        "sizes": list(LOGIN_CAPTURE_SIZES),
+        "results": login_results,
+        "violations": login_report_violations,
+        "ok": not login_report_violations,
+    }
+
+    brand_report_violations = [v for entry in brand_results for v in entry["violations"]]
+    brand_report = {
+        "sizes": list(BRAND_CAPTURE_SIZES),
+        "results": brand_results,
+        "violations": brand_report_violations,
+        "ok": not brand_report_violations,
+    }
+
     report = assemble_report(
         sizes=size_labels,
         pages=list(pages),
@@ -2561,6 +3306,10 @@ def run_full_capture(
         provider_isolation=provider_isolation,
         backdrop=backdrop_report,
         linkcheck=linkcheck_report,
+        re0=re0_report,
+        sticky=sticky_report,
+        brand=brand_report,
+        login=login_report,
         retries=sum(retry_counts.values()),
     )
     report_path = out_dir / "report.json"
@@ -2602,6 +3351,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     if not report["library_tab_reset"]["ok"]:
         print(f"FAILED: library tab reset acceptance violations: {report['library_tab_reset']['violations']}", file=sys.stderr)
+        return 1
+    if not report["re0_candidates"]["ok"]:
+        print(f"FAILED: RE0 candidate acceptance violations: {report['re0_candidates']['violations']}", file=sys.stderr)
+        return 1
+    if not report["sticky_header"]["ok"]:
+        print(f"FAILED: sticky-header acceptance violations: {report['sticky_header']['violations']}", file=sys.stderr)
         return 1
     return 0
 

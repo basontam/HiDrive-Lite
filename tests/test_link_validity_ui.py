@@ -85,6 +85,7 @@ var PROVIDER_META_BY_CODE = { "115": { code: "115", symbol: "provider-115" }, qu
 function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
   return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
 }); }
+var state = { cloudEnabled: false };
 var LINKCHECK_REASON_LABEL = """ + reason_label + """;
 var LINKCHECK_ERROR_CLASS_LABEL = """ + error_label + """;
 function linkcheckErrorClassLabel(code) {""" + error_label_fn + """}
@@ -391,14 +392,14 @@ def test_settings_page_has_linkcheck_card_and_ids(page):
 def test_linkcheck_card_appears_after_tmdb_card_and_before_status_card(page):
     tmdb_pos = page.index("TMDB 刮削")
     linkcheck_pos = page.index('id="linkcheckCard"')
-    status_pos = page.index("<h3>服务状态</h3>")
+    status_pos = page.index("<h3>系统状态</h3>")
     assert tmdb_pos < linkcheck_pos < status_pos
 
 
 def test_linkcheck_card_help_text_matches_brief(page):
-    assert "勾选后请点击下方「保存检测设置」才会生效" in page
-    assert "115 为匿名探测，不使用你的登录会话" in page
-    assert "失效判定只依据网盘的明确提示，无法确认的不标记" in page
+    assert "修改后点击「保存检测设置」生效" in page
+    assert "115 使用匿名探测" in page
+    assert "仅按网盘明确提示判定失效" in page
 
 
 def test_linkcheck_providers_fixed_order(js):
@@ -463,12 +464,16 @@ def test_settings_init_wires_dirty_flag_for_global_switch_and_all_providers(js):
     assert '"linkcheck-" + code + "-cap"' in body
 
 
-def test_settings_save_sends_linkcheck_payload_only_when_dirty(js):
+def test_115_save_does_not_persist_or_clear_linkcheck_draft(js):
     match = re.search(r'\$\("settingsSave"\)\.onclick = function \(\) \{([\s\S]*?)\n      \};', js)
     assert match, "expected the settingsSave onclick handler"
     body = match.group(1)
-    assert "if (state.linkcheckDirty) Object.assign(payload, linkcheckSavePayload());" in body
-    assert "state.linkcheckDirty = false;" in body
+    assert "linkcheckSavePayload" not in body
+    assert "state.linkcheckDirty = false" not in body
+    own_save = re.search(r'\$\("linkcheckSave"\)\.onclick = function \(\) \{([\s\S]*?)\n      \};', js)
+    assert own_save, "expected the linkcheckSave onclick handler"
+    assert "JSON.stringify(linkcheckSavePayload())" in own_save.group(1)
+    assert 'views.settingsNav.saved("linkcheck", revision)' in own_save.group(1)
 
 
 def test_linkcheck_save_payload_reads_global_switch_and_all_provider_rows(js):
@@ -615,7 +620,7 @@ def html():
 
 
 def test_linkcheck_card_has_its_own_save_button_and_feedback(html):
-    card = re.search(r'<article class="card" id="linkcheckCard">([\s\S]*?)</article>', html).group(1)
+    card = re.search(r'<article class="card" id="linkcheckCard"[^>]*>([\s\S]*?)</article>', html).group(1)
     assert 'id="linkcheckSave"' in card
     assert 'id="linkcheckResult"' in card
     assert "保存检测设置" in card
@@ -625,7 +630,7 @@ def test_linkcheck_save_posts_only_the_two_linkcheck_keys(js):
     handler = _extract(js, r'\$\("linkcheckSave"\)\.onclick = function \(\) \{([\s\S]*?)\n      \};')
     assert 'JSON.stringify(linkcheckSavePayload())' in handler
     assert "115_target_pid" not in handler and "tmdb" not in handler
-    assert "state.linkcheckDirty = false" in handler
+    assert 'views.settingsNav.saved("linkcheck", revision)' in handler
 
 
 def _summary_harness(js: str) -> str:
@@ -744,8 +749,18 @@ def test_status_words_are_plain_text_without_emoji_or_icons(js):
 def _group_row_harness(js: str) -> str:
     group_row = _extract(js, r'groupRowHtml:\s*function\s*\(group, code\)\s*\{([\s\S]*?)\n    \},')
     live_count = _extract(js, r'function groupLiveLinkCount\(group\) \{([\s\S]*?)\n  \}')
+    # Round 25: groupRowHtml reads its rows through these helpers.
+    visible_links = _extract(js, r'function visibleLinks\(group, code\) \{([\s\S]*?)\n  \}')
+    usable = _extract(js, r'function linkIsUsable\(link\) \{([\s\S]*?)\n  \}')
+    fold_open = _extract(js, r'function groupFoldOpen\(key\) \{([\s\S]*?)\n  \}')
+    fold_button = _extract(js, r'function foldButtonHtml\(key, open\) \{([\s\S]*?)\n  \}')
     return _link_row_harness(js) + """
 var REVIEW_REASON_LABEL = {};
+state.detail = state.detail || { includeDeleted: false };
+function linkIsUsable(link) {""" + usable + """}
+function visibleLinks(group, code) {""" + visible_links + """}
+function groupFoldOpen(key) {""" + fold_open + """}
+function foldButtonHtml(key, open) {""" + fold_button + """}
 function groupLiveLinkCount(group) {""" + live_count + """}
 views.detail.seasonLabel = function () { return ""; };
 views.detail.specRowHtml = function () { return ""; };
@@ -753,7 +768,10 @@ views.detail.groupRowHtml = function (group, code) {""" + group_row + """};
 """
 
 
-def test_mixed_group_shows_valid_and_invalid_status_side_by_side(js):
+def test_mixed_group_hides_the_invalid_link_and_shows_it_in_the_audit_view(js):
+    # Round 25: a checker-invalid link is no longer listed next to the valid
+    # one -- it is hidden and uncounted, and only the 包含已失效 audit view
+    # brings it back (still carrying its red 已失效 word).
     group = {
         "group_id": 7, "display_title": "4K", "providers": {"115": 1}, "link_count": 1, "links": [
             {"link_id": "a", "provider": "115", "label": "t", "deleted": False, "invalid": False,
@@ -762,21 +780,30 @@ def test_mixed_group_shows_valid_and_invalid_status_side_by_side(js):
              "check_status": "invalid", "check_reason": "share_cancelled", "checked_at": "2026-09-07T00:00:00Z", "actions": ["transfer", "open"]},
         ],
     }
-    harness = _group_row_harness(js) + "console.log(JSON.stringify(views.detail.groupRowHtml(" + json.dumps(group, ensure_ascii=False) + ", '')));"
-    html = json.loads(_run_node(harness))
-    assert html.count('class="link-row') == 2
-    assert re.search(r'link-status-valid"[^>]*>有效', html) and 'class="link-invalid-text"' in html
-    assert "1 条链接" in html
+    harness = _group_row_harness(js) + "var g = " + json.dumps(group, ensure_ascii=False) + """;
+var plain = views.detail.groupRowHtml(g, '');
+state.detail.includeDeleted = true;
+console.log(JSON.stringify({ plain: plain, audit: views.detail.groupRowHtml(g, '') }));
+"""
+    out = json.loads(_run_node(harness))
+    assert out["plain"].count('class="link-row') == 1
+    assert re.search(r'link-status-valid"[^>]*>有效', out["plain"]) and 'class="link-invalid-text"' not in out["plain"]
+    assert out["audit"].count('class="link-row') == 2 and 'class="link-invalid-text"' in out["audit"]
+    for html in (out["plain"], out["audit"]):
+        assert "1 条链接" in html
 
 
 def test_all_invalid_group_says_quanbu_shixiao_instead_of_zero_links(js):
+    # Such a group is not rendered at all in the normal view (its pan card
+    # drops it); in the 包含已失效 audit view it keeps its rows and says
+    # 全部失效 rather than "0 条链接".
     group = {
         "group_id": 8, "display_title": "1080p", "providers": {}, "link_count": 0, "links": [
             {"link_id": "c", "provider": "tianyicloud", "label": "t", "deleted": False, "invalid": True,
              "check_status": "invalid", "check_reason": "file_deleted", "checked_at": "2026-09-07T00:00:00Z", "actions": ["open"]},
         ],
     }
-    harness = _group_row_harness(js) + "console.log(JSON.stringify(views.detail.groupRowHtml(" + json.dumps(group, ensure_ascii=False) + ", '')));"
+    harness = _group_row_harness(js) + "state.detail.includeDeleted = true;\nconsole.log(JSON.stringify(views.detail.groupRowHtml(" + json.dumps(group, ensure_ascii=False) + ", '')));"
     html = json.loads(_run_node(harness))
     assert "全部失效" in html and "0 条链接" not in html
     assert "已失效" in html and "暂无可用链接" not in html
@@ -786,8 +813,11 @@ def test_detail_fetch_passes_include_deleted_when_filter_active(js):
     helper = _extract(js, r'function detailRequestUrl\(mediaId, provider\) \{([\s\S]*?)\n  \}')
     assert "include_deleted=1" in helper and "state.library.includeDeleted" in helper
     open_fn = _extract(js, r'open:\s*function\s*\(mediaId\)\s*\{([\s\S]*?)\n    \},')
-    select_fn = _extract(js, r'selectProvider:\s*function\s*\(code\)\s*\{([\s\S]*?)\n    \},')
-    assert "detailRequestUrl(" in open_fn and "detailRequestUrl(" in select_fn
+    assert "detailRequestUrl(" in open_fn
+    # Round 31: the pan tab highlights instead of refetching, so the detail
+    # fetch (and its include_deleted flag) happens once, in open().
+    reload_fn = _extract(js, r'reloadRe0:\s*function\s*\(\)\s*\{([\s\S]*?)\n    \},')
+    assert "detailRequestUrl(" in reload_fn
 
 
 def test_matches_provider_honours_include_deleted_for_all_invalid_groups(js):

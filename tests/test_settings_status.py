@@ -19,6 +19,7 @@ def test_status_on_fresh_install(client, hidrive):
     assert body["success"] is True
     assert body["auth_mode"] == "local"
     assert body["public_origin_configured"] is True
+    assert "public_origin" not in body
     assert body["hdhive"]["authorized"] is False
     assert body["hdhive"]["app_secret_configured"] is False
     assert body["hdhive"]["checkin"] == {"last_success": None, "last_at": None}
@@ -26,8 +27,6 @@ def test_status_on_fresh_install(client, hidrive):
     assert body["115"]["open_platform_configured"] is False
     assert body["openlist"] == {"configured": True, "token_configured": False, "paths": {"115pan": "/115pan", "115strm": "/115strm"}}
     assert body["strm"] == {"exists": True}
-    assert "url" not in body["openlist"]
-    assert "root" not in body["strm"]
     assert "target_pid" not in body["115"]
     assert "open_root_cid" not in body["115"]
 

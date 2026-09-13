@@ -1,4 +1,4 @@
-"""Optionally synchronize OpenList credentials into HiDrive-Lite's encrypted store.
+"""Synchronize existing OpenList credentials into HiDrive-Lite's encrypted store.
 
 OpenList owns the 115 Open Platform refresh cycle.  HiDrive-Lite receives a
 copy of the current access/refresh pair for read-only CID resolution and never
@@ -18,7 +18,6 @@ from cryptography.fernet import Fernet
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
-
 
 OPENLIST_DB = Path(os.getenv("OPENLIST_DB", "./data/openlist.db"))
 HIDRIVE_DB = Path(os.getenv("HIDRIVE_DB", "./data/hidrive.db"))

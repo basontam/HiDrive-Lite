@@ -218,28 +218,29 @@ def collect_targets(root: Path) -> list[Path]:
 def scan_git_history(root: Path, allow: list[AllowRule]) -> list[Finding]:
     """Scan reachable Git blobs without checking out or writing any object."""
     result = subprocess.run(
-        ["git", "-C", str(root), "rev-list", "--objects", "--all"],
+        ["git", "-C", str(root), "log", "--format=%T", "--all"],
         check=True,
         capture_output=True,
         text=True,
     )
+    # A blob can occur at several paths over history. rev-list --objects
+    # reports only one representative path, which is insufficient for
+    # path-scoped exceptions (e.g. a source secret later moved into tests).
+    objects: dict[str, set[str]] = {}
+    for tree in dict.fromkeys(result.stdout.splitlines()):
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", tree],
+            check=True, capture_output=True,
+        ).stdout
+        for entry in listing.split(b"\0"):
+            if not entry:
+                continue
+            metadata, raw_path = entry.split(b"\t", 1)
+            _mode, kind, raw_oid = metadata.split()
+            if kind == b"blob":
+                objects.setdefault(raw_oid.decode("ascii"), set()).add(raw_path.decode("utf-8", errors="surrogateescape"))
     findings: list[Finding] = []
-    seen: set[str] = set()
-    for raw in result.stdout.splitlines():
-        parts = raw.split(" ", 1)
-        oid = parts[0]
-        path = parts[1] if len(parts) == 2 else oid
-        if oid in seen:
-            continue
-        seen.add(oid)
-        kind = subprocess.run(
-            ["git", "-C", str(root), "cat-file", "-t", oid],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if kind != "blob":
-            continue
+    for oid, paths in objects.items():
         size = int(subprocess.run(
             ["git", "-C", str(root), "cat-file", "-s", oid],
             check=True,
@@ -255,8 +256,11 @@ def scan_git_history(root: Path, allow: list[AllowRule]) -> list[Finding]:
         ).stdout
         if b"\x00" in data[:8000]:
             continue
-        history_path = f".git-history/{path}@{oid[:12]}"
-        findings.extend(scan_text(data.decode("utf-8", errors="replace"), history_path, allow))
+        for path in sorted(paths):
+            history_path = f".git-history/{path}@{oid[:12]}"
+            # Match rules against the source path, not the display label.
+            for finding in scan_text(data.decode("utf-8", errors="replace"), path, allow):
+                findings.append(Finding(history_path, finding.line, finding.rule, finding.snippet))
     return findings
 
 

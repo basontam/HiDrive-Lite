@@ -229,6 +229,37 @@ def test_git_history_scan_detects_old_blob(repo):
     assert any(item.rule == "private-domain" for item in found)
 
 
+def test_history_allowlist_uses_source_path_without_hiding_adjacent_secrets(repo):
+    (repo / "tests").mkdir()
+    (repo / "tests" / "fixture.py").write_text('password = "' + "Ab3" * 8 + '"\n')
+    _git(repo, "add", "tests/fixture.py")
+    _git(repo, "commit", "-q", "-m", "fixture")
+    allow = scan_secrets.parse_allowlist(['tests/*.py :: password = "Ab3' + '(?:Ab3){7}"'])
+    assert scan_secrets.scan_git_history(repo, allow) == []
+    with (repo / "tests" / "fixture.py").open("a") as stream:
+        stream.write('token = "' + "Cx9" * 8 + '"\n')
+    _git(repo, "add", "tests/fixture.py")
+    _git(repo, "commit", "-q", "-m", "leak")
+    found = scan_secrets.scan_git_history(repo, allow)
+    assert len(found) == 1 and found[0].rule == "credential-assignment"
+    assert found[0].path.startswith(".git-history/tests/fixture.py@")
+    assert found[0].line == 2
+
+
+def test_history_exception_cannot_hide_same_blob_at_another_path(repo):
+    content = 'password = "' + "Ab3" * 8 + '"\n'
+    (repo / "config.py").write_text(content)
+    _git(repo, "add", "config.py")
+    _git(repo, "commit", "-q", "-m", "source")
+    (repo / "tests").mkdir()
+    _git(repo, "mv", "config.py", "tests/fixture.py")
+    _git(repo, "commit", "-q", "-m", "move")
+    allow = scan_secrets.parse_allowlist(['tests/*.py :: password = "Ab3' + '(?:Ab3){7}"'])
+    found = scan_secrets.scan_git_history(repo, allow)
+    assert len(found) == 1 and found[0].rule == "credential-assignment"
+    assert found[0].path.startswith(".git-history/config.py@")
+
+
 def test_collect_targets_skips_local_index(repo):
     (repo / ".gitignore").write_text((repo / ".gitignore").read_text() + ".local-index/\n")
     (repo / ".local-index").mkdir()

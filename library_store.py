@@ -36,6 +36,58 @@ LOG = logging.getLogger("HiDrive-Lite.library_store")
 SCHEMA_VERSION = 1
 
 
+def effective_ratings(
+    conn: sqlite3.Connection,
+    media_type: str | None,
+    tmdb_id: int | None,
+    ratings_json: str | None,
+    ratings_status: str | None = None,
+) -> tuple[str, str | None]:
+    """Return the ratings visible for one media identity.
+
+    RE0 keeps its own projection row, so a local media row can legitimately
+    have an empty ``ratings_json`` even after the projection was enriched.
+    Merge projection values as a read-time fallback (local values win when
+    both sides contain the same source); never write or downgrade the local
+    row here.  Older bundles without the projection table simply return the
+    local values unchanged.
+    """
+    try:
+        local = json.loads(ratings_json or "{}")
+    except (TypeError, ValueError):
+        local = {}
+    if not isinstance(local, dict):
+        local = {}
+    if not media_type or not tmdb_id:
+        return json.dumps(local, ensure_ascii=False), ratings_status
+    try:
+        projection = conn.execute(
+            "SELECT ratings_json, ratings_status FROM re0_media_projection "
+            "WHERE media_type=? AND tmdb_id=?",
+            (media_type, tmdb_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        projection = None
+    if projection is None:
+        return json.dumps(local, ensure_ascii=False), ratings_status
+    try:
+        projected = json.loads(projection["ratings_json"] or "{}")
+    except (TypeError, ValueError):
+        projected = {}
+    if not isinstance(projected, dict):
+        projected = {}
+    if not projected:
+        return json.dumps(local, ensure_ascii=False), ratings_status
+    merged = dict(projected)
+    merged.update(local)
+    # A projection's complete/partial state is authoritative for values it
+    # supplied, while a locally complete row remains authoritative overall.
+    status = ratings_status
+    if status not in ("complete", "partial") and projection["ratings_status"] in ("complete", "partial"):
+        status = projection["ratings_status"]
+    return json.dumps(merged, ensure_ascii=False), status
+
+
 def enqueue_index(conn: sqlite3.Connection, media_ids, *, now: int) -> None:
     """Queue changed media in the caller's transaction; never commit here."""
     conn.executemany(
@@ -1265,6 +1317,13 @@ class LibraryStore:
                 (media_id,),
             ).fetchall()
             groups = [self._group_summary_payload(conn, row, provider=provider) for row in group_rows]
+            ratings_json, ratings_status = effective_ratings(
+                conn,
+                media_row["media_type"],
+                media_row["tmdb_id"],
+                media_row["ratings_json"],
+                media_row["ratings_status"],
+            )
         finally:
             conn.close()
         if provider is not None:
@@ -1278,7 +1337,7 @@ class LibraryStore:
         groups.sort(key=lambda g: (0 if g["has_115"] else 1, -_QUALITY_RANK.get(g["quality"], 0)))
         provider_facets = self._provider_facets(groups)
         ratings = library_normalize.format_ratings(
-            media_row["ratings_json"],
+            ratings_json,
             media_type=media_row["media_type"],
             tmdb_id=media_row["tmdb_id"],
             imdb_id=media_row["imdb_id"],
@@ -1297,7 +1356,7 @@ class LibraryStore:
             "genres": json.loads(media_row["genres_json"] or "[]"),
             "match_status": media_row["match_status"],
             "ratings": ratings,
-            "ratings_status": media_row["ratings_status"],
+            "ratings_status": ratings_status,
             "groups": groups,
             "group_count": len(groups),
             "provider_facets": provider_facets,

@@ -589,6 +589,9 @@ _PROJECTION_COLUMNS = {
     "poster_path": "TEXT", "backdrop_path": "TEXT", "ratings_json": "TEXT NOT NULL DEFAULT '{}'",
     "metadata_status": "TEXT NOT NULL DEFAULT 'pending'", "ratings_status": "TEXT NOT NULL DEFAULT 'pending'",
     "metadata_fetched_at": "INTEGER", "ratings_fetched_at": "INTEGER", "last_fetched_at": "INTEGER",
+    # A short negative-cache window for a completed RE0 resource lookup that
+    # returned no usable candidates. Kept separate from metadata retry state.
+    "resources_retry_at": "INTEGER",
     "last_error_class": "TEXT", "next_retry_at": "INTEGER",
 }
 
@@ -1372,14 +1375,23 @@ def local_exact_candidates(conn: sqlite3.Connection, q: str, *, kinds: list, yea
         sql += " AND year=?"
         params.append(year)
     by_id = {row["id"]: row for row in conn.execute(sql, params).fetchall()}
+    # A local identity can have its TMDB rating enriched in the RE0
+    # projection before the local media row is backfilled.  Merge that
+    # projection value into the candidate payload so the federated search
+    # does not discard a known rating when the local row wins the merge.
+    from library_store import effective_ratings
+
     out = []
     for media_id in ids:
         row = by_id.get(media_id)
         if row is None:
             continue
+        ratings_json, _ratings_status = effective_ratings(
+            conn, row["media_type"], row["tmdb_id"], row["ratings_json"], None,
+        )
         try:
-            ratings = json.loads(row["ratings_json"] or "{}")
-        except ValueError:
+            ratings = json.loads(ratings_json or "{}")
+        except (TypeError, ValueError):
             ratings = {}
         out.append({
             "media_type": row["media_type"], "tmdb_id": int(row["tmdb_id"]), "title": row["title_zh"], "original_title": row["title_original"],

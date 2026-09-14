@@ -144,16 +144,20 @@ def select_metadata_rows(
     resume_after: int | None, retryable_only: bool = False,
 ) -> list[sqlite3.Row]:
     """Rows eligible for ``enrich``/``retry``: identity already confirmed
-    (``match_status='exact'``) and metadata incomplete (missing overview
-    or poster) -- §5.1: "enrich 只处理 match_status=exact 且元数据不完整
-    的条目". Restricted to explicit ``ids`` (ignoring ``statuses``/
-    ``resume_after``) or the default ``metadata_status`` filter (+ the
-    ``retry`` phase's retryable-only predicate + an optional resume
-    cursor)."""
+    (``match_status='exact'``) and either metadata or ratings are incomplete.
+    Ratings are a first-class part of the same TMDB detail response, so a
+    row with a poster/overview but an empty ``ratings_json`` must not be
+    skipped.  Restricted to explicit ``ids`` (ignoring ``statuses``/
+    ``resume_after``) or the default status filter (+ the ``retry`` phase's
+    retryable-only predicate + an optional resume cursor)."""
     base = (
         "SELECT id, media_type, tmdb_id, overview, poster_path, imdb_id, tvmaze_id, ratings_json, ratings_status "
         "FROM media "
-        "WHERE match_status='exact' AND (overview IS NULL OR overview='' OR poster_path IS NULL)"
+        "WHERE match_status='exact' AND ("
+        "overview IS NULL OR overview='' OR poster_path IS NULL OR "
+        "ratings_json IS NULL OR ratings_json='' OR "
+        "ratings_status IN ('pending','error')"
+        ")"
     )
     if retryable_only:
         base += f" AND metadata_error LIKE '{_RETRYABLE_ERROR_PREFIX}%'"
@@ -161,7 +165,14 @@ def select_metadata_rows(
         placeholders = ",".join("?" for _ in ids)
         return conn.execute(base + f" AND id IN ({placeholders}) ORDER BY id", ids).fetchall()
     status_placeholders = ",".join("?" for _ in statuses)
-    query = base + f" AND metadata_status IN ({status_placeholders})"
+    rating_missing = (
+        "(ratings_json IS NULL OR ratings_json='' "
+        "OR ratings_status IN ('pending','error'))"
+    )
+    # Metadata-complete rows are still eligible when only their ratings are
+    # missing; otherwise the original metadata_status gate would silently
+    # skip the exact rows this backfill is meant to repair.
+    query = base + f" AND (metadata_status IN ({status_placeholders}) OR {rating_missing})"
     params: list = list(statuses)
     if resume_after is not None:
         query += " AND id > ?"
@@ -487,7 +498,10 @@ def _build_client(db_path: Path, args: argparse.Namespace) -> "tmdb.TmdbClient":
         min_interval_ms=tmdb.DEFAULT_LIMITS.min_interval_ms,
         daily_budget=args.daily_budget if args.daily_budget is not None else tmdb.DEFAULT_LIMITS.daily_budget,
     )
-    lock_path = db_path.parent / "media-metadata-backfill.lock"
+    # Share the production budget lock with the background enricher and
+    # manual ``--library-enrich`` command.  A separate lock here would let
+    # two processes reserve the same daily TMDB quota concurrently.
+    lock_path = db_path.parent / "tmdb-budget.lock"
     return tmdb.TmdbClient(api_key, conn_factory=lambda: sqlite3.connect(db_path), lock_path=lock_path, limits=limits)
 
 

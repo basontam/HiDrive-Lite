@@ -262,7 +262,8 @@ class TestDetailProjection:
         after = client.get(f"/api/library/media/{re0_env['media_id']}").get_json()
         assert after["groups"] == before["groups"] and after["group_count"] == before["group_count"]
         # Local facets keep their counts; a pan only RE0 knows is added with link_count 0 (round 25).
-        assert [{k: v for k, v in f.items() if k != "re0_count"} for f in after["provider_facets"] if f["link_count"]] == before["provider_facets"]
+        before_local_facets = [{k: v for k, v in f.items() if k != "re0_count"} for f in before["provider_facets"] if f["link_count"]]
+        assert [{k: v for k, v in f.items() if k != "re0_count"} for f in after["provider_facets"] if f["link_count"]] == before_local_facets
         assert [(f["provider"], f["link_count"], f["re0_count"]) for f in after["provider_facets"]] == [("115", 1, 1), ("tianyicloud", 0, 1)]
         assert _local_links_snapshot(re0_env["store"]) == snapshot
         cands = after["re0_candidates"]
@@ -565,15 +566,16 @@ class TestSearchExtras:
         assert not [c for c in http.calls if c["url"] == UNLOCK_URL]
 
     def test_refresh_if_stale_fetches_once_then_skips_within_ttl(self, client, re0_env, http):
-        """Round 24: opening a detail page asks for a TTL-respecting refresh, so
-        a media that was never searched still gets its RE0 candidates."""
+        """Opening a detail page repairs a missing projection, then the
+        explicit stale refresh endpoint respects the freshly written TTL."""
         media_id = re0_env["media_id"]
-        assert client.get(f"/api/library/media/{media_id}").get_json()["re0_candidates"] == []
+        initial = client.get(f"/api/library/media/{media_id}").get_json()
+        assert len(initial["re0_candidates"]) == 2
+        assert [c["url"] for c in _re0_calls(http)] == [RES_MOVIE_555]
         response = client.post(RE0_REFRESH, json={"media_type": "movie", "tmdb_id": 555, "if_stale": True})
         assert response.status_code == 200, response.get_json()
         body = response.get_json()
-        assert body["success"] is True and body["fetched"] is True and body["report"]["remote_items"] == 2
-        assert [c["url"] for c in _re0_calls(http)] == [RES_MOVIE_555]
+        assert body == {"success": True, "fetched": False, "skipped": "fresh"}
         assert len(client.get(f"/api/library/media/{media_id}").get_json()["re0_candidates"]) == 2
         again = client.post(RE0_REFRESH, json={"media_type": "movie", "tmdb_id": 555, "if_stale": True})
         assert again.status_code == 200 and again.get_json() == {"success": True, "fetched": False, "skipped": "fresh"}
@@ -582,6 +584,16 @@ class TestSearchExtras:
         assert client.post(RE0_REFRESH, json={"media_type": "movie", "tmdb_id": 999, "if_stale": True}).get_json()["fetched"] is True
         assert [c["url"] for c in _re0_calls(http)] == [RES_MOVIE_555, RES_MOVIE_999]
         assert not [c for c in http.calls if c["url"] == UNLOCK_URL]
+
+    def test_detail_empty_result_is_negative_cached(self, client, re0_env, http):
+        """A completed empty RE0 response is retried after a short backoff,
+        not on every subsequent detail render."""
+        http.route("GET", RES_MOVIE_555, {"success": True, "data": []})
+        first = client.get(f"/api/library/media/{re0_env['media_id']}")
+        assert first.status_code == 200 and first.get_json()["re0_candidates"] == []
+        second = client.get(f"/api/library/media/{re0_env['media_id']}")
+        assert second.status_code == 200 and second.get_json()["re0_candidates"] == []
+        assert [c["url"] for c in _re0_calls(http)] == [RES_MOVIE_555]
 
     def test_website_unlock_refreshes_after_five_minutes_without_purchase(self, client, re0_env, http, hidrive, monkeypatch):
         now = hidrive.utc_now()
@@ -1061,8 +1073,9 @@ class TestCompositionPayloadAndPreview:
         # their live link totals are byte-for-byte what they were.
         assert after["groups"] == before["groups"] and after["group_count"] == before["group_count"]
         local_facets = [{k: v for k, v in f.items() if k != "re0_count"} for f in after["provider_facets"] if f["link_count"]]
-        assert local_facets == [f for f in before["provider_facets"] if f["link_count"]]
-        assert before["re0_candidates"] == [] and len(after["re0_candidates"]) == 2
+        before_local_facets = [{k: v for k, v in f.items() if k != "re0_count"} for f in before["provider_facets"] if f["link_count"]]
+        assert local_facets == before_local_facets
+        assert len(before["re0_candidates"]) == 2 and len(after["re0_candidates"]) == 2
 
 
     def test_a_refused_preview_carries_a_readable_top_level_message(self, client, re0_env, http):

@@ -35,7 +35,12 @@ from zoneinfo import ZoneInfo
 
 import jwt
 import requests
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:  # Production uses systemd EnvironmentFile.
+    def load_dotenv(_path=None):
+        return False
+
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Flask, Response, abort, g, has_request_context, jsonify, redirect, render_template, request
 
@@ -4703,6 +4708,156 @@ def _re0_tmdb_candidates(q: str, kinds: list[str], year: int | None) -> tuple[li
     return candidates, None
 
 
+def _re0_refresh_cached_catalog_refs(
+    store,
+    refs: list[tuple[str, int]],
+    *,
+    providers: tuple[str, ...],
+    salt: str | None,
+    now: int,
+    max_requests: int = 5,
+) -> dict:
+    """Backfill resources for cached catalog identities that have no rows.
+
+    The catalog cache stores TMDB identities, while ``re0_resource`` is
+    populated separately.  A fresh cache entry can therefore be structurally
+    valid but still render no RE0 candidates (for example after a process
+    restart or a previous interrupted fetch).  Refresh only those gaps,
+    bounded to a handful of upstream calls, before returning the catalog.
+    """
+    pending: list[tuple[str, int, str | None, int | None]] = []
+    conn = store.connect(readonly=True)
+    try:
+        for media_type, tmdb_id in refs:
+            row = conn.execute(
+                "SELECT last_fetched_at, resources_retry_at, title, local_media_id FROM re0_media_projection "
+                "WHERE media_type=? AND tmdb_id=?",
+                (media_type, tmdb_id),
+            ).fetchone()
+            if row is None:
+                pending.append((media_type, tmdb_id, None, None))
+                continue
+            # Use the unfiltered projection count to decide freshness.  A
+            # provider facet with no matching rows is a legitimate empty
+            # result and should not cause a refresh loop on every page load.
+            summary = re0_sync.resource_summary(conn, media_type, tmdb_id, ())
+            fetched_at = int(row["last_fetched_at"] or 0)
+            if fetched_at and now - fetched_at < re0_sync.RESOURCES_TTL_SECONDS:
+                if summary["candidate_count"]:
+                    continue
+                if int(row["resources_retry_at"] or 0) > now:
+                    continue
+            pending.append((media_type, tmdb_id, row["title"], row["local_media_id"]))
+    finally:
+        conn.close()
+
+    if not pending:
+        return {"refreshed": 0, "error_class": None, "message": None, "retry_after": None}
+
+    if salt is None:
+        conn = store.connect()
+        try:
+            salt = _re0_slug_salt(conn)
+        finally:
+            conn.close()
+    re0 = _re0_client()
+    refreshed = 0
+    for media_type, tmdb_id, title, local_media_id in pending[:max(1, max_requests)]:
+        result = re0.get(f"/api/open/resources/{media_type}/{tmdb_id}")
+        if result.ok:
+            raw_items = result.data if isinstance(result.data, list) else (
+                (result.data or {}).get("items") if isinstance(result.data, dict) else []
+            )
+            re0_sync.record_items(
+                store, media_type, tmdb_id, raw_items or [], media_id=local_media_id,
+                media_title=title or f"TMDB {tmdb_id}", salt=salt, now=now,
+            )
+            refreshed += 1
+        elif result.error_class == "upstream_4xx":
+            # A completed upstream response (including an empty/404 result)
+            # still gets a fetch timestamp, matching the normal search path
+            # and preventing a hot-loop on every page load.
+            pass
+        else:
+            return {
+                "refreshed": refreshed,
+                "error_class": result.error_class,
+                "message": result.message,
+                "retry_after": result.retry_after,
+            }
+        conn = store.connect(readonly=True)
+        try:
+            has_candidates = bool(re0_sync.resource_summary(conn, media_type, tmdb_id, ())['candidate_count'])
+        finally:
+            conn.close()
+        conn = store.connect()
+        try:
+            conn.execute(
+                "UPDATE re0_media_projection SET last_fetched_at=?, resources_retry_at=?, last_error_class=NULL, updated_at=? "
+                "WHERE media_type=? AND tmdb_id=?",
+                (now, None if has_candidates else now + re0_sync.NEGATIVE_TTL_SECONDS, now, media_type, tmdb_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    return {"refreshed": refreshed, "error_class": None, "message": None, "retry_after": None}
+
+
+def _re0_refresh_detail_ref(
+    media_type: str,
+    tmdb_id: int,
+    *,
+    local_media_id: int | None = None,
+    title: str | None = None,
+    original_title: str | None = None,
+    year: int | None = None,
+    overview: str | None = None,
+    poster_path: str | None = None,
+    backdrop_path: str | None = None,
+) -> dict:
+    """Ensure one detail view has a populated RE0 projection before render.
+
+    Search results can legitimately arrive from a cached catalog while the
+    corresponding ``re0_resource`` rows are still missing (for example after
+    an interrupted fetch).  A detail request is the user's explicit intent to
+    inspect that identity, so spend at most one normal, budgeted RE0 request to
+    repair the gap synchronously.  The helper is deliberately best-effort:
+    browsing a local media must remain available when the encryption key or
+    upstream service is temporarily unavailable.
+    """
+    if media_type not in ("movie", "tv") or int(tmdb_id or 0) <= 0:
+        return {"refreshed": 0, "error_class": None, "message": None, "retry_after": None}
+    write_store, error = _library_store_or_error(True)
+    if error:
+        LOG.warning("re0 detail refresh skipped type=%s id=%s reason=library_key_unavailable", media_type, tmdb_id)
+        return {"refreshed": 0, "error_class": "library_key_unavailable", "message": None, "retry_after": None}
+    try:
+        # A local media can be opened directly before any federated search has
+        # created its projection row.  Seed that identity first so the refresh
+        # timestamp written below also participates in the normal TTL gate.
+        if local_media_id is not None:
+            re0_sync.upsert_projection(
+                write_store,
+                media_type,
+                int(tmdb_id),
+                title=title or f"TMDB {tmdb_id}",
+                original_title=original_title,
+                year=year,
+                overview=overview,
+                poster_path=poster_path,
+                backdrop_path=backdrop_path,
+                ratings={},
+                now=utc_now(),
+                local_media_id=int(local_media_id),
+            )
+        return _re0_refresh_cached_catalog_refs(
+            write_store, [(media_type, int(tmdb_id))], providers=(), salt=None, now=utc_now(), max_requests=1,
+        )
+    except Exception as exc:  # noqa: BLE001 -- detail browsing is best-effort
+        LOG.warning("re0 detail refresh failed type=%s id=%s error=%s", media_type, tmdb_id, type(exc).__name__)
+        return {"refreshed": 0, "error_class": type(exc).__name__, "message": None, "retry_after": None}
+
+
 @app.get("/api/library/search/re0")
 def api_library_search_re0():
     store, error = _library_store_or_error(True)
@@ -4777,6 +4932,15 @@ def api_library_search_re0():
             return _respond(cached["error_class"] or "rate_limited", refs, cached_at=cached["fetched_at"],
                             message="RE0 限流冷却中", retry_after=int(cached["retry_after_until"]) - now, origin=cached_origin)
         if cached["expires_at"] and int(cached["expires_at"]) > now and cached["status"] in ("fresh", "no_candidates"):
+            if request.args.get("catalog") == "1" and refs:
+                repair = _re0_refresh_cached_catalog_refs(
+                    store, refs, providers=providers, salt=salt, now=now,
+                )
+                if repair["error_class"]:
+                    return _respond(
+                        repair["error_class"], refs, cached_at=cached["fetched_at"],
+                        message=repair["message"], retry_after=repair["retry_after"], origin=cached_origin,
+                    )
             return _respond("cached" if cached["status"] == "fresh" else "no_candidates", refs, cached_at=cached["fetched_at"], origin=cached_origin)
 
     re0 = _re0_client()
@@ -5539,6 +5703,23 @@ def api_library_media(media_id):
     media = store.media_detail(media_id, provider=provider, include_deleted=include_deleted)
     if media is None:
         return json_error("未找到该媒体", 404, "MEDIA_NOT_FOUND")
+    if media.get("media_type") in ("movie", "tv") and media.get("tmdb_id"):
+        _re0_refresh_detail_ref(
+            media["media_type"],
+            int(media["tmdb_id"]),
+            local_media_id=int(media["media_id"]),
+            title=media.get("title"),
+            original_title=media.get("original_title"),
+            year=media.get("year"),
+            overview=media.get("overview"),
+            poster_path=media.get("poster_path"),
+            backdrop_path=media.get("backdrop_path"),
+        )
+        # Re-read after the synchronous projection repair so effective ratings
+        # and any projection-backed metadata are included in this response.
+        media = store.media_detail(media_id, provider=provider, include_deleted=include_deleted)
+        if media is None:
+            return json_error("未找到该媒体", 404, "MEDIA_NOT_FOUND")
     media = dict(media)
     poster_path = media.pop("poster_path", None)
     media["poster_url"] = _tmdb_image_url(poster_path, LIBRARY_POSTER_SIZE)
@@ -5833,6 +6014,7 @@ def api_library_re0_media(media_type, tmdb_id):
     if provider is not None and provider not in library_normalize.PROVIDERS:
         return json_error("provider 参数不正确", 400, "LIBRARY_PROVIDER_INVALID")
     re0_sync.catalog_projections(store, [(media_type, tmdb_id)], charmap=_library_charmap(store))
+    _re0_refresh_detail_ref(media_type, tmdb_id)
     conn = store.connect(readonly=True)
     try:
         proj = re0_sync.projection_row(conn, media_type, tmdb_id)

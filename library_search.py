@@ -93,7 +93,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Iterable, Mapping
 
 from library_normalize import format_ratings, normalize_text, primary_rating
-from library_store import LibraryStore, live_link_sql
+from library_store import LibraryStore, effective_ratings, live_link_sql
 
 # ---------------------------------------------------------------------------
 # 7.0.1 tokenizer constants
@@ -1588,8 +1588,15 @@ def _fetch_items(
         )
         item_providers = _order_providers(providers_by_media.get(media_id, ()))
         has_115 = ("115" in item_providers) if providers else bool(row["has_115"])
+        ratings_json, ratings_status = effective_ratings(
+            conn,
+            row["media_type"],
+            row["tmdb_id"],
+            row["ratings_json"],
+            row["ratings_status"],
+        )
         ratings = format_ratings(
-            row["ratings_json"], media_type=row["media_type"],
+            ratings_json, media_type=row["media_type"],
             tmdb_id=row["tmdb_id"], imdb_id=row["imdb_id"], tvmaze_id=row["tvmaze_id"],
         )
         items.append(
@@ -1611,7 +1618,7 @@ def _fetch_items(
                 "groups_summary": [g["display_title"] for g in groups],
                 "needs_review": row["match_status"] == "needs_review",
                 "ratings": ratings,
-                "ratings_status": row["ratings_status"],
+                "ratings_status": ratings_status,
                 "primary_rating": primary_rating(ratings),
                 "all_links_invalid": all_links_invalid_by_media.get(media_id, False),
             }

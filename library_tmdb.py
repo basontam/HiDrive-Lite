@@ -760,6 +760,11 @@ def _fold(text: str) -> str:
     return _PUNCT_RE.sub("", normalized)
 
 
+def _has_cjk(text: object) -> bool:
+    """Whether a title contains at least one CJK unified ideograph."""
+    return isinstance(text, str) and any("\u3400" <= ch <= "\u9fff" for ch in text)
+
+
 def _parse_retry_after(value) -> int:
     if value is None:
         return RETRY_AFTER_DEFAULT
@@ -2073,9 +2078,25 @@ def _write_exact(
     now = int(time.time())
     conn = store.connect()
     try:
-        prior = conn.execute("SELECT ratings_json, tvmaze_id FROM media WHERE id=?", (media_id,)).fetchone()
+        prior = conn.execute("SELECT title_zh, title_alt_json, ratings_json, tvmaze_id FROM media WHERE id=?", (media_id,)).fetchone()
         prior_ratings_json = prior["ratings_json"] if prior else None
         prior_tvmaze_id = prior["tvmaze_id"] if prior else None
+
+        # TMDB's zh-CN result is the canonical display name when it actually
+        # contains Chinese. Keep the imported/English title as an alias so
+        # both forms remain searchable; do not replace a useful Chinese name
+        # with an untranslated Latin title.
+        import library_normalize
+        prior_title = prior["title_zh"] if prior else ""
+        try:
+            prior_aliases = json.loads(prior["title_alt_json"] or "[]") if prior else []
+        except (TypeError, ValueError):
+            prior_aliases = []
+        if not isinstance(prior_aliases, list):
+            prior_aliases = []
+        title_zh = top.title if _has_cjk(top.title) else prior_title
+        aliases = [value for value in [prior_title, top.title] + prior_aliases if isinstance(value, str) and value.strip()]
+        aliases = list(dict.fromkeys(value.strip() for value in aliases if value.strip() != title_zh.strip()))
 
         new_ratings: dict = {}
         tmdb_entry = _tmdb_rating_entry(vote_average, vote_count)
@@ -2108,7 +2129,7 @@ def _write_exact(
         conn.execute(
             """
             UPDATE media SET
-                tmdb_id = ?, media_type = ?, title_original = ?, overview = ?,
+                tmdb_id = ?, media_type = ?, title_zh = ?, search_key = ?, title_alt_json = ?, title_original = ?, overview = ?,
                 poster_path = ?, backdrop_path = ?, genres_json = ?,
                 match_status = 'exact', match_score = ?, match_candidates_json = ?,
                 ratings_json = ?, ratings_status = ?, ratings_fetched_at = ?,
@@ -2117,7 +2138,8 @@ def _write_exact(
             WHERE id = ?
             """,
             (
-                judgement.tmdb_id, judgement.media_type, top.original_title, overview,
+                judgement.tmdb_id, judgement.media_type, title_zh, library_normalize.search_key(title_zh),
+                json.dumps(aliases, ensure_ascii=False), top.original_title, overview,
                 poster_path, backdrop_path, genres_json, judgement.score, match_candidates_json,
                 ratings_json, ratings_status, _default_today(),
                 imdb_id, tvmaze_id,
@@ -2790,12 +2812,124 @@ def requeue_review_batch(
 
 
 def _merge_media_rows(conn: sqlite3.Connection, keeper_id: int, dup_id: int, now: int) -> None:
-    """Fold ``dup_id`` into ``keeper_id``: repoint each of its resource
-    groups (or, on a ``UNIQUE(media_id, edition_fingerprint)`` conflict with
-    a group ``keeper_id`` already has, repoint its links onto that existing
-    group and drop the now-empty duplicate group), then delete the
-    duplicate media row.  Groups are moved before links are merged and the
-    media row is deleted last, so every step stays foreign-key-safe."""
+    """Fold one exact-TMDB duplicate into its keeper without losing data.
+
+    Resource groups, RE0 projections/resources, follow records, aliases and
+    search-index rows all point at a media id in different ways.  Repoint or
+    merge each dependent row before deleting the duplicate so foreign keys
+    and the derived search index remain consistent.
+    """
+    import library_normalize
+
+    keeper = conn.execute("SELECT * FROM media WHERE id = ?", (keeper_id,)).fetchone()
+    duplicate = conn.execute("SELECT * FROM media WHERE id = ?", (dup_id,)).fetchone()
+    if keeper is None or duplicate is None:
+        return
+
+    def _json_list(value) -> list:
+        try:
+            parsed = json.loads(value or "[]")
+        except (TypeError, ValueError):
+            parsed = []
+        return parsed if isinstance(parsed, list) else []
+
+    def _json_dict(value) -> dict:
+        try:
+            parsed = json.loads(value or "{}")
+        except (TypeError, ValueError):
+            parsed = {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _present(value) -> bool:
+        return value not in (None, "", "[]", "{}")
+
+    # Prefer a translated title, but retain every prior title as an alias.
+    keeper_title = keeper["title_zh"] or duplicate["title_zh"]
+    if not _has_cjk(keeper_title) and _has_cjk(duplicate["title_zh"]):
+        keeper_title = duplicate["title_zh"]
+    names = [keeper["title_zh"], duplicate["title_zh"], keeper["title_original"], duplicate["title_original"]]
+    names.extend(_json_list(keeper["title_alt_json"]))
+    names.extend(_json_list(duplicate["title_alt_json"]))
+    aliases = list(dict.fromkeys(str(value).strip() for value in names if isinstance(value, str) and value.strip()))
+    aliases = [value for value in aliases if value != keeper_title]
+
+    # Keep the strongest match and richest metadata/rating state available on
+    # either row. Candidate rows can share an identity with a later exact
+    # match; the merged row must retain that stronger status.
+    match_rank = {"unmatched": 0, "needs_review": 1, "candidate": 2, "exact": 3}
+    keeper_match_status = keeper["match_status"] or "unmatched"
+    duplicate_match_status = duplicate["match_status"] or "unmatched"
+    match_status = (
+        keeper_match_status
+        if match_rank.get(keeper_match_status, 0) >= match_rank.get(duplicate_match_status, 0)
+        else duplicate_match_status
+    )
+    tmdb_id = keeper["tmdb_id"] if keeper["tmdb_id"] is not None else duplicate["tmdb_id"]
+
+    def _first(*values):
+        return next((value for value in values if _present(value)), None)
+
+    metadata_rank = {"pending": 0, "partial": 1, "manual_review": 1, "no_source": 1, "error": 1, "complete": 2}
+    keeper_status = keeper["metadata_status"] or "pending"
+    duplicate_status = duplicate["metadata_status"] or "pending"
+    metadata_status = keeper_status if metadata_rank.get(keeper_status, 0) >= metadata_rank.get(duplicate_status, 0) else duplicate_status
+    ratings = _json_dict(duplicate["ratings_json"])
+    ratings.update(_json_dict(keeper["ratings_json"]))
+    ratings_rank = {"error": 0, "none": 1, "partial": 2, "complete": 3}
+    keeper_ratings_status = keeper["ratings_status"] or "none"
+    duplicate_ratings_status = duplicate["ratings_status"] or "none"
+    ratings_status = keeper_ratings_status if ratings_rank.get(keeper_ratings_status, 0) >= ratings_rank.get(duplicate_ratings_status, 0) else duplicate_ratings_status
+
+    conn.execute(
+        """
+        UPDATE media SET title_zh=?, search_key=?, title_alt_json=?,
+            tmdb_id=?, media_type=?, match_status=?,
+            title_original=?, overview=?, poster_path=?, backdrop_path=?, genres_json=?,
+            match_score=?, match_candidates_json=?, metadata_status=?, metadata_source=?,
+            tvmaze_id=?, imdb_id=?, metadata_fetched_at=?, metadata_error=?,
+            ratings_json=?, ratings_status=?, ratings_fetched_at=?, ratings_error=?, updated_at=?
+        WHERE id=?
+        """,
+        (
+            keeper_title, library_normalize.search_key(keeper_title), json.dumps(aliases, ensure_ascii=False),
+            tmdb_id, keeper["media_type"], match_status,
+            _first(keeper["title_original"], duplicate["title_original"]),
+            _first(keeper["overview"], duplicate["overview"]),
+            _first(keeper["poster_path"], duplicate["poster_path"]),
+            _first(keeper["backdrop_path"], duplicate["backdrop_path"]),
+            _first(keeper["genres_json"], duplicate["genres_json"]) or "[]",
+            max(keeper["match_score"] or 0, duplicate["match_score"] or 0) or None,
+            _first(keeper["match_candidates_json"], duplicate["match_candidates_json"]),
+            metadata_status, _first(keeper["metadata_source"], duplicate["metadata_source"]),
+            _first(keeper["tvmaze_id"], duplicate["tvmaze_id"]),
+            _first(keeper["imdb_id"], duplicate["imdb_id"]),
+            _first(keeper["metadata_fetched_at"], duplicate["metadata_fetched_at"]),
+            _first(keeper["metadata_error"], duplicate["metadata_error"]),
+            json.dumps(ratings, ensure_ascii=False), ratings_status,
+            _first(keeper["ratings_fetched_at"], duplicate["ratings_fetched_at"]),
+            _first(keeper["ratings_error"], duplicate["ratings_error"]), now, keeper_id,
+        ),
+    )
+
+    # Active non-FK references are repointed before the duplicate disappears.
+    for table, column in (
+        ("re0_resource", "media_id"), ("re0_media_projection", "local_media_id"),
+        ("re0_calendar_event", "media_id"), ("re0_tv_follow_pack", "media_id"),
+        ("media_metadata_attempts", "media_id"), ("tmdb_requeue_audit", "media_id"),
+    ):
+        try:
+            conn.execute(f"UPDATE {table} SET {column}=? WHERE {column}=?", (keeper_id, dup_id))
+        except sqlite3.IntegrityError:
+            # Audit rows are historical and uniquely keyed by (batch, media).
+            # If the keeper already has the same batch, retain that one audit
+            # record and discard only the duplicate's redundant copy.
+            if table != "tmdb_requeue_audit":
+                raise
+            conn.execute(f"DELETE FROM {table} WHERE {column}=?", (dup_id,))
+        except sqlite3.OperationalError:
+            # Older bundles may not have an optional audit/follow table yet.
+            continue
+
     dup_groups = conn.execute(
         "SELECT id, edition_fingerprint FROM resource_group WHERE media_id = ?", (dup_id,)
     ).fetchall()
@@ -2810,42 +2944,50 @@ def _merge_media_rows(conn: sqlite3.Connection, keeper_id: int, dup_id: int, now
                 (keeper_id, now, dup_group["id"]),
             )
         else:
+            conn.execute("UPDATE re0_resource SET group_id = ? WHERE group_id = ?", (keeper_group["id"], dup_group["id"]))
             conn.execute("UPDATE resource_link SET group_id = ? WHERE group_id = ?", (keeper_group["id"], dup_group["id"]))
             conn.execute("DELETE FROM resource_group WHERE id = ?", (dup_group["id"],))
+    # search_term has no FK of its own, while search_doc does; delete both
+    # duplicate index rows and queue the keeper for one atomic rebuild.
+    conn.execute("DELETE FROM search_term WHERE media_id = ?", (dup_id,))
+    conn.execute("DELETE FROM search_doc WHERE media_id = ?", (dup_id,))
+    enqueue_index(conn, [keeper_id], now=now)
     conn.execute("DELETE FROM media WHERE id = ?", (dup_id,))
 
 
 def merge_by_tmdb(store: "LibraryStore") -> int:
-    """Identity merge (§6.2 step 6): group every ``exact``-matched media row
-    by ``(media_type, tmdb_id)``, upgrade the earliest row in each group to
-    ``media_identity = "tmdb:<type>:<id>"`` (a singleton group is just an
-    identity upgrade, no merge), and fold any later rows into it via
-    ``_merge_media_rows``.  Returns the number of media rows merged away
-    this call.  Idempotent: a second call finds groups of size 1 (their
-    identity already upgraded) and returns 0.
+    """Identity merge (§6.2 step 6): group matched media rows with a TMDB id
+    by ``(media_type, tmdb_id)``. Exact matches are preferred as keepers over
+    provisional candidates; a singleton group is just an identity upgrade.
+    Returns the number of media rows merged away this call. Idempotent: a
+    second call finds groups of size 1 (their identity already upgraded) and
+    returns 0.
     """
     conn = store.connect()
     merged = 0
     try:
         rows = conn.execute(
-            "SELECT id, media_type, tmdb_id FROM media "
-            "WHERE match_status = 'exact' AND tmdb_id IS NOT NULL ORDER BY id"
+            "SELECT id, media_type, tmdb_id, match_status FROM media "
+            "WHERE match_status IN ('exact', 'candidate') AND tmdb_id IS NOT NULL ORDER BY id"
         ).fetchall()
         groups: dict[tuple[str, int], list[int]] = {}
+        status_by_id: dict[int, str] = {}
+        match_rank = {"unmatched": 0, "needs_review": 1, "candidate": 2, "exact": 3}
         for row in rows:
             groups.setdefault((row["media_type"], row["tmdb_id"]), []).append(row["id"])
+            status_by_id[row["id"]] = row["match_status"]
 
         now = int(time.time())
         for (media_type, tmdb_id), ids in groups.items():
-            keeper_id = ids[0]
+            keeper_id = min(ids, key=lambda media_id: (-match_rank.get(status_by_id[media_id], 0), media_id))
             target_identity = f"tmdb:{media_type}:{tmdb_id}"
+            for dup_id in (media_id for media_id in ids if media_id != keeper_id):
+                _merge_media_rows(conn, keeper_id, dup_id, now)
+                merged += 1
             conn.execute(
                 "UPDATE media SET media_identity = ?, updated_at = ? WHERE id = ? AND media_identity != ?",
                 (target_identity, now, keeper_id, target_identity),
             )
-            for dup_id in ids[1:]:
-                _merge_media_rows(conn, keeper_id, dup_id, now)
-                merged += 1
         conn.commit()
     finally:
         conn.close()
